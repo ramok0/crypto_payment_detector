@@ -425,6 +425,7 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
+ "bech32",
  "bitcoin",
  "dotenvy",
  "env_logger",

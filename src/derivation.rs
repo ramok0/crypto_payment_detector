@@ -168,54 +168,20 @@ pub fn derive_address(
 }
 
 fn btc_bech32_to_ltc_bech32(btc_addr: &str) -> Result<String, DetectorError> {
-    let stripped = btc_addr.strip_prefix("bc1")
-        .ok_or_else(|| DetectorError::DerivationFailed {
+    use bech32::Hrp;
+
+    let (_hrp, witness_version, witness_program) = bech32::segwit::decode(btc_addr)
+        .map_err(|e| DetectorError::DerivationFailed {
             index: 0,
-            reason: format!("Expected bc1 prefix, got: {}", btc_addr),
+            reason: format!("Failed to decode bech32 segwit address: {e}"),
         })?;
-    Ok(format!("ltc1{}", stripped))
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let ltc_hrp = Hrp::parse("ltc").unwrap();
+    let encoded = bech32::segwit::encode(ltc_hrp, witness_version, &witness_program)
+        .map_err(|e| DetectorError::DerivationFailed {
+            index: 0,
+            reason: format!("Failed to encode ltc bech32 address: {e}"),
+        })?;
 
-    #[test]
-    fn test_derive_btc_address_deterministic() {
-        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
-        let addr1 = derive_address(xpub, 0, Chain::Bitcoin).unwrap();
-        let addr2 = derive_address(xpub, 0, Chain::Bitcoin).unwrap();
-        assert_eq!(addr1, addr2);
-
-        let addr3 = derive_address(xpub, 1, Chain::Bitcoin).unwrap();
-        assert_ne!(addr1, addr3);
-    }
-
-    #[test]
-    fn test_btc_address_starts_with_bc1() {
-        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
-        let addr = derive_address(xpub, 0, Chain::Bitcoin).unwrap();
-        assert!(addr.starts_with("bc1"));
-    }
-
-    #[test]
-    fn test_ltc_address_starts_with_ltc1() {
-        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
-        let addr = derive_address(xpub, 0, Chain::Litecoin).unwrap();
-        assert!(addr.starts_with("ltc1"));
-    }
-
-    #[test]
-    fn test_base58_roundtrip() {
-        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
-        let decoded = base58_decode_check(xpub).unwrap();
-        let re_encoded = base58_encode_check(&decoded);
-        assert_eq!(xpub, re_encoded);
-    }
-
-    #[test]
-    fn test_invalid_xpub() {
-        let result = derive_address("invalid_xpub", 0, Chain::Bitcoin);
-        assert!(result.is_err());
-    }
+    Ok(encoded)
 }

@@ -272,7 +272,11 @@ impl ChainDetector {
                             Chain::Litecoin => {
                                 let btc_addr = addr_str?;
                                 if btc_addr.starts_with("bc1") {
-                                    format!("ltc1{}", &btc_addr[3..])
+                                    use bech32::Hrp;
+                                    let (_hrp, witness_version, witness_program) =
+                                        bech32::segwit::decode(&btc_addr).ok()?;
+                                    let ltc_hrp = Hrp::parse("ltc").unwrap();
+                                    bech32::segwit::encode(ltc_hrp, witness_version, &witness_program).ok()?
                                 } else {
                                     btc_addr
                                 }
@@ -280,11 +284,14 @@ impl ChainDetector {
                         };
 
                         let &index = address_lookup.get(&addr_str)?;
+                        let amount_sat = output.value.to_sat();
                         Some(DetectedPayment {
                             chain,
+                            ticker: chain.ticker().to_string(),
                             txid: txid.clone(),
                             address: addr_str,
-                            amount_sat: output.value.to_sat(),
+                            amount_sat,
+                            amount_coin: amount_sat as f64 / chain.sats_per_unit() as f64,
                             confirmations,
                             block_height: Some(block_height),
                             derivation_index: index,

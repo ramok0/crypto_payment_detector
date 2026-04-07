@@ -76,9 +76,11 @@ impl std::str::FromStr for Chain {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedPayment {
     pub chain: Chain,
+    pub ticker: String,
     pub txid: String,
     pub address: String,
     pub amount_sat: u64,
+    pub amount_coin: f64,
     pub confirmations: u64,
     pub block_height: Option<u64>,
     pub derivation_index: u32,
