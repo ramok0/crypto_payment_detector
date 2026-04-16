@@ -103,6 +103,10 @@ fn build_solana_config() -> SolanaConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1000),
+        min_deposit_fiat: std::env::var("SOL_MIN_DEPOSIT_FIAT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.5),
     }
 }
 
