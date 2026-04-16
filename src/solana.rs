@@ -20,6 +20,9 @@ pub struct SolanaConfig {
     pub poll_interval_secs: u64,
     pub min_confirmations: u64,
     pub fiat_currency: String,
+    pub proxy_url: Option<String>,
+    pub max_retries: u32,
+    pub retry_base_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,13 +141,18 @@ impl SolanaDetector {
             ));
         }
 
-        let rpc_client = reqwest::Client::builder()
+        let mut rpc_builder = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
-            .connection_verbose(false)
-            .build()
-            .map_err(|e| {
-                DetectorError::InvalidConfig(format!("Failed to build RPC client: {e}"))
-            })?;
+            .connection_verbose(false);
+        if let Some(ref proxy_url) = config.proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .map_err(|e| DetectorError::InvalidConfig(format!("Invalid proxy URL: {e}")))?;
+            rpc_builder = rpc_builder.proxy(proxy);
+            log::info!("[SOL] Using proxy: {}", proxy_url);
+        }
+        let rpc_client = rpc_builder.build().map_err(|e| {
+            DetectorError::InvalidConfig(format!("Failed to build RPC client: {e}"))
+        })?;
 
         let webhook_client = reqwest::Client::builder()
             .no_proxy()
@@ -175,35 +183,80 @@ impl SolanaDetector {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, DetectorError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
+        let max_retries = self.config.max_retries.max(1);
+        let mut attempt: u32 = 0;
+        let mut last_error = String::new();
 
-        let response = self
-            .rpc_client
-            .post(&self.config.rpc_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| DetectorError::ApiError(format!("Solana RPC request failed: {e}")))?;
+        while attempt < max_retries {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            });
 
-        if !response.status().is_success() {
-            return Err(DetectorError::ApiError(format!(
-                "Solana RPC {} failed with status {}",
-                method,
-                response.status()
-            )));
+            let response = self
+                .rpc_client
+                .post(&self.config.rpc_url)
+                .json(&body)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    let parsed: RpcResponse<T> = resp.json().await.map_err(|e| {
+                        DetectorError::ApiError(format!("Solana RPC parse failed: {e}"))
+                    })?;
+                    return Ok(parsed.result);
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+
+                    last_error = format!("Solana RPC {} failed with status {}", method, status);
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        break;
+                    }
+
+                    let backoff_delay = self.config.retry_base_delay_ms * 2u64.pow(attempt - 1);
+                    let delay_ms = retry_after
+                        .map(|sec| sec.saturating_mul(1000))
+                        .unwrap_or(backoff_delay);
+                    log::warn!(
+                        "[SOL] {} (attempt {}/{}) - retry in {}ms",
+                        last_error,
+                        attempt,
+                        max_retries,
+                        delay_ms
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => {
+                    last_error = format!("Solana RPC request failed: {e}");
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        break;
+                    }
+
+                    let delay_ms = self.config.retry_base_delay_ms * 2u64.pow(attempt - 1);
+                    log::warn!(
+                        "[SOL] {} (attempt {}/{}) - retry in {}ms",
+                        last_error,
+                        attempt,
+                        max_retries,
+                        delay_ms
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
         }
 
-        let parsed: RpcResponse<T> = response
-            .json()
-            .await
-            .map_err(|e| DetectorError::ApiError(format!("Solana RPC parse failed: {e}")))?;
-
-        Ok(parsed.result)
+        Err(DetectorError::ApiError(last_error))
     }
 
     async fn get_current_slot(&self) -> Result<u64, DetectorError> {

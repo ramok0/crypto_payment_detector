@@ -94,6 +94,15 @@ fn build_solana_config() -> SolanaConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1),
         fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
+        proxy_url: std::env::var("PROXY").ok(),
+        max_retries: std::env::var("MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5),
+        retry_base_delay_ms: std::env::var("RETRY_BASE_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000),
     }
 }
 
