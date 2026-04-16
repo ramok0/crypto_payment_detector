@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bitcoin::consensus::Decodable;
-use rayon::prelude::*;
 use crate::derivation::derive_address;
 use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, DetectorConfig, WebhookEvent};
 use crate::webhook::send_webhook;
+use bitcoin::consensus::Decodable;
+use rayon::prelude::*;
 
 async fn retry<F, Fut, T>(
     name: &str,
@@ -72,7 +72,9 @@ impl ChainDetector {
             return Err(DetectorError::InvalidConfig("xpub is required".into()));
         }
         if config.webhook_url.is_empty() {
-            return Err(DetectorError::InvalidConfig("webhook_url is required".into()));
+            return Err(DetectorError::InvalidConfig(
+                "webhook_url is required".into(),
+            ));
         }
         if config.webhook_hmac_secret.is_empty() {
             return Err(DetectorError::InvalidConfig(
@@ -96,22 +98,21 @@ impl ChainDetector {
             client_builder = client_builder.proxy(proxy);
             log::info!("[{}] Using proxy: {}", config.chain.ticker(), proxy_url);
         }
-        let client = client_builder
-            .build()
-            .map_err(|e| DetectorError::InvalidConfig(format!("Failed to build HTTP client: {e}")))?;
+        let client = client_builder.build().map_err(|e| {
+            DetectorError::InvalidConfig(format!("Failed to build HTTP client: {e}"))
+        })?;
 
         let webhook_client = reqwest::Client::builder()
             .no_proxy()
             .pool_max_idle_per_host(0)
             .connection_verbose(false)
             .build()
-            .map_err(|e| DetectorError::InvalidConfig(format!("Failed to build webhook client: {e}")))?;
+            .map_err(|e| {
+                DetectorError::InvalidConfig(format!("Failed to build webhook client: {e}"))
+            })?;
 
-        let price_fetcher = PriceFetcher::new(
-            webhook_client.clone(),
-            &config.fiat_currency,
-            config.chain,
-        );
+        let price_fetcher =
+            PriceFetcher::new(webhook_client.clone(), &config.fiat_currency, config.chain);
 
         log::info!(
             "[{}] Detector initialized - explorer: {}",
@@ -231,10 +232,7 @@ impl ChainDetector {
         Ok(block)
     }
 
-    fn build_address_lookup(
-        &self,
-        max_index: u32,
-    ) -> Result<HashMap<String, u32>, DetectorError> {
+    fn build_address_lookup(&self, max_index: u32) -> Result<HashMap<String, u32>, DetectorError> {
         let mut map = HashMap::with_capacity(max_index as usize + 1);
         for i in 0..=max_index {
             let addr = derive_address(&self.config.xpub, i, self.config.chain)?;
@@ -276,11 +274,17 @@ impl ChainDetector {
                                     let (_hrp, witness_version, witness_program) =
                                         bech32::segwit::decode(&btc_addr).ok()?;
                                     let ltc_hrp = Hrp::parse("ltc").unwrap();
-                                    bech32::segwit::encode(ltc_hrp, witness_version, &witness_program).ok()?
+                                    bech32::segwit::encode(
+                                        ltc_hrp,
+                                        witness_version,
+                                        &witness_program,
+                                    )
+                                    .ok()?
                                 } else {
                                     btc_addr
                                 }
                             }
+                            Chain::Solana => return None,
                         };
 
                         let &index = address_lookup.get(&addr_str)?;
@@ -295,6 +299,7 @@ impl ChainDetector {
                             confirmations,
                             block_height: Some(block_height),
                             derivation_index: index,
+                            memo: None,
                             fiat_amount: None,
                             fiat_currency: None,
                             coin_price: None,
@@ -389,7 +394,9 @@ impl ChainDetector {
 
         let ready: Vec<PendingPayment> = {
             let state = self.state.lock().unwrap();
-            state.pending.iter()
+            state
+                .pending
+                .iter()
                 .filter(|p| {
                     let confs = tip_height.saturating_sub(p.block_height) + 1;
                     confs >= min_conf && !state.notified_confirmed.contains(&p.payment.txid)
@@ -407,7 +414,8 @@ impl ChainDetector {
                 Ok(price) => {
                     enriched.coin_price = Some(price);
                     enriched.fiat_currency = Some(self.price_fetcher.currency().to_string());
-                    let coin = enriched.amount_sat as f64 / self.config.chain.sats_per_unit() as f64;
+                    let coin =
+                        enriched.amount_sat as f64 / self.config.chain.sats_per_unit() as f64;
                     enriched.fiat_amount = Some(coin * price);
                 }
                 Err(e) => {
@@ -415,7 +423,7 @@ impl ChainDetector {
                 }
             }
 
-            let event = WebhookEvent::PaymentConfirmed(enriched.clone());
+            let event = WebhookEvent::PaymentCredited(enriched.clone());
             send_webhook(
                 &self.webhook_client,
                 &self.config.webhook_url,
@@ -425,7 +433,9 @@ impl ChainDetector {
             .await?;
 
             let mut state = self.state.lock().unwrap();
-            state.notified_confirmed.insert(pending.payment.txid.clone());
+            state
+                .notified_confirmed
+                .insert(pending.payment.txid.clone());
             log::info!(
                 "[{}] Payment confirmed ({} confs): txid={} address={} amount={} sats fiat={:?} {}",
                 ticker,
@@ -441,7 +451,9 @@ impl ChainDetector {
         if !ready.is_empty() {
             let mut state = self.state.lock().unwrap();
             let confirmed = state.notified_confirmed.clone();
-            state.pending.retain(|p| !confirmed.contains(&p.payment.txid));
+            state
+                .pending
+                .retain(|p| !confirmed.contains(&p.payment.txid));
         }
 
         Ok(())
@@ -550,7 +562,11 @@ impl PaymentDetector for ChainDetector {
                         state.last_scanned_height = Some(rollback_from.saturating_sub(1));
                     }
                     current_height = rollback_from;
-                    log::info!("[{}] Rolled back to height {}, re-scanning", ticker, current_height);
+                    log::info!(
+                        "[{}] Rolled back to height {}, re-scanning",
+                        ticker,
+                        current_height
+                    );
                     continue;
                 }
 
@@ -565,7 +581,11 @@ impl PaymentDetector for ChainDetector {
                 let block_hash = match self.get_block_hash(current_height).await {
                     Ok(h) => h,
                     Err(e) => {
-                        log::error!("[{}] Failed to get block hash for height {}: {e}", ticker, current_height);
+                        log::error!(
+                            "[{}] Failed to get block hash for height {}: {e}",
+                            ticker,
+                            current_height
+                        );
                         break;
                     }
                 };
@@ -573,7 +593,11 @@ impl PaymentDetector for ChainDetector {
                 let block = match self.fetch_raw_block(&block_hash).await {
                     Ok(b) => b,
                     Err(e) => {
-                        log::error!("[{}] Failed to fetch block {} raw: {e}", ticker, current_height);
+                        log::error!(
+                            "[{}] Failed to fetch block {} raw: {e}",
+                            ticker,
+                            current_height
+                        );
                         break;
                     }
                 };
@@ -581,7 +605,8 @@ impl PaymentDetector for ChainDetector {
                 let block_elapsed = block_start_time.elapsed();
 
                 let eta = if blocks_done > 0 {
-                    let avg_per_block = batch_start_time.elapsed().as_secs_f64() / blocks_done as f64;
+                    let avg_per_block =
+                        batch_start_time.elapsed().as_secs_f64() / blocks_done as f64;
                     let remaining = (tip_height - current_height) as f64;
                     let eta_secs = avg_per_block * remaining;
                     format!("ETA: {:.0}s", eta_secs)
@@ -625,8 +650,11 @@ impl PaymentDetector for ChainDetector {
                 {
                     let mut state = self.state.lock().unwrap();
                     state.last_scanned_height = Some(current_height);
-                    state.known_block_hashes.insert(current_height, block_hash.clone());
-                    let min_keep = current_height.saturating_sub(self.config.min_confirmations + 10);
+                    state
+                        .known_block_hashes
+                        .insert(current_height, block_hash.clone());
+                    let min_keep =
+                        current_height.saturating_sub(self.config.min_confirmations + 10);
                     state.known_block_hashes.retain(|&h, _| h >= min_keep);
                 }
 

@@ -1,11 +1,11 @@
 use axum::{
+    Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
-    Router,
 };
-use crypto_payment_detector::{verify_signature, WebhookEvent};
+use crypto_payment_detector::{WebhookEvent, verify_signature};
 
 #[derive(Clone)]
 struct AppState {
@@ -45,19 +45,41 @@ async fn handle_webhook(
     };
 
     match &event {
-        WebhookEvent::PaymentConfirmed(payment) => {
-            println!("=== PAYMENT CONFIRMED ({}) ===", payment.chain);
+        WebhookEvent::PaymentDetected(payment) => {
+            println!("=== PAYMENT DETECTED ({}) ===", payment.chain);
             println!("  TxID:           {}", payment.txid);
             println!("  Address:        {}", payment.address);
-            println!("  Amount:         {} sats", payment.amount_sat);
+            println!("  Amount:         {}", payment.amount_coin);
+            println!("  Base units:     {}", payment.amount_sat);
+            println!("  Confirmations:  {}", payment.confirmations);
+            println!("  Block height:   {:?}", payment.block_height);
+            println!("  Memo:           {:?}", payment.memo);
+            println!();
+        }
+        WebhookEvent::PaymentCredited(payment) => {
+            println!("=== PAYMENT CREDITED ({}) ===", payment.chain);
+            println!("  TxID:           {}", payment.txid);
+            println!("  Address:        {}", payment.address);
+            println!("  Amount:         {}", payment.amount_coin);
+            println!("  Base units:     {}", payment.amount_sat);
             println!("  Confirmations:  {}", payment.confirmations);
             println!("  Block height:   {:?}", payment.block_height);
             println!("  Index:          {}", payment.derivation_index);
+            println!("  Memo:           {:?}", payment.memo);
             if let Some(price) = payment.coin_price {
-                println!("  {} price:    {:.2} {}", payment.chain, price, payment.fiat_currency.as_deref().unwrap_or("?"));
+                println!(
+                    "  {} price:    {:.2} {}",
+                    payment.chain,
+                    price,
+                    payment.fiat_currency.as_deref().unwrap_or("?")
+                );
             }
             if let Some(fiat) = payment.fiat_amount {
-                println!("  Fiat value:     {:.2} {}", fiat, payment.fiat_currency.as_deref().unwrap_or("?"));
+                println!(
+                    "  Fiat value:     {:.2} {}",
+                    fiat,
+                    payment.fiat_currency.as_deref().unwrap_or("?")
+                );
             }
             println!();
         }

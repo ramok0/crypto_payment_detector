@@ -14,7 +14,10 @@ pub struct PersistedState {
 pub fn load_state(path: &str) -> Result<PersistedState, DetectorError> {
     let p = Path::new(path);
     if !p.exists() {
-        log::info!("No persisted state file found at '{}', starting fresh", path);
+        log::info!(
+            "No persisted state file found at '{}', starting fresh",
+            path
+        );
         return Ok(PersistedState::default());
     }
 

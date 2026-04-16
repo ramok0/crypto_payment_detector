@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use crypto_payment_detector::derivation::derive_address;
-use crypto_payment_detector::persistence::{load_state, PersistedState};
+use crypto_payment_detector::persistence::{PersistedState, load_state};
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, PaymentDetector, RetryConfig,
@@ -36,7 +36,9 @@ struct DeriveParams {
     count: u32,
 }
 
-fn default_count() -> u32 { 1 }
+fn default_count() -> u32 {
+    1
+}
 
 #[derive(Serialize)]
 struct DeriveResponse {
@@ -68,12 +70,21 @@ async fn handle_derive(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DeriveParams>,
 ) -> Result<Json<DeriveResponse>, (StatusCode, String)> {
-    let chain: Chain = params.chain.parse()
+    let chain: Chain = params
+        .chain
+        .parse()
         .map_err(|e: String| (StatusCode::BAD_REQUEST, e))?;
 
-    let info = state.chains.iter()
+    let info = state
+        .chains
+        .iter()
         .find(|c| c.chain == chain)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Chain {} not configured", chain)))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Chain {} not configured", chain),
+            )
+        })?;
 
     if params.count > 100000 {
         return Err((StatusCode::BAD_REQUEST, "count must be <= 100000".into()));
@@ -81,9 +92,16 @@ async fn handle_derive(
 
     let mut addresses = Vec::with_capacity(params.count as usize);
     for i in params.start..params.start + params.count {
-        let addr = derive_address(&info.xpub, i, chain)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Derivation error at index {i}: {e}")))?;
-        addresses.push(AddressEntry { index: i, address: addr });
+        let addr = derive_address(&info.xpub, i, chain).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Derivation error at index {i}: {e}"),
+            )
+        })?;
+        addresses.push(AddressEntry {
+            index: i,
+            address: addr,
+        });
     }
 
     Ok(Json(DeriveResponse {
@@ -92,9 +110,7 @@ async fn handle_derive(
     }))
 }
 
-async fn handle_health(
-    State(state): State<Arc<AppState>>,
-) -> Json<HealthResponse> {
+async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let mut chains = Vec::new();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -105,7 +121,10 @@ async fn handle_health(
         let persisted: Option<PersistedState> = load_state(&info.state_file).ok();
 
         let tip_url = format!("{}/blocks/tip/height", info.explorer_api_url);
-        let explorer_reachable = client.get(&tip_url).send().await
+        let explorer_reachable = client
+            .get(&tip_url)
+            .send()
+            .await
             .map(|r| r.status().is_success())
             .unwrap_or(false);
 
@@ -117,10 +136,16 @@ async fn handle_health(
         });
     }
 
-    let all_ok = chains.iter().all(|c| c.explorer_reachable && c.last_scanned_height.is_some());
+    let all_ok = chains
+        .iter()
+        .all(|c| c.explorer_reachable && c.last_scanned_height.is_some());
 
     Json(HealthResponse {
-        status: if all_ok { "ok".into() } else { "degraded".into() },
+        status: if all_ok {
+            "ok".into()
+        } else {
+            "degraded".into()
+        },
         chains,
     })
 }
@@ -129,10 +154,12 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
     let state_file_default = match chain {
         Chain::Bitcoin => "btc_detector_state.json",
         Chain::Litecoin => "ltc_detector_state.json",
+        Chain::Solana => "sol_detector_state.json",
     };
     let state_file_var = match chain {
         Chain::Bitcoin => "BTC_STATE_FILE",
         Chain::Litecoin => "LTC_STATE_FILE",
+        Chain::Solana => "SOL_STATE_FILE",
     };
 
     DetectorConfig {
@@ -149,6 +176,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
             let chain_var = match chain {
                 Chain::Bitcoin => "BTC_POLL_INTERVAL",
                 Chain::Litecoin => "LTC_POLL_INTERVAL",
+                Chain::Solana => "SOL_POLL_INTERVAL",
             };
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("POLL_INTERVAL"))
@@ -160,8 +188,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
         state_file: std::env::var(state_file_var)
             .or_else(|_| std::env::var("STATE_FILE"))
             .unwrap_or_else(|_| state_file_default.to_string()),
-        fiat_currency: std::env::var("FIAT_CURRENCY")
-            .unwrap_or_else(|_| "EUR".to_string()),
+        fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
         retry: RetryConfig {
             max_retries: std::env::var("MAX_RETRIES")
                 .ok()
@@ -177,6 +204,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
             let chain_var = match chain {
                 Chain::Bitcoin => "BTC_MIN_CONFIRMATIONS",
                 Chain::Litecoin => "LTC_MIN_CONFIRMATIONS",
+                Chain::Solana => "SOL_MIN_CONFIRMATIONS",
             };
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
@@ -191,6 +219,7 @@ fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
     let xpub_var = match chain {
         Chain::Bitcoin => "BTC_XPUB",
         Chain::Litecoin => "LTC_XPUB",
+        Chain::Solana => return None,
     };
     let xpub = match std::env::var(xpub_var) {
         Ok(v) if !v.is_empty() => v,
@@ -200,6 +229,7 @@ fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
     let (state_file_var, state_file_default) = match chain {
         Chain::Bitcoin => ("BTC_STATE_FILE", "btc_state.json"),
         Chain::Litecoin => ("LTC_STATE_FILE", "ltc_state.json"),
+        Chain::Solana => ("SOL_STATE_FILE", "sol_state.json"),
     };
     let state_file = std::env::var(state_file_var)
         .or_else(|_| std::env::var("STATE_FILE"))
@@ -208,14 +238,25 @@ fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
     let explorer_api_url = std::env::var("EXPLORER_API_URL")
         .unwrap_or_else(|_| chain.default_explorer_api().to_string());
 
-    Some((ChainInfo { chain, xpub: xpub.clone(), state_file, explorer_api_url }, xpub))
+    Some((
+        ChainInfo {
+            chain,
+            xpub: xpub.clone(),
+            state_file,
+            explorer_api_url,
+        },
+        xpub,
+    ))
 }
 
 async fn run_detector(detector: Arc<ChainDetector>, max_index: u32) {
     let ticker = detector.chain().ticker();
     loop {
         if let Err(e) = detector.run_block_scan_loop(None, max_index).await {
-            log::error!("[{}] Block scan loop error: {e} - restarting in 10s", ticker);
+            log::error!(
+                "[{}] Block scan loop error: {e} - restarting in 10s",
+                ticker
+            );
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     }
@@ -236,8 +277,12 @@ async fn main() {
 
     for chain in [Chain::Bitcoin, Chain::Litecoin] {
         if let Some((info, xpub)) = build_chain_info(chain) {
-            log::info!("[{}] Configured with xpub {}...{}", chain.ticker(),
-                &info.xpub[..8], &info.xpub[info.xpub.len()-4..]);
+            log::info!(
+                "[{}] Configured with xpub {}...{}",
+                chain.ticker(),
+                &info.xpub[..8],
+                &info.xpub[info.xpub.len() - 4..]
+            );
 
             let config = build_config(chain, xpub);
             let detector = Arc::new(
@@ -265,7 +310,9 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let state = Arc::new(AppState { chains: chain_infos });
+    let state = Arc::new(AppState {
+        chains: chain_infos,
+    });
 
     let app = Router::new()
         .route("/health", get(handle_health))

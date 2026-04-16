@@ -76,6 +76,30 @@ pub fn verify_signature(secret: &str, payload: &[u8], signature_hex: &str) -> bo
     mac.verify_slice(&expected).is_ok()
 }
 
+pub async fn send_discord_webhook(
+    client: &reqwest::Client,
+    url: &str,
+    content: &str,
+) -> Result<(), DetectorError> {
+    let body = serde_json::json!({
+        "content": content,
+    });
+
+    let response =
+        client.post(url).json(&body).send().await.map_err(|e| {
+            DetectorError::WebhookError(format!("Discord webhook request failed: {e}"))
+        })?;
+
+    if !response.status().is_success() {
+        return Err(DetectorError::WebhookError(format!(
+            "Discord webhook returned status {}",
+            response.status()
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

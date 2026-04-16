@@ -75,10 +75,7 @@ impl PriceFetcher {
     }
 
     async fn fetch_from_kraken(&self) -> Result<f64, DetectorError> {
-        let url = format!(
-            "https://api.kraken.com/0/public/Ticker?pair={}",
-            self.pair
-        );
+        let url = format!("https://api.kraken.com/0/public/Ticker?pair={}", self.pair);
 
         let resp: KrakenResponse = self
             .client
@@ -133,6 +130,7 @@ fn kraken_pair(chain: Chain, currency: &str) -> String {
     let base = match chain {
         Chain::Bitcoin => "XBT",
         Chain::Litecoin => "LTC",
+        Chain::Solana => "SOL",
     };
     let fiat = currency.to_uppercase();
     match chain {
@@ -147,6 +145,7 @@ fn kraken_pair(chain: Chain, currency: &str) -> String {
             _ => format!("X{}Z{}", base, fiat),
         },
         Chain::Litecoin => format!("LTC{}", fiat),
+        Chain::Solana => format!("SOL{}", fiat),
     }
 }
 
@@ -164,5 +163,11 @@ mod tests {
     fn test_ltc_pair() {
         assert_eq!(kraken_pair(Chain::Litecoin, "EUR"), "LTCEUR");
         assert_eq!(kraken_pair(Chain::Litecoin, "usd"), "LTCUSD");
+    }
+
+    #[test]
+    fn test_sol_pair() {
+        assert_eq!(kraken_pair(Chain::Solana, "EUR"), "SOLEUR");
+        assert_eq!(kraken_pair(Chain::Solana, "usd"), "SOLUSD");
     }
 }

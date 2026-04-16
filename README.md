@@ -1,12 +1,13 @@
 # Crypto Payment Detector
 
-A Rust-based payment detection system for **Bitcoin** and **Litecoin**. Monitors the blockchain in real-time by scanning raw blocks, derives addresses from an extended public key (xpub), and sends HMAC-signed webhook notifications when payments are detected.
+A Rust-based payment detection system for **Bitcoin**, **Litecoin**, and **Solana**. Monitors blockchains in near real-time and sends HMAC-signed webhook notifications for detected and credited payments.
 
 ## Features
 
-- **Multi-chain support** — Bitcoin and Litecoin, runnable simultaneously (`CHAIN=both`)
+- **Multi-chain support** — Bitcoin, Litecoin, Solana (`CHAIN=both`, `CHAIN=solana`, or `CHAIN=all`)
 - **BIP84 (P2WPKH) address derivation** from xpub / Ltub keys (watch-only, no private keys needed)
 - **Raw block scanning** with parallel transaction matching via [rayon](https://github.com/rayon-rs/rayon)
+- **Solana deposit watcher** via RPC `getSignaturesForAddress` + `getTransaction` with memo validation
 - **HMAC-SHA256 signed webhooks** with infinite retry and exponential backoff
 - **Fiat price enrichment** via Kraken public API (EUR, USD, GBP, CAD, JPY, AUD, CHF)
 - **Persistence** — resumes from last scanned block on restart
@@ -29,9 +30,12 @@ cargo build --release
 Create a `.env` file:
 
 ```env
-CHAIN=both                # bitcoin, litecoin, btc, ltc, or both
+CHAIN=both                # bitcoin, litecoin, solana, btc, ltc, sol, both, all
 BTC_XPUB=xpub6...        # Bitcoin extended public key
 LTC_XPUB=Ltub2...        # Litecoin extended public key
+SOLANA_DEPOSIT_ADDRESS=...   # Solana deposit wallet address (watch-only)
+SOLANA_RPC_URL=https://api.mainnet.solana.com
+DISCORD_INVALID_MEMO_WEBHOOK_URL=https://discord.com/api/webhooks/...
 
 WEBHOOK_URL=http://localhost:8080/webhook
 WEBHOOK_SECRET=your_hmac_secret
@@ -42,6 +46,7 @@ AUTH_PASS=pass
 FIAT_CURRENCY=EUR
 BTC_POLL_INTERVAL=120     # seconds between polls (BTC)
 LTC_POLL_INTERVAL=30      # seconds between polls (LTC)
+SOL_POLL_INTERVAL=60      # seconds between polls (SOL)
 
 RUST_LOG=info
 ```
@@ -56,6 +61,7 @@ BTC_STATE_FILE=btc_state.json
 LTC_STATE_FILE=ltc_state.json
 BTC_MIN_CONFIRMATIONS=3
 LTC_MIN_CONFIRMATIONS=2
+SOL_MIN_CONFIRMATIONS=1
 MAX_DERIVATION_INDEX=1500
 ```
 
@@ -81,7 +87,7 @@ Webhooks are POST requests with:
 Payload:
 ```json
 {
-  "event": "payment_confirmed",
+  "event": "payment_detected",
   "data": {
     "chain": "Bitcoin",
     "txid": "abc123...",
@@ -90,6 +96,7 @@ Payload:
     "confirmations": 3,
     "block_height": 840000,
     "derivation_index": 12,
+    "memo": "123456",
     "fiat_amount": 52.30,
     "fiat_currency": "EUR",
     "coin_price": 52300.00
@@ -127,3 +134,9 @@ src/
 |----------|------------------------------|-------------------------------|
 | Bitcoin  | blockstream.info/api         | blockchain.info (hex)         |
 | Litecoin | litecoinspace.org/api        | litecoinspace.org/api (binary)|
+When confirmations threshold is reached, a second webhook is sent with event `payment_credited`.
+
+For Solana:
+- Only transactions that increase `SOLANA_DEPOSIT_ADDRESS` balance are processed.
+- Memo must be numeric only (`^[0-9]+$`).
+- Missing or invalid memos are sent to `DISCORD_INVALID_MEMO_WEBHOOK_URL`.

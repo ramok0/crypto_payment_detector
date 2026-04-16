@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum Chain {
     Bitcoin,
     Litecoin,
+    Solana,
 }
 
 impl Chain {
@@ -12,6 +13,7 @@ impl Chain {
         match self {
             Chain::Bitcoin => "BTC",
             Chain::Litecoin => "LTC",
+            Chain::Solana => "SOL",
         }
     }
 
@@ -19,6 +21,7 @@ impl Chain {
         match self {
             Chain::Bitcoin => "Bitcoin",
             Chain::Litecoin => "Litecoin",
+            Chain::Solana => "Solana",
         }
     }
 
@@ -26,6 +29,7 @@ impl Chain {
         match self {
             Chain::Bitcoin => "https://blockstream.info/api",
             Chain::Litecoin => "https://litecoinspace.org/api",
+            Chain::Solana => "https://api.mainnet.solana.com",
         }
     }
 
@@ -33,6 +37,7 @@ impl Chain {
         match self {
             Chain::Bitcoin => format!("https://blockchain.info/rawblock/{}?format=hex", hash),
             Chain::Litecoin => format!("https://litecoinspace.org/api/block/{}/raw", hash),
+            Chain::Solana => format!("https://api.mainnet.solana.com/block/{}", hash),
         }
     }
 
@@ -40,17 +45,22 @@ impl Chain {
         match self {
             Chain::Bitcoin => true,
             Chain::Litecoin => false,
+            Chain::Solana => false,
         }
     }
 
     pub fn sats_per_unit(&self) -> u64 {
-        100_000_000
+        match self {
+            Chain::Bitcoin | Chain::Litecoin => 100_000_000,
+            Chain::Solana => 1_000_000_000,
+        }
     }
 
     pub fn bitcoin_network(&self) -> bitcoin::Network {
         match self {
             Chain::Bitcoin => bitcoin::Network::Bitcoin,
             Chain::Litecoin => bitcoin::Network::Bitcoin,
+            Chain::Solana => bitcoin::Network::Bitcoin,
         }
     }
 }
@@ -68,6 +78,7 @@ impl std::str::FromStr for Chain {
         match s.to_lowercase().as_str() {
             "bitcoin" | "btc" => Ok(Chain::Bitcoin),
             "litecoin" | "ltc" => Ok(Chain::Litecoin),
+            "solana" | "sol" => Ok(Chain::Solana),
             _ => Err(format!("Unknown chain: {}", s)),
         }
     }
@@ -84,6 +95,7 @@ pub struct DetectedPayment {
     pub confirmations: u64,
     pub block_height: Option<u64>,
     pub derivation_index: u32,
+    pub memo: Option<String>,
     pub fiat_amount: Option<f64>,
     pub fiat_currency: Option<String>,
     pub coin_price: Option<f64>,
@@ -92,8 +104,10 @@ pub struct DetectedPayment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data")]
 pub enum WebhookEvent {
-    #[serde(rename = "payment_confirmed")]
-    PaymentConfirmed(DetectedPayment),
+    #[serde(rename = "payment_detected")]
+    PaymentDetected(DetectedPayment),
+    #[serde(rename = "payment_credited")]
+    PaymentCredited(DetectedPayment),
 }
 
 #[derive(Debug, Clone)]

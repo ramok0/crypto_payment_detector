@@ -1,7 +1,7 @@
-use bitcoin::bip32::{ChildNumber, Xpub};
-use bitcoin::CompressedPublicKey;
 use bitcoin::Address;
+use bitcoin::CompressedPublicKey;
 use bitcoin::Network;
+use bitcoin::bip32::{ChildNumber, Xpub};
 use std::str::FromStr;
 
 use crate::error::DetectorError;
@@ -37,6 +37,9 @@ fn normalize_xpub_to_bitcoin(xpub_str: &str, chain: Chain) -> Result<String, Det
 
             Ok(base58_encode_check(&converted))
         }
+        Chain::Solana => Err(DetectorError::InvalidXpub(
+            "Solana does not use xpub/Ltub derivation in this detector".into(),
+        )),
     }
 }
 
@@ -45,7 +48,9 @@ fn base58_decode_check(input: &str) -> Result<Vec<u8>, String> {
 
     let mut result = vec![0u8; 0];
     for &c in input.as_bytes() {
-        let pos = alphabet.iter().position(|&b| b == c)
+        let pos = alphabet
+            .iter()
+            .position(|&b| b == c)
             .ok_or_else(|| format!("Invalid base58 character: {}", c as char))?;
 
         let mut carry = pos;
@@ -126,15 +131,11 @@ fn base58_encode_check(payload: &[u8]) -> String {
     result
 }
 
-pub fn derive_address(
-    xpub_str: &str,
-    index: u32,
-    chain: Chain,
-) -> Result<String, DetectorError> {
+pub fn derive_address(xpub_str: &str, index: u32, chain: Chain) -> Result<String, DetectorError> {
     let btc_xpub_str = normalize_xpub_to_bitcoin(xpub_str, chain)?;
 
-    let xpub = Xpub::from_str(&btc_xpub_str)
-        .map_err(|e| DetectorError::InvalidXpub(e.to_string()))?;
+    let xpub =
+        Xpub::from_str(&btc_xpub_str).map_err(|e| DetectorError::InvalidXpub(e.to_string()))?;
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
@@ -164,23 +165,29 @@ pub fn derive_address(
             let btc_addr = address.to_string();
             btc_bech32_to_ltc_bech32(&btc_addr)
         }
+        Chain::Solana => Err(DetectorError::DerivationFailed {
+            index,
+            reason: "Solana address derivation is not handled in BTC/LTC derivation module".into(),
+        }),
     }
 }
 
 fn btc_bech32_to_ltc_bech32(btc_addr: &str) -> Result<String, DetectorError> {
     use bech32::Hrp;
 
-    let (_hrp, witness_version, witness_program) = bech32::segwit::decode(btc_addr)
-        .map_err(|e| DetectorError::DerivationFailed {
+    let (_hrp, witness_version, witness_program) =
+        bech32::segwit::decode(btc_addr).map_err(|e| DetectorError::DerivationFailed {
             index: 0,
             reason: format!("Failed to decode bech32 segwit address: {e}"),
         })?;
 
     let ltc_hrp = Hrp::parse("ltc").unwrap();
-    let encoded = bech32::segwit::encode(ltc_hrp, witness_version, &witness_program)
-        .map_err(|e| DetectorError::DerivationFailed {
-            index: 0,
-            reason: format!("Failed to encode ltc bech32 address: {e}"),
+    let encoded =
+        bech32::segwit::encode(ltc_hrp, witness_version, &witness_program).map_err(|e| {
+            DetectorError::DerivationFailed {
+                index: 0,
+                reason: format!("Failed to encode ltc bech32 address: {e}"),
+            }
         })?;
 
     Ok(encoded)
