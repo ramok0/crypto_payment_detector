@@ -23,6 +23,7 @@ pub struct SolanaConfig {
     pub proxy_url: Option<String>,
     pub max_retries: u32,
     pub retry_base_delay_ms: u64,
+    pub min_deposit_fiat: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,6 +393,15 @@ impl SolanaDetector {
         }
 
         let current_slot = self.get_current_slot().await?;
+        let spot_price = match self.price_fetcher.get_price().await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!(
+                    "[SOL] Failed to fetch price for dust filter (continuing without fiat filter): {e}"
+                );
+                None
+            }
+        };
 
         for sig in &new_sigs {
             let tx = match self.get_transaction(&sig.signature).await {
@@ -451,6 +461,23 @@ impl SolanaDetector {
             }
 
             let memo = memo.unwrap();
+            if let Some(price) = spot_price {
+                let amount_coin = amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64;
+                let fiat_value = amount_coin * price;
+                if fiat_value < self.config.min_deposit_fiat {
+                    log::info!(
+                        "[SOL] Ignoring dust deposit tx={} amount={} SOL (~{:.4} {}) < min {:.2}",
+                        sig.signature,
+                        amount_coin,
+                        fiat_value,
+                        self.price_fetcher.currency(),
+                        self.config.min_deposit_fiat
+                    );
+                    self.persist_state(Some(sig.signature.clone()))?;
+                    continue;
+                }
+            }
+
             let confirmations = current_slot.saturating_sub(tx.slot) + 1;
             let detected = DetectedPayment {
                 chain: Chain::Solana,

@@ -47,6 +47,7 @@ FIAT_CURRENCY=EUR
 BTC_POLL_INTERVAL=120     # seconds between polls (BTC)
 LTC_POLL_INTERVAL=30      # seconds between polls (LTC)
 SOL_POLL_INTERVAL=60      # seconds between polls (SOL)
+SOL_MIN_DEPOSIT_FIAT=0.5  # ignore SOL deposits below this fiat value (dust filter)
 
 RUST_LOG=info
 ```
