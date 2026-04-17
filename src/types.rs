@@ -145,6 +145,7 @@ pub struct DetectorConfig {
     pub retry: RetryConfig,
     pub explorer_api_url: Option<String>,
     pub min_confirmations: u64,
+    pub skip_initial_block_sync: bool,
 }
 
 impl Default for DetectorConfig {
@@ -165,6 +166,7 @@ impl Default for DetectorConfig {
             retry: RetryConfig::default(),
             explorer_api_url: None,
             min_confirmations: 1,
+            skip_initial_block_sync: false,
         }
     }
 }

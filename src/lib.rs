@@ -1,5 +1,6 @@
 pub mod blockstream;
 pub mod derivation;
+pub mod env_utils;
 pub mod error;
 pub mod persistence;
 pub mod pricing;

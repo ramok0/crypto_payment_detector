@@ -8,6 +8,7 @@ use axum::routing::get;
 use serde::{Deserialize, Serialize};
 
 use crypto_payment_detector::derivation::derive_address;
+use crypto_payment_detector::env_utils::chain_env_bool;
 use crypto_payment_detector::persistence::{PersistedState, load_state};
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
@@ -212,6 +213,11 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1)
         },
+        skip_initial_block_sync: chain_env_bool(
+            chain,
+            "SKIP_INITIAL_BLOCK_SYNC",
+            "SKIP_INITIAL_BLOCK_SYNC",
+        ),
     }
 }
 

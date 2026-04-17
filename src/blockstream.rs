@@ -505,9 +505,24 @@ impl PaymentDetector for ChainDetector {
         );
 
         let persisted = crate::persistence::load_state(&self.config.state_file)?;
+        let mut known_block_hashes = persisted.known_block_hashes.clone();
 
         let mut current_height = if let Some(h) = start_height {
             h
+        } else if self.config.skip_initial_block_sync {
+            let tip_height = self.get_chain_tip().await?;
+            let persisted_height = persisted
+                .last_scanned_height
+                .map(|height| height.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            log::info!(
+                "[{}] Initial block sync disabled, ignoring persisted height {} and waiting for blocks after tip {}",
+                ticker,
+                persisted_height,
+                tip_height
+            );
+            known_block_hashes.clear();
+            tip_height.saturating_add(1)
         } else if let Some(last) = persisted.last_scanned_height {
             log::info!("[{}] Resuming from persisted height {}", ticker, last + 1);
             last + 1
@@ -518,7 +533,17 @@ impl PaymentDetector for ChainDetector {
         {
             let mut state = self.state.lock().unwrap();
             state.last_scanned_height = Some(current_height.saturating_sub(1));
-            state.known_block_hashes = persisted.known_block_hashes;
+            state.known_block_hashes = known_block_hashes.clone();
+        }
+
+        if self.config.skip_initial_block_sync {
+            crate::persistence::save_state(
+                &self.config.state_file,
+                &crate::persistence::PersistedState {
+                    last_scanned_height: Some(current_height.saturating_sub(1)),
+                    known_block_hashes: known_block_hashes.clone(),
+                },
+            )?;
         }
 
         loop {
