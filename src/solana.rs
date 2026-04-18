@@ -234,7 +234,12 @@ impl SolanaDetector {
     }
 
     pub fn wallet_count(&self) -> usize {
-        self.wallets.len()
+        load_wallet_pool(&self.config.wallet_pool_file)
+            .map(|wallets| wallets.len())
+            .unwrap_or_else(|error| {
+                log::warn!("[SOL] Failed to reload wallet pool for count: {error}");
+                self.wallets.len()
+            })
     }
 
     async fn process_cycle(&self) -> Result<(), DetectorError> {
@@ -424,7 +429,8 @@ impl SolanaDetector {
     }
 
     async fn sweep_available_balance(&self, address: &str) -> Result<SweepResult, DetectorError> {
-        let wallet = find_wallet(&self.wallets, address).ok_or_else(|| {
+        let wallets = load_wallet_pool(&self.config.wallet_pool_file)?;
+        let wallet = find_wallet(&wallets, address).ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Solana wallet found for address '{}'",
                 address

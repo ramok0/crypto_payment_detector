@@ -1,3 +1,5 @@
+use std::io::ErrorKind;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,28 +29,32 @@ pub struct SolanaReservation {
     pub expires_at_unix: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum WalletPoolInput {
     List(Vec<WalletEntry>),
     Wrapped { wallets: Vec<WalletEntry> },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WalletEntry {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     address: Option<String>,
     #[serde(default, alias = "secret_key", alias = "secretKey", alias = "keypair")]
     private_key: serde_json::Value,
 }
 
 pub fn load_wallet_pool(path: &str) -> Result<Vec<ManagedSolanaWallet>, DetectorError> {
-    let data = std::fs::read_to_string(path).map_err(|e| {
-        DetectorError::InvalidConfig(format!(
-            "Failed to read Solana wallet pool file '{}': {e}",
-            path
-        ))
-    })?;
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(DetectorError::InvalidConfig(format!(
+                "Failed to read Solana wallet pool file '{}': {error}",
+                path
+            )));
+        }
+    };
 
     let input: WalletPoolInput = serde_json::from_str(&data).map_err(|e| {
         DetectorError::InvalidConfig(format!(
@@ -63,9 +69,7 @@ pub fn load_wallet_pool(path: &str) -> Result<Vec<ManagedSolanaWallet>, Detector
     };
 
     if entries.is_empty() {
-        return Err(DetectorError::InvalidConfig(
-            "Solana wallet pool file is empty".into(),
-        ));
+        return Ok(Vec::new());
     }
 
     let mut wallets = Vec::with_capacity(entries.len());
@@ -111,11 +115,80 @@ pub fn load_wallet_pool(path: &str) -> Result<Vec<ManagedSolanaWallet>, Detector
     Ok(wallets)
 }
 
+pub fn append_generated_wallet_to_pool(path: &str) -> Result<ManagedSolanaWallet, DetectorError> {
+    let mut entries = load_wallet_entries(path)?;
+    let index = entries.len() as u32;
+
+    let keypair = Keypair::new();
+    let address = keypair.pubkey().to_string();
+    let private_key = bs58::encode(keypair.to_bytes()).into_string();
+
+    entries.push(WalletEntry {
+        address: Some(address.clone()),
+        private_key: serde_json::Value::String(private_key),
+    });
+
+    write_wallet_entries(path, &entries)?;
+
+    Ok(ManagedSolanaWallet {
+        index,
+        address,
+        keypair: Arc::new(keypair),
+    })
+}
+
 pub fn find_wallet<'a>(
     wallets: &'a [ManagedSolanaWallet],
     address: &str,
 ) -> Option<&'a ManagedSolanaWallet> {
     wallets.iter().find(|wallet| wallet.address == address)
+}
+
+fn load_wallet_entries(path: &str) -> Result<Vec<WalletEntry>, DetectorError> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(DetectorError::InvalidConfig(format!(
+                "Failed to read Solana wallet pool file '{}': {error}",
+                path
+            )));
+        }
+    };
+
+    let input: WalletPoolInput = serde_json::from_str(&data).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to parse Solana wallet pool file '{}': {e}",
+            path
+        ))
+    })?;
+
+    Ok(match input {
+        WalletPoolInput::List(entries) => entries,
+        WalletPoolInput::Wrapped { wallets } => wallets,
+    })
+}
+
+fn write_wallet_entries(path: &str, entries: &[WalletEntry]) -> Result<(), DetectorError> {
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                DetectorError::InvalidConfig(format!(
+                    "Failed to create Solana wallet pool directory '{}': {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+
+    let payload = serde_json::json!({ "wallets": entries });
+    let data = serde_json::to_string_pretty(&payload)?;
+    std::fs::write(path, format!("{data}\n")).map_err(|error| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to write Solana wallet pool file '{}': {error}",
+            path
+        ))
+    })
 }
 
 pub async fn load_active_reservations(
