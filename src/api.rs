@@ -1,10 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::Json;
-use axum::routing::get;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crypto_payment_detector::derivation::derive_address;
@@ -12,13 +12,23 @@ use crypto_payment_detector::env_utils::chain_env_bool;
 use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
-    BasicAuth, ChainDetector, DetectorConfig, PaymentDetector, RetryConfig, SolanaConfig,
-    SolanaDetector,
+    BasicAuth, ChainDetector, DetectorConfig, DetectorError, ManagedSolanaWallet, PaymentDetector,
+    RetryConfig, SolanaConfig, SolanaDetector, SolanaReservation, load_active_reservations,
+    load_wallet_pool, reserve_wallet_for_user,
 };
 
 #[derive(Clone)]
 struct AppState {
     chains: Vec<ChainInfo>,
+    solana_pool: Option<SolanaPoolApiState>,
+}
+
+#[derive(Clone)]
+struct SolanaPoolApiState {
+    wallets: Vec<ManagedSolanaWallet>,
+    redis_url: String,
+    reservation_ttl_secs: u64,
+    secure_deposit_address: String,
 }
 
 #[derive(Clone)]
@@ -48,6 +58,11 @@ struct DeriveParams {
     start: u32,
     #[serde(default = "default_count")]
     count: u32,
+}
+
+#[derive(Deserialize)]
+struct ReserveSolanaAddressRequest {
+    user_id: String,
 }
 
 fn default_count() -> u32 {
@@ -81,8 +96,31 @@ struct ChainHealthStatus {
     explorer_reachable: bool,
 }
 
+#[derive(Serialize)]
+struct ReserveSolanaAddressResponse {
+    user_id: String,
+    address: String,
+    wallet_index: u32,
+    reserved_at_unix: i64,
+    expires_at_unix: i64,
+    reservation_ttl_secs: u64,
+    sweep_destination_address: String,
+}
+
+#[derive(Serialize)]
+struct ActiveSolanaReservationsResponse {
+    count: usize,
+    reservations: Vec<SolanaReservation>,
+}
+
 #[derive(Deserialize)]
 struct SolanaHealthState {
+    #[serde(default)]
+    addresses: HashMap<String, SolanaAddressHealthCursor>,
+}
+
+#[derive(Deserialize)]
+struct SolanaAddressHealthCursor {
     last_processed_signature: Option<String>,
 }
 
@@ -98,7 +136,7 @@ async fn handle_derive(
     let info = state
         .chains
         .iter()
-        .find(|c| c.chain == chain)
+        .find(|chain_info| chain_info.chain == chain)
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -113,17 +151,14 @@ async fn handle_derive(
     let mut addresses = Vec::with_capacity(params.count as usize);
     match &info.address_source {
         AddressSource::Xpub(xpub) => {
-            for i in params.start..params.start + params.count {
-                let addr = derive_address(xpub, i, chain).map_err(|e| {
+            for index in params.start..params.start + params.count {
+                let address = derive_address(xpub, index, chain).map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Derivation error at index {i}: {e}"),
+                        format!("Derivation error at index {index}: {e}"),
                     )
                 })?;
-                addresses.push(AddressEntry {
-                    index: i,
-                    address: addr,
-                });
+                addresses.push(AddressEntry { index, address });
             }
         }
         AddressSource::Static(address) => {
@@ -158,9 +193,9 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
                         .get(&tip_url)
                         .send()
                         .await
-                        .map(|r| r.status().is_success())
+                        .map(|response| response.status().is_success())
                         .unwrap_or(false);
-                    let last_scanned_height = persisted.and_then(|s| s.last_scanned_height);
+                    let last_scanned_height = persisted.and_then(|state| state.last_scanned_height);
                     let chain_ok = reachable && last_scanned_height.is_some();
                     (last_scanned_height, None, reachable, chain_ok)
                 }
@@ -177,14 +212,13 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
                         }))
                         .send()
                         .await
-                        .map(|r| r.status().is_success())
+                        .map(|response| response.status().is_success())
                         .unwrap_or(false);
                     (None, last_processed_signature, reachable, reachable)
                 }
             };
 
         all_ok &= chain_ok;
-
         chains.push(ChainHealthStatus {
             chain: info.chain.name().to_string(),
             ticker: info.chain.ticker().to_string(),
@@ -202,6 +236,57 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
         },
         chains,
     })
+}
+
+async fn handle_solana_reserve(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ReserveSolanaAddressRequest>,
+) -> Result<Json<ReserveSolanaAddressResponse>, (StatusCode, String)> {
+    let Some(solana_pool) = state.solana_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Solana address pool is not configured".into(),
+        ));
+    };
+
+    let reservation = reserve_wallet_for_user(
+        &solana_pool.redis_url,
+        &solana_pool.wallets,
+        &payload.user_id,
+        solana_pool.reservation_ttl_secs,
+    )
+    .await
+    .map_err(map_reservation_error)?;
+
+    Ok(Json(ReserveSolanaAddressResponse {
+        user_id: reservation.user_id,
+        address: reservation.address,
+        wallet_index: reservation.wallet_index,
+        reserved_at_unix: reservation.reserved_at_unix,
+        expires_at_unix: reservation.expires_at_unix,
+        reservation_ttl_secs: solana_pool.reservation_ttl_secs,
+        sweep_destination_address: solana_pool.secure_deposit_address.clone(),
+    }))
+}
+
+async fn handle_solana_active(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ActiveSolanaReservationsResponse>, (StatusCode, String)> {
+    let Some(solana_pool) = state.solana_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Solana address pool is not configured".into(),
+        ));
+    };
+
+    let reservations = load_active_reservations(&solana_pool.redis_url)
+        .await
+        .map_err(map_internal_error)?;
+
+    Ok(Json(ActiveSolanaReservationsResponse {
+        count: reservations.len(),
+        reservations,
+    }))
 }
 
 fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
@@ -235,7 +320,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("POLL_INTERVAL"))
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(30)
         },
         proxy_url: std::env::var("PROXY").ok(),
@@ -246,11 +331,11 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
         retry: RetryConfig {
             max_retries: std::env::var("MAX_RETRIES")
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(5),
             base_delay_ms: std::env::var("RETRY_BASE_DELAY_MS")
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(1000),
         },
         explorer_api_url: std::env::var("EXPLORER_API_URL").ok(),
@@ -263,7 +348,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(1)
         },
         skip_initial_block_sync: chain_env_bool(
@@ -278,38 +363,44 @@ fn build_solana_config() -> SolanaConfig {
     SolanaConfig {
         rpc_url: std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.mainnet.solana.com".to_string()),
-        deposit_address: std::env::var("SOLANA_DEPOSIT_ADDRESS")
+        wallet_pool_file: std::env::var("SOLANA_WALLET_POOL_FILE")
+            .expect("SOLANA_WALLET_POOL_FILE env var required for CHAIN=solana"),
+        secure_deposit_address: std::env::var("SOLANA_DEPOSIT_ADDRESS")
             .expect("SOLANA_DEPOSIT_ADDRESS env var required for CHAIN=solana"),
         webhook_url: std::env::var("WEBHOOK_URL").expect("WEBHOOK_URL env var required"),
         webhook_hmac_secret: std::env::var("WEBHOOK_SECRET")
             .expect("WEBHOOK_SECRET env var required"),
-        discord_invalid_webhook_url: std::env::var("DISCORD_INVALID_MEMO_WEBHOOK_URL").ok(),
+        redis_url: std::env::var("REDIS_URL").expect("REDIS_URL env var required"),
+        reservation_ttl_secs: std::env::var("SOLANA_RESERVATION_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3600),
         state_file: std::env::var("SOL_STATE_FILE")
             .or_else(|_| std::env::var("STATE_FILE"))
             .unwrap_or_else(|_| "sol_detector_state.json".to_string()),
         poll_interval_secs: std::env::var("SOL_POLL_INTERVAL")
             .or_else(|_| std::env::var("POLL_INTERVAL"))
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(60),
         min_confirmations: std::env::var("SOL_MIN_CONFIRMATIONS")
             .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(1),
         fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
         proxy_url: std::env::var("PROXY").ok(),
         max_retries: std::env::var("MAX_RETRIES")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(5),
         retry_base_delay_ms: std::env::var("RETRY_BASE_DELAY_MS")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(1000),
         min_deposit_fiat: std::env::var("SOL_MIN_DEPOSIT_FIAT")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(0.5),
     }
 }
@@ -321,7 +412,7 @@ fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
         Chain::Solana => return None,
     };
     let xpub = match std::env::var(xpub_var) {
-        Ok(v) if !v.is_empty() => v,
+        Ok(value) if !value.is_empty() => value,
         _ => return None,
     };
 
@@ -349,8 +440,8 @@ fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
 }
 
 fn build_solana_chain_info() -> Option<ChainInfo> {
-    let deposit_address = match std::env::var("SOLANA_DEPOSIT_ADDRESS") {
-        Ok(v) if !v.is_empty() => v,
+    let secure_deposit_address = match std::env::var("SOLANA_DEPOSIT_ADDRESS") {
+        Ok(value) if !value.is_empty() => value,
         _ => return None,
     };
 
@@ -362,18 +453,27 @@ fn build_solana_chain_info() -> Option<ChainInfo> {
 
     Some(ChainInfo {
         chain: Chain::Solana,
-        address_source: AddressSource::Static(deposit_address),
+        address_source: AddressSource::Static(secure_deposit_address),
         state_file,
         endpoint: HealthEndpoint::SolanaRpc(rpc_url),
+    })
+}
+
+fn build_solana_pool_api_state(config: &SolanaConfig) -> Result<SolanaPoolApiState, DetectorError> {
+    Ok(SolanaPoolApiState {
+        wallets: load_wallet_pool(&config.wallet_pool_file)?,
+        redis_url: config.redis_url.clone(),
+        reservation_ttl_secs: config.reservation_ttl_secs,
+        secure_deposit_address: config.secure_deposit_address.clone(),
     })
 }
 
 async fn run_detector(detector: Arc<ChainDetector>, max_index: u32) {
     let ticker = detector.chain().ticker();
     loop {
-        if let Err(e) = detector.run_block_scan_loop(None, max_index).await {
+        if let Err(error) = detector.run_block_scan_loop(None, max_index).await {
             log::error!(
-                "[{}] Block scan loop error: {e} - restarting in 10s",
+                "[{}] Block scan loop error: {error} - restarting in 10s",
                 ticker
             );
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -383,8 +483,8 @@ async fn run_detector(detector: Arc<ChainDetector>, max_index: u32) {
 
 async fn run_solana_detector(detector: Arc<SolanaDetector>) {
     loop {
-        if let Err(e) = detector.run_block_scan_loop(None, 0).await {
-            log::error!("[SOL] Solana scan loop error: {e} - restarting in 10s");
+        if let Err(error) = detector.run_block_scan_loop(None, 0).await {
+            log::error!("[SOL] Solana scan loop error: {error} - restarting in 10s");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     }
@@ -398,19 +498,35 @@ fn load_solana_last_processed_signature(path: &str) -> Option<String> {
 
     let data = match std::fs::read_to_string(file) {
         Ok(data) => data,
-        Err(e) => {
-            log::warn!("[SOL] Failed to read state file '{}': {}", path, e);
+        Err(error) => {
+            log::warn!("[SOL] Failed to read state file '{}': {}", path, error);
             return None;
         }
     };
 
     match serde_json::from_str::<SolanaHealthState>(&data) {
-        Ok(state) => state.last_processed_signature,
-        Err(e) => {
-            log::warn!("[SOL] Failed to parse state file '{}': {}", path, e);
+        Ok(state) => state
+            .addresses
+            .values()
+            .find_map(|cursor| cursor.last_processed_signature.clone()),
+        Err(error) => {
+            log::warn!("[SOL] Failed to parse state file '{}': {}", path, error);
             None
         }
     }
+}
+
+fn map_reservation_error(error: DetectorError) -> (StatusCode, String) {
+    let message = error.to_string();
+    if message.contains("No unreserved Solana wallet") {
+        (StatusCode::CONFLICT, message)
+    } else {
+        map_internal_error(error)
+    }
+}
+
+fn map_internal_error(error: DetectorError) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 #[tokio::main]
@@ -421,7 +537,7 @@ async fn main() {
     let chain_str = std::env::var("CHAIN").unwrap_or_else(|_| "bitcoin".to_string());
     let max_index: u32 = std::env::var("MAX_DERIVATION_INDEX")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(100);
     let chains: Vec<Chain> = match chain_str.to_lowercase().as_str() {
         "both" => vec![Chain::Bitcoin, Chain::Litecoin],
@@ -433,6 +549,7 @@ async fn main() {
 
     let mut chain_infos = Vec::new();
     let mut detector_handles = Vec::new();
+    let mut solana_pool = None;
 
     for chain in &chains {
         match chain {
@@ -459,9 +576,9 @@ async fn main() {
                         detector.derive_address(0).unwrap()
                     );
 
-                    let det = detector.clone();
+                    let detector_handle = detector.clone();
                     detector_handles.push(tokio::spawn(async move {
-                        run_detector(det, max_index).await;
+                        run_detector(detector_handle, max_index).await;
                     }));
 
                     chain_infos.push(info);
@@ -477,21 +594,25 @@ async fn main() {
             Chain::Solana => {
                 if let Some(info) = build_solana_chain_info() {
                     let config = build_solana_config();
+                    let pool_state = build_solana_pool_api_state(&config)
+                        .expect("Failed to load Solana wallet pool");
                     let detector = Arc::new(
-                        SolanaDetector::new(config).expect("Failed to create SOL detector"),
+                        SolanaDetector::new(config.clone()).expect("Failed to create SOL detector"),
                     );
 
                     log::info!(
-                        "[SOL] Detector started - deposit address: {}",
-                        detector.derive_address(0).unwrap()
+                        "[SOL] Detector started - sweep destination: {} - managed wallets: {}",
+                        detector.derive_address(0).unwrap(),
+                        detector.wallet_count()
                     );
 
-                    let det = detector.clone();
+                    let detector_handle = detector.clone();
                     detector_handles.push(tokio::spawn(async move {
-                        run_solana_detector(det).await;
+                        run_solana_detector(detector_handle).await;
                     }));
 
                     chain_infos.push(info);
+                    solana_pool = Some(pool_state);
                 } else {
                     log::warn!("[SOL] SOLANA_DEPOSIT_ADDRESS not set, skipping");
                 }
@@ -506,11 +627,14 @@ async fn main() {
 
     let state = Arc::new(AppState {
         chains: chain_infos,
+        solana_pool,
     });
 
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/derive", get(handle_derive))
+        .route("/solana/reserve", post(handle_solana_reserve))
+        .route("/solana/active", get(handle_solana_active))
         .with_state(state);
 
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());

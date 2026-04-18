@@ -1,23 +1,41 @@
 # Crypto Payment Detector
 
-A Rust-based payment detection system for **Bitcoin**, **Litecoin**, and **Solana**. Monitors blockchains in near real-time and sends HMAC-signed webhook notifications for detected and credited payments.
+Rust payment detector for **Bitcoin**, **Litecoin**, and **Solana**.
+
+BTC and LTC stay watch-only with xpub / Ltub derivation.
+Solana now uses a **bot-managed wallet pool** backed by **Redis reservations**:
+
+- the API reserves one temporary Solana address per user for 1 hour
+- the detector scans only active reserved addresses from Redis
+- when funds arrive, webhooks include the `user_id`
+- once the payment is credited, the bot automatically sweeps the maximum spendable SOL from that temporary address to your secure destination wallet
 
 ## Features
 
-- **Multi-chain support** — Bitcoin, Litecoin, Solana (`CHAIN=both`, `CHAIN=solana`, or `CHAIN=all`)
-- **BIP84 (P2WPKH) address derivation** from xpub / Ltub keys (watch-only, no private keys needed)
-- **Raw block scanning** with parallel transaction matching via [rayon](https://github.com/rayon-rs/rayon)
-- **Solana deposit watcher** via RPC `getSignaturesForAddress` + `getTransaction` with memo validation
-- **HMAC-SHA256 signed webhooks** with infinite retry and exponential backoff
-- **Fiat price enrichment** via Kraken public API (EUR, USD, GBP, CAD, JPY, AUD, CHF)
-- **Persistence** — resumes from last scanned block on restart
-- **Configurable retry**, poll intervals, and explorer API URLs per chain
+- Multi-chain support: Bitcoin, Litecoin, Solana
+- BTC/LTC watch-only address derivation from xpub / Ltub
+- Solana address pool loaded from a local JSON file with private keys
+- Redis-backed Solana reservation system with 1h TTL by default
+- HMAC-SHA256 signed webhooks
+- Automatic Solana sweep to a secure destination wallet
+- Fiat enrichment via Kraken public API
+- Persistent state for restart recovery
+
+## Solana Flow
+
+1. Your bot/API reserves a temporary address for a `user_id`.
+2. The reservation is stored in Redis with a TTL.
+3. The Solana detector polls only the active reserved addresses.
+4. On incoming payment, it sends `payment_detected`.
+5. Once confirmations are met, it sweeps the max spendable balance to `SOLANA_DEPOSIT_ADDRESS`.
+6. It then sends `payment_credited` with the user id, received amount, and sweep metadata.
 
 ## Quick Start
 
 ### Prerequisites
 
 - Rust 1.85+
+- Redis
 
 ### Build
 
@@ -27,15 +45,19 @@ cargo build --release
 
 ### Configuration
 
-Create a `.env` file:
+Example `.env`:
 
 ```env
-CHAIN=both                # bitcoin, litecoin, solana, btc, ltc, sol, both, all
-BTC_XPUB=xpub6...        # Bitcoin extended public key
-LTC_XPUB=Ltub2...        # Litecoin extended public key
-SOLANA_DEPOSIT_ADDRESS=...   # Solana deposit wallet address (watch-only)
+CHAIN=all
+
+BTC_XPUB=xpub6...
+LTC_XPUB=Ltub2...
+
 SOLANA_RPC_URL=https://api.mainnet.solana.com
-DISCORD_INVALID_MEMO_WEBHOOK_URL=https://discord.com/api/webhooks/...
+SOLANA_WALLET_POOL_FILE=solana_wallets.json
+SOLANA_DEPOSIT_ADDRESS=...        # secure destination wallet, usually the hardware wallet receive address
+REDIS_URL=redis://127.0.0.1:6379/
+SOLANA_RESERVATION_TTL_SECS=3600
 
 WEBHOOK_URL=http://localhost:8080/webhook
 WEBHOOK_SECRET=your_hmac_secret
@@ -44,103 +66,204 @@ AUTH_USER=user
 AUTH_PASS=pass
 
 FIAT_CURRENCY=EUR
-BTC_POLL_INTERVAL=120     # seconds between polls (BTC)
-LTC_POLL_INTERVAL=30      # seconds between polls (LTC)
-SOL_POLL_INTERVAL=60      # seconds between polls (SOL)
-SOL_MIN_DEPOSIT_FIAT=0.5  # ignore SOL deposits below this fiat value (dust filter)
+BTC_POLL_INTERVAL=120
+LTC_POLL_INTERVAL=30
+SOL_POLL_INTERVAL=20
+SOL_MIN_DEPOSIT_FIAT=0.5
+SOL_MIN_CONFIRMATIONS=1
 
 RUST_LOG=info
 ```
 
 Optional:
+
 ```env
 PROXY=socks5://user:pass@host:port
-EXPLORER_API_URL=https://blockstream.info/api    # override default explorer
+EXPLORER_API_URL=https://blockstream.info/api
 MAX_RETRIES=5
 RETRY_BASE_DELAY_MS=1000
-SKIP_INITIAL_BLOCK_SYNC=true                     # BTC/LTC: ignore backlog and start after current tip
-# BTC_SKIP_INITIAL_BLOCK_SYNC=true               # optional per-chain override
-# LTC_SKIP_INITIAL_BLOCK_SYNC=true               # optional per-chain override
+SKIP_INITIAL_BLOCK_SYNC=true
 BTC_STATE_FILE=btc_state.json
 LTC_STATE_FILE=ltc_state.json
+SOL_STATE_FILE=sol_state.json
 BTC_MIN_CONFIRMATIONS=3
 LTC_MIN_CONFIRMATIONS=2
-SOL_MIN_CONFIRMATIONS=1
 MAX_DERIVATION_INDEX=1500
+API_BIND=0.0.0.0:3030
 ```
 
-### Run
+## Solana Wallet Pool File
+
+Set `SOLANA_WALLET_POOL_FILE` to a JSON file containing the bot-managed private keys.
+
+Supported formats:
+
+1. Array of entries
+2. Object with a `wallets` field
+3. Private key as base58 string or as a 64-byte array
+
+Example:
+
+```json
+{
+  "wallets": [
+    {
+      "address": "Fh3Y...",
+      "private_key": "4UhnbpVAaXHYiQ1..."
+    },
+    {
+      "private_key": "2j8zXJwL7n2p..."
+    }
+  ]
+}
+```
+
+Note:
+
+- if `address` is present, it is validated against the private key
+- the private key array must contain the full 64-byte Solana keypair
+
+## Run
+
+Detector only:
 
 ```bash
-# Single chain
-CHAIN=bitcoin cargo run --release
+CHAIN=solana cargo run --release
+```
 
-# Both chains concurrently
-CHAIN=both cargo run --release
+API + detector:
 
-# Custom derivation gap (default: 100)
-cargo run --release -- 200
+```bash
+CHAIN=all cargo run --release --bin crypto_payment_api
+```
+
+## API
+
+### Health
+
+```http
+GET /health
+```
+
+### BTC/LTC Derivation Helper
+
+```http
+GET /derive?chain=bitcoin&start=0&count=5
+```
+
+### Reserve a Solana Address
+
+```http
+POST /solana/reserve
+Content-Type: application/json
+
+{
+  "user_id": "123456789"
+}
+```
+
+Example response:
+
+```json
+{
+  "user_id": "123456789",
+  "address": "6tM5...",
+  "wallet_index": 4,
+  "reserved_at_unix": 1773500000,
+  "expires_at_unix": 1773503600,
+  "reservation_ttl_secs": 3600,
+  "sweep_destination_address": "HwSecureWallet..."
+}
+```
+
+If the same user already has an active reservation, the API returns the existing one.
+
+### List Active Solana Reservations
+
+```http
+GET /solana/active
 ```
 
 ## Webhook Format
 
 Webhooks are POST requests with:
+
 - `Content-Type: application/json`
 - `X-Signature-256` header containing the HMAC-SHA256 hex signature of the body
 
-Payload:
+Example payload:
+
 ```json
 {
-  "event": "payment_detected",
+  "event": "payment_credited",
   "data": {
-    "chain": "Bitcoin",
-    "txid": "abc123...",
-    "address": "bc1q...",
-    "amount_sat": 100000,
-    "confirmations": 3,
-    "block_height": 840000,
-    "derivation_index": 12,
-    "memo": "123456",
-    "fiat_amount": 52.30,
+    "chain": "solana",
+    "ticker": "SOL",
+    "txid": "5tYp...",
+    "address": "6tM5...",
+    "user_id": "123456789",
+    "amount_sat": 1250000000,
+    "amount_coin": 1.25,
+    "confirmations": 1,
+    "block_height": 321654987,
+    "derivation_index": 4,
+    "memo": null,
+    "swept_to_address": "HwSecureWallet...",
+    "swept_amount_sat": 1249995000,
+    "swept_amount_coin": 1.249995,
+    "sweep_txid": "3w9Q...",
+    "fiat_amount": 148.22,
     "fiat_currency": "EUR",
-    "coin_price": 52300.00
+    "coin_price": 118.58
   }
 }
 ```
 
-### Example Webhook Server
+Important fields:
+
+- `address`: the temporary reserved Solana address that received the payment
+- `user_id`: the Redis reservation owner
+- `amount_*`: what the user sent in the detected transaction
+- `swept_*`: what was actually forwarded to the secure destination address
+
+## Example Webhook Server
 
 ```bash
 WEBHOOK_SECRET=your_secret cargo run --example webhook_server
 ```
 
-Listens on `http://localhost:8080/webhook`, verifies HMAC signatures and logs incoming payments.
+It listens on `http://localhost:8080/webhook`.
 
 ## Architecture
 
-```
+```text
 src/
-├── blockstream.rs   # ChainDetector: block fetching, scanning, webhook dispatch
-├── derivation.rs    # BIP32/84 address derivation (BTC xpub + LTC Ltub)
-├── error.rs         # Error types
-├── lib.rs           # Public API
-├── main.rs          # Binary entry point, multi-chain orchestration
-├── persistence.rs   # State save/load (JSON, atomic write)
-├── pricing.rs       # Kraken price fetcher with 30s cache
-├── trait_def.rs     # PaymentDetector trait
-├── types.rs         # Chain, DetectorConfig, DetectedPayment, WebhookEvent
-└── webhook.rs       # HMAC signing, webhook delivery with retry
+|-- api.rs           # API server, reservation endpoints, detector orchestration
+|-- blockstream.rs   # BTC/LTC block scanning
+|-- derivation.rs    # BTC/LTC address derivation
+|-- error.rs         # Error types
+|-- lib.rs           # Public exports
+|-- main.rs          # Detector-only entry point
+|-- persistence.rs   # BTC/LTC state helpers
+|-- pricing.rs       # Fiat pricing
+|-- solana.rs        # Solana detector, scanning, sweep logic
+|-- solana_pool.rs   # Solana wallet pool loading + Redis reservations
+|-- trait_def.rs     # Shared detector trait
+|-- types.rs         # Shared webhook and payment types
+`-- webhook.rs       # HMAC signing and delivery
 ```
 
-## Block Data Sources
+## Operational Notes
 
-| Chain    | Chain tip / Block hash       | Raw block data                |
-|----------|------------------------------|-------------------------------|
-| Bitcoin  | blockstream.info/api         | blockchain.info (hex)         |
-| Litecoin | litecoinspace.org/api        | litecoinspace.org/api (binary)|
-When confirmations threshold is reached, a second webhook is sent with event `payment_credited`.
+- Solana sweep uses the max spendable balance on the temporary address at credit time.
+- If several deposits hit the same temporary address before the sweep runs, the first credited sweep can forward more than the single transaction amount because it forwards the current spendable balance.
+- Expired Redis reservations are no longer scanned for new incoming payments.
+- The secure destination address should be controlled outside the bot, ideally by a hardware wallet.
 
-For Solana:
-- Only transactions that increase `SOLANA_DEPOSIT_ADDRESS` balance are processed.
-- Memo must be numeric only (`^[0-9]+$`).
-- Missing or invalid memos are sent to `DISCORD_INVALID_MEMO_WEBHOOK_URL`.
+## Verification
+
+Current verification command:
+
+```bash
+cargo check --all-targets
+```

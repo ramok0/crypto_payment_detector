@@ -36,7 +36,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("POLL_INTERVAL"))
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(30)
         },
         proxy_url: std::env::var("PROXY").ok(),
@@ -47,11 +47,11 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
         retry: RetryConfig {
             max_retries: std::env::var("MAX_RETRIES")
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(5),
             base_delay_ms: std::env::var("RETRY_BASE_DELAY_MS")
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(1000),
         },
         explorer_api_url: std::env::var("EXPLORER_API_URL").ok(),
@@ -64,7 +64,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|value| value.parse().ok())
                 .unwrap_or(1)
         },
         skip_initial_block_sync: chain_env_bool(
@@ -79,38 +79,44 @@ fn build_solana_config() -> SolanaConfig {
     SolanaConfig {
         rpc_url: std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.mainnet.solana.com".to_string()),
-        deposit_address: std::env::var("SOLANA_DEPOSIT_ADDRESS")
+        wallet_pool_file: std::env::var("SOLANA_WALLET_POOL_FILE")
+            .expect("SOLANA_WALLET_POOL_FILE env var required for CHAIN=solana"),
+        secure_deposit_address: std::env::var("SOLANA_DEPOSIT_ADDRESS")
             .expect("SOLANA_DEPOSIT_ADDRESS env var required for CHAIN=solana"),
         webhook_url: std::env::var("WEBHOOK_URL").expect("WEBHOOK_URL env var required"),
         webhook_hmac_secret: std::env::var("WEBHOOK_SECRET")
             .expect("WEBHOOK_SECRET env var required"),
-        discord_invalid_webhook_url: std::env::var("DISCORD_INVALID_MEMO_WEBHOOK_URL").ok(),
+        redis_url: std::env::var("REDIS_URL").expect("REDIS_URL env var required"),
+        reservation_ttl_secs: std::env::var("SOLANA_RESERVATION_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3600),
         state_file: std::env::var("SOL_STATE_FILE")
             .or_else(|_| std::env::var("STATE_FILE"))
             .unwrap_or_else(|_| "sol_detector_state.json".to_string()),
         poll_interval_secs: std::env::var("SOL_POLL_INTERVAL")
             .or_else(|_| std::env::var("POLL_INTERVAL"))
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(60),
         min_confirmations: std::env::var("SOL_MIN_CONFIRMATIONS")
             .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(1),
         fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
         proxy_url: std::env::var("PROXY").ok(),
         max_retries: std::env::var("MAX_RETRIES")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(5),
         retry_base_delay_ms: std::env::var("RETRY_BASE_DELAY_MS")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(1000),
         min_deposit_fiat: std::env::var("SOL_MIN_DEPOSIT_FIAT")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(0.5),
     }
 }
@@ -118,9 +124,9 @@ fn build_solana_config() -> SolanaConfig {
 async fn run_detector(detector: Arc<ChainDetector>, max_index: u32) {
     let ticker = detector.chain().ticker();
     loop {
-        if let Err(e) = detector.run_block_scan_loop(None, max_index).await {
+        if let Err(error) = detector.run_block_scan_loop(None, max_index).await {
             log::error!(
-                "[{}] Block scan loop error: {e} - restarting in 10s",
+                "[{}] Block scan loop error: {error} - restarting in 10s",
                 ticker
             );
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -130,8 +136,8 @@ async fn run_detector(detector: Arc<ChainDetector>, max_index: u32) {
 
 async fn run_solana_detector(detector: Arc<SolanaDetector>) {
     loop {
-        if let Err(e) = detector.run_block_scan_loop(None, 0).await {
-            log::error!("[SOL] Solana scan loop error: {e} - restarting in 10s");
+        if let Err(error) = detector.run_block_scan_loop(None, 0).await {
+            log::error!("[SOL] Solana scan loop error: {error} - restarting in 10s");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     }
@@ -146,7 +152,7 @@ async fn main() {
 
     let max_index: u32 = std::env::args()
         .nth(1)
-        .and_then(|s| s.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(100);
 
     let chains: Vec<Chain> = match chain_str.to_lowercase().as_str() {
@@ -169,7 +175,7 @@ async fn main() {
                 };
 
                 let xpub = match std::env::var(xpub_var) {
-                    Ok(v) if !v.is_empty() => v,
+                    Ok(value) if !value.is_empty() => value,
                     _ => {
                         log::warn!("[{}] {} not set, skipping", chain.ticker(), xpub_var);
                         continue;
@@ -188,9 +194,9 @@ async fn main() {
                 println!("  Address 0: {}", detector.derive_address(0).unwrap());
                 println!();
 
-                let det = detector.clone();
+                let detector_handle = detector.clone();
                 handles.push(tokio::spawn(async move {
-                    run_detector(det, max_index).await;
+                    run_detector(detector_handle, max_index).await;
                 }));
             }
             Chain::Solana => {
@@ -200,12 +206,16 @@ async fn main() {
 
                 println!("Solana Payment Detector starting");
                 println!("  Chain: SOL");
-                println!("  Deposit address: {}", detector.derive_address(0).unwrap());
+                println!(
+                    "  Sweep destination: {}",
+                    detector.derive_address(0).unwrap()
+                );
+                println!("  Managed wallet count: {}", detector.wallet_count());
                 println!();
 
-                let det = detector.clone();
+                let detector_handle = detector.clone();
                 handles.push(tokio::spawn(async move {
-                    run_solana_detector(det).await;
+                    run_solana_detector(detector_handle).await;
                 }));
             }
         }

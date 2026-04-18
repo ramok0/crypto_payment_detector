@@ -26,6 +26,9 @@ pub enum DetectorError {
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 
+    #[error("Redis error: {0}")]
+    RedisError(String),
+
     #[error("Bitcoin key error: {0}")]
     BitcoinError(String),
 }

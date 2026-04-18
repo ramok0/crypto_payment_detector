@@ -49,6 +49,7 @@ async fn handle_webhook(
             println!("=== PAYMENT DETECTED ({}) ===", payment.chain);
             println!("  TxID:           {}", payment.txid);
             println!("  Address:        {}", payment.address);
+            println!("  User ID:        {:?}", payment.user_id);
             println!("  Amount:         {}", payment.amount_coin);
             println!("  Base units:     {}", payment.amount_sat);
             println!("  Confirmations:  {}", payment.confirmations);
@@ -60,12 +61,16 @@ async fn handle_webhook(
             println!("=== PAYMENT CREDITED ({}) ===", payment.chain);
             println!("  TxID:           {}", payment.txid);
             println!("  Address:        {}", payment.address);
+            println!("  User ID:        {:?}", payment.user_id);
             println!("  Amount:         {}", payment.amount_coin);
             println!("  Base units:     {}", payment.amount_sat);
             println!("  Confirmations:  {}", payment.confirmations);
             println!("  Block height:   {:?}", payment.block_height);
             println!("  Index:          {}", payment.derivation_index);
             println!("  Memo:           {:?}", payment.memo);
+            println!("  Swept To:       {:?}", payment.swept_to_address);
+            println!("  Swept Amount:   {:?}", payment.swept_amount_coin);
+            println!("  Sweep TxID:     {:?}", payment.sweep_txid);
             if let Some(price) = payment.coin_price {
                 println!(
                     "  {} price:    {:.2} {}",
