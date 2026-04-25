@@ -151,14 +151,6 @@ async fn run_solana_detector(detector: Arc<SolanaDetector>) {
     }
 }
 
-fn exit_solana_startup_error(error: crypto_payment_detector::DetectorError) -> ! {
-    eprintln!("Failed to create SOL detector: {error}");
-    eprintln!(
-        "Check SOLANA_WALLET_POOL_FILE. If it points to /wallet_pool/solana_wallets.json in Docker, mount a host JSON file or directory at /wallet_pool."
-    );
-    std::process::exit(1);
-}
-
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -217,10 +209,8 @@ async fn main() {
             }
             Chain::Solana => {
                 let config = build_solana_config();
-                let detector = Arc::new(
-                    SolanaDetector::new(config)
-                        .unwrap_or_else(|error| exit_solana_startup_error(error)),
-                );
+                let detector =
+                    Arc::new(SolanaDetector::new(config).expect("Failed to create SOL detector"));
 
                 println!("Solana Payment Detector starting");
                 println!("  Chain: SOL");

@@ -15,8 +15,8 @@ pub use error::DetectorError;
 pub use pricing::PriceFetcher;
 pub use solana::{SolanaConfig, SolanaDetector};
 pub use solana_pool::{
-    ManagedSolanaWallet, SolanaReservation, append_generated_wallet_to_pool,
-    load_active_reservations, load_wallet_pool, reserve_wallet_for_user,
+    ManagedSolanaWallet, SolanaReservation, load_active_reservations, load_wallet_pool,
+    reserve_wallet_for_user,
 };
 pub use trait_def::PaymentDetector;
 pub use types::{BasicAuth, Chain, DetectedPayment, DetectorConfig, RetryConfig, WebhookEvent};

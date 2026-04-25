@@ -103,18 +103,6 @@ key.
 
 Set `SOLANA_WALLET_POOL_FILE` to a JSON file containing the bot-managed private keys.
 
-The API creates this file automatically when `/solana/reserve` needs a new
-deposit address and no unreserved wallet is available.
-
-For Docker, keep the private keys outside the image and mount the folder:
-
-```yaml
-environment:
-  SOLANA_WALLET_POOL_FILE: /wallet_pool/solana_wallets.json
-volumes:
-  - ./wallet_pool:/wallet_pool
-```
-
 Supported formats:
 
 1. Array of entries

@@ -6,7 +6,6 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use crypto_payment_detector::derivation::derive_address;
 use crypto_payment_detector::env_utils::{chain_env_bool, chain_env_var};
@@ -14,8 +13,8 @@ use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, ManagedSolanaWallet, PaymentDetector,
-    RetryConfig, SolanaConfig, SolanaDetector, SolanaReservation, append_generated_wallet_to_pool,
-    load_active_reservations, load_wallet_pool, reserve_wallet_for_user,
+    RetryConfig, SolanaConfig, SolanaDetector, SolanaReservation, load_active_reservations,
+    load_wallet_pool, reserve_wallet_for_user,
 };
 
 #[derive(Clone)]
@@ -26,8 +25,7 @@ struct AppState {
 
 #[derive(Clone)]
 struct SolanaPoolApiState {
-    wallets: Arc<Mutex<Vec<ManagedSolanaWallet>>>,
-    wallet_pool_file: String,
+    wallets: Vec<ManagedSolanaWallet>,
     redis_url: String,
     reservation_ttl_secs: u64,
     secure_deposit_address: String,
@@ -288,9 +286,14 @@ async fn handle_solana_reserve(
         ));
     };
 
-    let reservation = reserve_or_create_solana_wallet(solana_pool, &payload.user_id)
-        .await
-        .map_err(map_reservation_error)?;
+    let reservation = reserve_wallet_for_user(
+        &solana_pool.redis_url,
+        &solana_pool.wallets,
+        &payload.user_id,
+        solana_pool.reservation_ttl_secs,
+    )
+    .await
+    .map_err(map_reservation_error)?;
 
     Ok(Json(ReserveSolanaAddressResponse {
         user_id: reservation.user_id,
@@ -494,62 +497,11 @@ fn build_solana_chain_info() -> Option<ChainInfo> {
 
 fn build_solana_pool_api_state(config: &SolanaConfig) -> Result<SolanaPoolApiState, DetectorError> {
     Ok(SolanaPoolApiState {
-        wallets: Arc::new(Mutex::new(load_wallet_pool(&config.wallet_pool_file)?)),
-        wallet_pool_file: config.wallet_pool_file.clone(),
+        wallets: load_wallet_pool(&config.wallet_pool_file)?,
         redis_url: config.redis_url.clone(),
         reservation_ttl_secs: config.reservation_ttl_secs,
         secure_deposit_address: config.secure_deposit_address.clone(),
     })
-}
-
-async fn reserve_or_create_solana_wallet(
-    pool: &SolanaPoolApiState,
-    user_id: &str,
-) -> Result<SolanaReservation, DetectorError> {
-    let mut wallets = pool.wallets.lock().await;
-
-    match reserve_wallet_for_user(
-        &pool.redis_url,
-        &wallets,
-        user_id,
-        pool.reservation_ttl_secs,
-    )
-    .await
-    {
-        Ok(reservation) => Ok(reservation),
-        Err(error) if is_no_solana_wallet_available(&error) => {
-            let wallet = append_generated_wallet_to_pool(&pool.wallet_pool_file)?;
-            log::info!(
-                "[SOL] Generated new managed deposit wallet {} at index {}",
-                wallet.address,
-                wallet.index
-            );
-            wallets.push(wallet);
-
-            reserve_wallet_for_user(
-                &pool.redis_url,
-                &wallets,
-                user_id,
-                pool.reservation_ttl_secs,
-            )
-            .await
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn is_no_solana_wallet_available(error: &DetectorError) -> bool {
-    error
-        .to_string()
-        .contains("No unreserved Solana wallet is currently available")
-}
-
-fn exit_solana_startup_error(context: &str, error: DetectorError) -> ! {
-    eprintln!("{context}: {error}");
-    eprintln!(
-        "Check SOLANA_WALLET_POOL_FILE. If it points to /wallet_pool/solana_wallets.json in Docker, mount a host JSON file or directory at /wallet_pool."
-    );
-    std::process::exit(1);
 }
 
 async fn run_detector(detector: Arc<ChainDetector>, max_index: u32) {
@@ -678,13 +630,11 @@ async fn main() {
             Chain::Solana => {
                 if let Some(info) = build_solana_chain_info() {
                     let config = build_solana_config();
-                    let pool_state = build_solana_pool_api_state(&config).unwrap_or_else(|error| {
-                        exit_solana_startup_error("Failed to load Solana wallet pool", error)
-                    });
-                    let detector =
-                        Arc::new(SolanaDetector::new(config.clone()).unwrap_or_else(|error| {
-                            exit_solana_startup_error("Failed to create SOL detector", error)
-                        }));
+                    let pool_state = build_solana_pool_api_state(&config)
+                        .expect("Failed to load Solana wallet pool");
+                    let detector = Arc::new(
+                        SolanaDetector::new(config.clone()).expect("Failed to create SOL detector"),
+                    );
 
                     log::info!(
                         "[SOL] Detector started - sweep destination: {} - managed wallets: {}",

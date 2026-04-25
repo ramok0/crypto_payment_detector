@@ -102,17 +102,6 @@ WEBHOOK_URL=http://localhost:8080/webhook
 WEBHOOK_SECRET=<hmac secret>
 ```
 
-The API manages this pool automatically. When `/solana/reserve` cannot find an
-unreserved wallet for a user, it generates a new Solana keypair, appends it to
-the wallet pool file, and reserves that new address.
-
-For Docker, mount `./wallet_pool` to `/wallet_pool` without `:ro`, because the
-API appends generated wallets to this file, and set:
-
-```env
-SOLANA_WALLET_POOL_FILE=/wallet_pool/solana_wallets.json
-```
-
 Useful optional vars:
 
 ```env
