@@ -23,7 +23,7 @@ pub fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
-pub fn chain_env_bool(chain: Chain, suffix: &str, global_name: &str) -> bool {
+pub fn chain_env_var(chain: Chain, suffix: &str) -> Option<String> {
     let chain_name = match chain {
         Chain::Bitcoin => "BTC",
         Chain::Litecoin => "LTC",
@@ -31,7 +31,28 @@ pub fn chain_env_bool(chain: Chain, suffix: &str, global_name: &str) -> bool {
     };
     let chain_var = format!("{chain_name}_{suffix}");
 
-    env_bool(&chain_var)
+    std::env::var(chain_var).ok()
+}
+
+pub fn chain_env_bool(chain: Chain, suffix: &str, global_name: &str) -> bool {
+    chain_env_var(chain, suffix)
+        .and_then(|value| match parse_bool(&value) {
+            Some(parsed) => Some(parsed),
+            None => {
+                let chain_name = match chain {
+                    Chain::Bitcoin => "BTC",
+                    Chain::Litecoin => "LTC",
+                    Chain::Solana => "SOL",
+                };
+                log::warn!(
+                    "Ignoring invalid boolean env {}_{}={:?}; expected one of 1/0, true/false, yes/no, on/off",
+                    chain_name,
+                    suffix,
+                    value
+                );
+                None
+            }
+        })
         .or_else(|| env_bool(global_name))
         .unwrap_or(false)
 }

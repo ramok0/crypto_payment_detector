@@ -1,8 +1,16 @@
 use crypto_payment_detector::{
     BasicAuth, Chain, ChainDetector, DetectorConfig, PaymentDetector, RetryConfig, SolanaConfig,
-    SolanaDetector, env_utils::chain_env_bool,
+    SolanaDetector,
+    env_utils::{chain_env_bool, chain_env_var},
 };
 use std::sync::Arc;
+
+fn explorer_api_config(chain: Chain) -> Option<String> {
+    chain_env_var(chain, "EXPLORER_API_URLS")
+        .or_else(|| chain_env_var(chain, "EXPLORER_API_URL"))
+        .or_else(|| std::env::var("EXPLORER_API_URLS").ok())
+        .or_else(|| std::env::var("EXPLORER_API_URL").ok())
+}
 
 fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
     let state_file_default = match chain {
@@ -54,7 +62,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1000),
         },
-        explorer_api_url: std::env::var("EXPLORER_API_URL").ok(),
+        explorer_api_url: explorer_api_config(chain),
         min_confirmations: {
             let chain_var = match chain {
                 Chain::Bitcoin => "BTC_MIN_CONFIRMATIONS",

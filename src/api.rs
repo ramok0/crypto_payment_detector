@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crypto_payment_detector::derivation::derive_address;
-use crypto_payment_detector::env_utils::chain_env_bool;
+use crypto_payment_detector::env_utils::{chain_env_bool, chain_env_var};
 use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
@@ -49,7 +49,7 @@ enum AddressSource {
 
 #[derive(Clone)]
 enum HealthEndpoint {
-    ExplorerApi(String),
+    ExplorerApis(Vec<String>),
     SolanaRpc(String),
 }
 
@@ -69,6 +69,33 @@ struct ReserveSolanaAddressRequest {
 
 fn default_count() -> u32 {
     1
+}
+
+fn explorer_api_config(chain: Chain) -> Option<String> {
+    chain_env_var(chain, "EXPLORER_API_URLS")
+        .or_else(|| chain_env_var(chain, "EXPLORER_API_URL"))
+        .or_else(|| std::env::var("EXPLORER_API_URLS").ok())
+        .or_else(|| std::env::var("EXPLORER_API_URL").ok())
+}
+
+fn is_blockchair_api_url(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("api.blockchair.com")
+}
+
+fn blockchair_health_url(url: &str) -> String {
+    let mut health_url = format!("{}/stats", url.trim_end_matches('/'));
+    if let Ok(key) = std::env::var("BLOCKCHAIR_API_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            health_url.push_str("?key=");
+            health_url.push_str(key);
+        }
+    }
+    health_url
+}
+
+fn esplora_health_url(url: &str) -> String {
+    format!("{}/blocks/tip/height", url.trim_end_matches('/'))
 }
 
 #[derive(Serialize)]
@@ -188,15 +215,25 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
     for info in &state.chains {
         let (last_scanned_height, last_processed_signature, explorer_reachable, chain_ok) =
             match &info.endpoint {
-                HealthEndpoint::ExplorerApi(explorer_api_url) => {
+                HealthEndpoint::ExplorerApis(explorer_api_urls) => {
                     let persisted = load_state(&info.state_file).ok();
-                    let tip_url = format!("{}/blocks/tip/height", explorer_api_url);
-                    let reachable = client
-                        .get(&tip_url)
-                        .send()
-                        .await
-                        .map(|response| response.status().is_success())
-                        .unwrap_or(false);
+                    let mut reachable = false;
+                    for explorer_api_url in explorer_api_urls {
+                        let health_url = if is_blockchair_api_url(explorer_api_url) {
+                            blockchair_health_url(explorer_api_url)
+                        } else {
+                            esplora_health_url(explorer_api_url)
+                        };
+                        reachable = client
+                            .get(&health_url)
+                            .send()
+                            .await
+                            .map(|response| response.status().is_success())
+                            .unwrap_or(false);
+                        if reachable {
+                            break;
+                        }
+                    }
                     let last_scanned_height = persisted.and_then(|state| state.last_scanned_height);
                     let chain_ok = reachable && last_scanned_height.is_some();
                     (last_scanned_height, None, reachable, chain_ok)
@@ -335,7 +372,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1000),
         },
-        explorer_api_url: std::env::var("EXPLORER_API_URL").ok(),
+        explorer_api_url: explorer_api_config(chain),
         min_confirmations: {
             let chain_var = match chain {
                 Chain::Bitcoin => "BTC_MIN_CONFIRMATIONS",
@@ -422,15 +459,14 @@ fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
         .or_else(|_| std::env::var("STATE_FILE"))
         .unwrap_or_else(|_| state_file_default.to_string());
 
-    let explorer_api_url = std::env::var("EXPLORER_API_URL")
-        .unwrap_or_else(|_| chain.default_explorer_api().to_string());
+    let explorer_api_urls = chain.explorer_api_urls(explorer_api_config(chain).as_deref());
 
     Some((
         ChainInfo {
             chain,
             address_source: AddressSource::Xpub(xpub.clone()),
             state_file,
-            endpoint: HealthEndpoint::ExplorerApi(explorer_api_url),
+            endpoint: HealthEndpoint::ExplorerApis(explorer_api_urls),
         },
         xpub,
     ))

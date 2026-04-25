@@ -26,25 +26,51 @@ impl Chain {
     }
 
     pub fn default_explorer_api(&self) -> &'static str {
+        self.default_explorer_apis()[0]
+    }
+
+    pub fn default_explorer_apis(&self) -> &'static [&'static str] {
         match self {
-            Chain::Bitcoin => "https://blockstream.info/api",
-            Chain::Litecoin => "https://litecoinspace.org/api",
-            Chain::Solana => "https://api.mainnet.solana.com",
+            Chain::Bitcoin => &["https://blockstream.info/api"],
+            Chain::Litecoin => &[
+                "https://litecoinspace.org/api",
+                "https://api.blockchair.com/litecoin",
+            ],
+            Chain::Solana => &["https://api.mainnet.solana.com"],
+        }
+    }
+
+    pub fn explorer_api_urls(&self, configured: Option<&str>) -> Vec<String> {
+        let configured_urls = configured
+            .into_iter()
+            .flat_map(|value| value.split([',', ';']))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/').to_string())
+            .collect::<Vec<_>>();
+
+        if configured_urls.is_empty() {
+            self.default_explorer_apis()
+                .iter()
+                .map(|url| url.to_string())
+                .collect()
+        } else {
+            configured_urls
         }
     }
 
     pub fn raw_block_url(&self, hash: &str) -> String {
         match self {
-            Chain::Bitcoin => format!("https://blockchain.info/rawblock/{}?format=hex", hash),
-            Chain::Litecoin => format!("https://litecoinspace.org/api/block/{}/raw", hash),
+            Chain::Bitcoin | Chain::Litecoin => {
+                format!("{}/block/{}/raw", self.default_explorer_api(), hash)
+            }
             Chain::Solana => format!("https://api.mainnet.solana.com/block/{}", hash),
         }
     }
 
     pub fn raw_block_is_hex(&self) -> bool {
         match self {
-            Chain::Bitcoin => true,
-            Chain::Litecoin => false,
+            Chain::Bitcoin | Chain::Litecoin => false,
             Chain::Solana => false,
         }
     }
@@ -104,6 +130,27 @@ pub struct DetectedPayment {
     pub fiat_amount: Option<f64>,
     pub fiat_currency: Option<String>,
     pub coin_price: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Chain;
+
+    #[test]
+    fn parses_configured_explorer_api_urls() {
+        let urls = Chain::Litecoin
+            .explorer_api_urls(Some(" https://a.example/api/,https://b.example/api "));
+
+        assert_eq!(urls, vec!["https://a.example/api", "https://b.example/api"]);
+    }
+
+    #[test]
+    fn falls_back_to_chain_defaults() {
+        let urls = Chain::Litecoin.explorer_api_urls(None);
+
+        assert_eq!(urls[0], "https://litecoinspace.org/api");
+        assert!(urls.iter().any(|url| url.contains("blockchair.com")));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

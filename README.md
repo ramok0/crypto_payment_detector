@@ -79,7 +79,9 @@ Optional:
 
 ```env
 PROXY=socks5://user:pass@host:port
-EXPLORER_API_URL=https://blockstream.info/api
+BTC_EXPLORER_API_URL=https://blockstream.info/api
+LTC_EXPLORER_API_URLS=https://litecoinspace.org/api,https://api.blockchair.com/litecoin
+BLOCKCHAIR_API_KEY=optional_blockchair_key
 MAX_RETRIES=5
 RETRY_BASE_DELAY_MS=1000
 SKIP_INITIAL_BLOCK_SYNC=true
@@ -91,6 +93,11 @@ LTC_MIN_CONFIRMATIONS=2
 MAX_DERIVATION_INDEX=1500
 API_BIND=0.0.0.0:3030
 ```
+
+BTC/LTC explorer URLs use Esplora-compatible APIs by default. Litecoin also
+falls back to Blockchair when `litecoinspace.org` is unreachable. For production
+volume, prefer your own Litecoin Space/Esplora instance or set a Blockchair API
+key.
 
 ## Solana Wallet Pool File
 
@@ -278,4 +285,10 @@ Current verification command:
 
 ```bash
 cargo check --all-targets
+```
+
+Live Litecoin fallback checks:
+
+```bash
+cargo test blockchair_live -- --ignored --nocapture
 ```

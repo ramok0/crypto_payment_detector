@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -10,6 +11,117 @@ use crate::types::{Chain, DetectedPayment, DetectorConfig, WebhookEvent};
 use crate::webhook::send_webhook;
 use bitcoin::consensus::Decodable;
 use rayon::prelude::*;
+use serde::Deserialize;
+
+#[derive(Debug, Clone)]
+enum ExplorerApi {
+    Esplora { base_url: String },
+    Blockchair { base_url: String },
+}
+
+impl ExplorerApi {
+    fn from_url(chain: Chain, url: &str) -> Self {
+        let normalized = normalize_api_url(url);
+        if normalized
+            .to_ascii_lowercase()
+            .contains("api.blockchair.com")
+        {
+            Self::Blockchair {
+                base_url: normalize_blockchair_api_url(chain, &normalized),
+            }
+        } else {
+            Self::Esplora {
+                base_url: normalized,
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Esplora { base_url } => format!("Esplora({base_url})"),
+            Self::Blockchair { base_url } => format!("Blockchair({base_url})"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockchairStatsResponse {
+    data: BlockchairStatsData,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockchairStatsData {
+    best_block_height: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockchairBlockResponse {
+    data: HashMap<String, BlockchairBlockEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockchairBlockEntry {
+    block: BlockchairBlockData,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockchairBlockData {
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockchairRawBlockResponse {
+    data: HashMap<String, BlockchairRawBlockEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockchairRawBlockEntry {
+    raw_block: String,
+}
+
+fn normalize_api_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+fn blockchair_chain_slug(chain: Chain) -> &'static str {
+    match chain {
+        Chain::Bitcoin => "bitcoin",
+        Chain::Litecoin => "litecoin",
+        Chain::Solana => "solana",
+    }
+}
+
+fn normalize_blockchair_api_url(chain: Chain, url: &str) -> String {
+    let base_url = normalize_api_url(url);
+    let slug = blockchair_chain_slug(chain);
+    let lower = base_url.to_ascii_lowercase();
+
+    if lower.ends_with(&format!("/{slug}")) || lower.contains(&format!("/{slug}/")) {
+        base_url
+    } else {
+        format!("{base_url}/{slug}")
+    }
+}
+
+fn blockchair_url(base_url: &str, path: &str) -> String {
+    let mut url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+
+    if let Ok(key) = std::env::var("BLOCKCHAIR_API_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            url.push(separator);
+            url.push_str("key=");
+            url.push_str(key);
+        }
+    }
+
+    url
+}
 
 async fn retry<F, Fut, T>(
     name: &str,
@@ -63,7 +175,8 @@ pub struct ChainDetector {
     webhook_client: reqwest::Client,
     price_fetcher: PriceFetcher,
     state: Arc<Mutex<SharedState>>,
-    base_url: String,
+    explorer_apis: Vec<ExplorerApi>,
+    active_explorer_index: Mutex<usize>,
 }
 
 impl ChainDetector {
@@ -84,10 +197,18 @@ impl ChainDetector {
 
         derive_address(&config.xpub, 0, config.chain)?;
 
-        let base_url = config
-            .explorer_api_url
-            .clone()
-            .unwrap_or_else(|| config.chain.default_explorer_api().to_string());
+        let explorer_apis = config
+            .chain
+            .explorer_api_urls(config.explorer_api_url.as_deref())
+            .into_iter()
+            .map(|url| ExplorerApi::from_url(config.chain, &url))
+            .collect::<Vec<_>>();
+
+        if explorer_apis.is_empty() {
+            return Err(DetectorError::InvalidConfig(
+                "At least one explorer API URL is required".into(),
+            ));
+        }
 
         let mut client_builder = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
@@ -114,10 +235,16 @@ impl ChainDetector {
         let price_fetcher =
             PriceFetcher::new(webhook_client.clone(), &config.fiat_currency, config.chain);
 
+        let explorer_list = explorer_apis
+            .iter()
+            .map(ExplorerApi::label)
+            .collect::<Vec<_>>()
+            .join(", ");
+
         log::info!(
-            "[{}] Detector initialized - explorer: {}",
+            "[{}] Detector initialized - explorers: {}",
             config.chain.ticker(),
-            base_url
+            explorer_list
         );
 
         Ok(Self {
@@ -131,7 +258,8 @@ impl ChainDetector {
                 pending: Vec::new(),
                 known_block_hashes: HashMap::new(),
             })),
-            base_url,
+            explorer_apis,
+            active_explorer_index: Mutex::new(0),
         })
     }
 
@@ -139,97 +267,259 @@ impl ChainDetector {
         self.config.chain
     }
 
+    async fn try_explorers<T, F, Fut>(&self, name: &str, mut call: F) -> Result<T, DetectorError>
+    where
+        F: FnMut(ExplorerApi) -> Fut,
+        Fut: Future<Output = Result<T, DetectorError>>,
+    {
+        let len = self.explorer_apis.len();
+        let start = *self.active_explorer_index.lock().unwrap();
+        let mut last_err = None;
+
+        for offset in 0..len {
+            let index = (start + offset) % len;
+            let explorer = self.explorer_apis[index].clone();
+            let label = explorer.label();
+
+            match call(explorer).await {
+                Ok(value) => {
+                    if index != start {
+                        log::warn!(
+                            "[{}] Switching explorer API to {} after fallback during {}",
+                            self.config.chain.ticker(),
+                            label,
+                            name
+                        );
+                    }
+                    *self.active_explorer_index.lock().unwrap() = index;
+                    return Ok(value);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[{}] Explorer {} failed during {}: {}",
+                        self.config.chain.ticker(),
+                        label,
+                        name,
+                        error
+                    );
+                    last_err = Some(error);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            DetectorError::ApiError(format!("No explorer API configured for {name}"))
+        }))
+    }
+
     async fn get_chain_tip(&self) -> Result<u64, DetectorError> {
-        let client = &self.client;
-        let url = format!("{}/blocks/tip/height", self.base_url);
-        let max_retries = self.config.retry.max_retries;
-        let base_delay = self.config.retry.base_delay_ms;
-        retry("get_chain_tip", max_retries, base_delay, || async {
-            let resp = client.get(&url).send().await?.text().await?;
-            resp.trim()
-                .parse::<u64>()
-                .map_err(|e| DetectorError::ApiError(format!("Failed to parse tip height: {e}")))
+        self.try_explorers("get_chain_tip", |explorer| async move {
+            self.get_chain_tip_from(&explorer).await
         })
         .await
+    }
+
+    async fn get_chain_tip_from(&self, explorer: &ExplorerApi) -> Result<u64, DetectorError> {
+        let max_retries = self.config.retry.max_retries;
+        let base_delay = self.config.retry.base_delay_ms;
+
+        match explorer {
+            ExplorerApi::Esplora { base_url } => {
+                let client = &self.client;
+                let url = format!("{base_url}/blocks/tip/height");
+                let name = format!("get_chain_tip {}", explorer.label());
+                retry(&name, max_retries, base_delay, || async {
+                    let resp = client.get(&url).send().await?;
+                    if !resp.status().is_success() {
+                        return Err(DetectorError::ApiError(format!(
+                            "Failed to fetch chain tip (status {})",
+                            resp.status()
+                        )));
+                    }
+                    let body = resp.text().await?;
+                    body.trim().parse::<u64>().map_err(|e| {
+                        DetectorError::ApiError(format!("Failed to parse tip height: {e}"))
+                    })
+                })
+                .await
+            }
+            ExplorerApi::Blockchair { base_url } => {
+                let client = &self.client;
+                let url = blockchair_url(base_url, "stats");
+                let name = format!("get_chain_tip {}", explorer.label());
+                retry(&name, max_retries, base_delay, || async {
+                    let resp = client.get(&url).send().await?;
+                    if !resp.status().is_success() {
+                        return Err(DetectorError::ApiError(format!(
+                            "Failed to fetch Blockchair stats (status {})",
+                            resp.status()
+                        )));
+                    }
+                    let body = resp.json::<BlockchairStatsResponse>().await?;
+                    Ok(body.data.best_block_height)
+                })
+                .await
+            }
+        }
     }
 
     async fn get_block_hash(&self, height: u64) -> Result<String, DetectorError> {
-        let client = &self.client;
-        let url = format!("{}/block-height/{}", self.base_url, height);
-        let max_retries = self.config.retry.max_retries;
-        let base_delay = self.config.retry.base_delay_ms;
-        retry("get_block_hash", max_retries, base_delay, || async {
-            let resp = client.get(&url).send().await?;
-            if !resp.status().is_success() {
-                return Err(DetectorError::ApiError(format!(
-                    "Block height {} not found (status {})",
-                    height,
-                    resp.status()
-                )));
-            }
-            let hash = resp.text().await?;
-            Ok(hash.trim().to_string())
+        self.try_explorers("get_block_hash", |explorer| async move {
+            self.get_block_hash_from(&explorer, height).await
         })
         .await
     }
 
-    async fn fetch_raw_block(&self, hash: &str) -> Result<bitcoin::Block, DetectorError> {
-        let client = &self.client;
-        let url = self.config.chain.raw_block_url(hash);
-        let is_hex = self.config.chain.raw_block_is_hex();
+    async fn get_block_hash_from(
+        &self,
+        explorer: &ExplorerApi,
+        height: u64,
+    ) -> Result<String, DetectorError> {
         let max_retries = self.config.retry.max_retries;
         let base_delay = self.config.retry.base_delay_ms;
 
-        let bytes: Vec<u8> = if is_hex {
-            let hex_str: String = retry("fetch_raw_block", max_retries, base_delay, || async {
-                let resp = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| DetectorError::ApiError(e.to_string()))?;
+        match explorer {
+            ExplorerApi::Esplora { base_url } => {
+                let client = &self.client;
+                let url = format!("{base_url}/block-height/{height}");
+                let name = format!("get_block_hash {}", explorer.label());
+                retry(&name, max_retries, base_delay, || async {
+                    let resp = client.get(&url).send().await?;
+                    if !resp.status().is_success() {
+                        return Err(DetectorError::ApiError(format!(
+                            "Block height {} not found (status {})",
+                            height,
+                            resp.status()
+                        )));
+                    }
+                    let hash = resp.text().await?;
+                    Ok(hash.trim().to_string())
+                })
+                .await
+            }
+            ExplorerApi::Blockchair { base_url } => {
+                let client = &self.client;
+                let url = blockchair_url(base_url, &format!("dashboards/block/{height}?limit=0"));
+                let name = format!("get_block_hash {}", explorer.label());
+                retry(&name, max_retries, base_delay, || async {
+                    let resp = client.get(&url).send().await?;
+                    if !resp.status().is_success() {
+                        return Err(DetectorError::ApiError(format!(
+                            "Blockchair block height {} not found (status {})",
+                            height,
+                            resp.status()
+                        )));
+                    }
+                    let body = resp.json::<BlockchairBlockResponse>().await?;
+                    body.data
+                        .values()
+                        .next()
+                        .map(|entry| entry.block.hash.clone())
+                        .ok_or_else(|| {
+                            DetectorError::ApiError(format!(
+                                "Blockchair returned no block data for height {height}"
+                            ))
+                        })
+                })
+                .await
+            }
+        }
+    }
 
-                if !resp.status().is_success() {
-                    return Err(DetectorError::ApiError(format!(
-                        "Failed to fetch raw block (status {})",
-                        resp.status()
-                    )));
-                }
+    async fn fetch_raw_block(&self, hash: &str) -> Result<bitcoin::Block, DetectorError> {
+        self.try_explorers("fetch_raw_block", |explorer| async move {
+            self.fetch_raw_block_from(&explorer, hash).await
+        })
+        .await
+    }
 
-                resp.text()
-                    .await
-                    .map_err(|e| DetectorError::ApiError(e.to_string()))
-            })
-            .await?;
-
-            hex::decode(hex_str.trim())
-                .map_err(|e| DetectorError::ApiError(format!("Failed to decode block hex: {e}")))?
-        } else {
-            retry("fetch_raw_block", max_retries, base_delay, || async {
-                let resp = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| DetectorError::ApiError(e.to_string()))?;
-
-                if !resp.status().is_success() {
-                    return Err(DetectorError::ApiError(format!(
-                        "Failed to fetch raw block (status {})",
-                        resp.status()
-                    )));
-                }
-
-                resp.bytes()
-                    .await
-                    .map(|b| b.to_vec())
-                    .map_err(|e| DetectorError::ApiError(e.to_string()))
-            })
-            .await?
-        };
+    async fn fetch_raw_block_from(
+        &self,
+        explorer: &ExplorerApi,
+        hash: &str,
+    ) -> Result<bitcoin::Block, DetectorError> {
+        let bytes = self.fetch_raw_block_bytes_from(explorer, hash).await?;
 
         let block = bitcoin::Block::consensus_decode(&mut bytes.as_slice())
             .map_err(|e| DetectorError::ApiError(format!("Failed to parse raw block: {e}")))?;
 
         Ok(block)
+    }
+
+    async fn fetch_raw_block_bytes_from(
+        &self,
+        explorer: &ExplorerApi,
+        hash: &str,
+    ) -> Result<Vec<u8>, DetectorError> {
+        let max_retries = self.config.retry.max_retries;
+        let base_delay = self.config.retry.base_delay_ms;
+
+        match explorer {
+            ExplorerApi::Esplora { base_url } => {
+                let client = &self.client;
+                let url = format!("{base_url}/block/{hash}/raw");
+                let name = format!("fetch_raw_block {}", explorer.label());
+                retry(&name, max_retries, base_delay, || async {
+                    let resp = client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map_err(|e| DetectorError::ApiError(e.to_string()))?;
+
+                    if !resp.status().is_success() {
+                        return Err(DetectorError::ApiError(format!(
+                            "Failed to fetch raw block (status {})",
+                            resp.status()
+                        )));
+                    }
+
+                    resp.bytes()
+                        .await
+                        .map(|b| b.to_vec())
+                        .map_err(|e| DetectorError::ApiError(e.to_string()))
+                })
+                .await
+            }
+            ExplorerApi::Blockchair { base_url } => {
+                let client = &self.client;
+                let url = blockchair_url(base_url, &format!("raw/block/{hash}"));
+                let name = format!("fetch_raw_block {}", explorer.label());
+                let hex_str: String = retry(&name, max_retries, base_delay, || async {
+                    let resp = client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map_err(|e| DetectorError::ApiError(e.to_string()))?;
+
+                    if !resp.status().is_success() {
+                        return Err(DetectorError::ApiError(format!(
+                            "Failed to fetch Blockchair raw block (status {})",
+                            resp.status()
+                        )));
+                    }
+
+                    let body = resp
+                        .json::<BlockchairRawBlockResponse>()
+                        .await
+                        .map_err(|e| DetectorError::ApiError(e.to_string()))?;
+
+                    body.data
+                        .values()
+                        .next()
+                        .map(|entry| entry.raw_block.clone())
+                        .ok_or_else(|| {
+                            DetectorError::ApiError(format!(
+                                "Blockchair returned no raw block data for {hash}"
+                            ))
+                        })
+                })
+                .await?;
+
+                hex::decode(hex_str.trim()).map_err(|e| {
+                    DetectorError::ApiError(format!("Failed to decode Blockchair block hex: {e}"))
+                })
+            }
+        }
     }
 
     fn build_address_lookup(&self, max_index: u32) -> Result<HashMap<String, u32>, DetectorError> {
@@ -718,5 +1008,120 @@ impl PaymentDetector for ChainDetector {
 
             tokio::time::sleep(poll_interval).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::RetryConfig;
+    use std::time::Duration;
+
+    fn blockchair_litecoin_detector() -> ChainDetector {
+        let chain = Chain::Litecoin;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("test HTTP client should build");
+        let webhook_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("test webhook HTTP client should build");
+        let price_fetcher = PriceFetcher::new(webhook_client.clone(), "EUR", chain);
+
+        ChainDetector {
+            config: DetectorConfig {
+                chain,
+                fiat_currency: "EUR".to_string(),
+                retry: RetryConfig {
+                    max_retries: 1,
+                    base_delay_ms: 10,
+                },
+                ..DetectorConfig::default()
+            },
+            client,
+            webhook_client,
+            price_fetcher,
+            state: Arc::new(Mutex::new(SharedState {
+                notified_confirmed: HashSet::new(),
+                last_scanned_height: None,
+                pending: Vec::new(),
+                known_block_hashes: HashMap::new(),
+            })),
+            explorer_apis: vec![ExplorerApi::from_url(
+                chain,
+                "https://api.blockchair.com/litecoin",
+            )],
+            active_explorer_index: Mutex::new(0),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the live Blockchair Litecoin API"]
+    async fn blockchair_live_gets_litecoin_tip_height() {
+        let detector = blockchair_litecoin_detector();
+
+        let tip_height = detector
+            .get_chain_tip()
+            .await
+            .expect("Blockchair should return a Litecoin tip height");
+
+        assert!(
+            tip_height > 2_000_000,
+            "unexpected Litecoin tip height: {tip_height}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the live Blockchair Litecoin API"]
+    async fn blockchair_live_downloads_recent_litecoin_raw_block_bytes() {
+        let detector = blockchair_litecoin_detector();
+        let explorer = detector.explorer_apis[0].clone();
+        let tip_height = detector
+            .get_chain_tip()
+            .await
+            .expect("Blockchair should return a Litecoin tip height");
+        let block_height = tip_height.saturating_sub(6);
+        let block_hash = detector
+            .get_block_hash(block_height)
+            .await
+            .expect("Blockchair should return a Litecoin block hash by height");
+
+        let raw_block = detector
+            .fetch_raw_block_bytes_from(&explorer, &block_hash)
+            .await
+            .expect("Blockchair should return raw Litecoin block bytes");
+
+        assert!(
+            raw_block.len() > 80,
+            "downloaded Litecoin block {block_hash} at height {block_height} is too small: {} bytes",
+            raw_block.len()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the live Blockchair Litecoin API"]
+    async fn blockchair_live_decodes_pre_mweb_litecoin_block() {
+        let detector = blockchair_litecoin_detector();
+        let block_height = 2_000_000;
+        let block_hash = detector
+            .get_block_hash(block_height)
+            .await
+            .expect("Blockchair should return a Litecoin block hash by height");
+
+        let block = detector
+            .fetch_raw_block(&block_hash)
+            .await
+            .expect("Blockchair should return a decodable raw Litecoin block");
+
+        assert!(
+            !block.txdata.is_empty(),
+            "downloaded Litecoin block {block_hash} at height {block_height} has no transactions"
+        );
+        assert!(
+            block.header.time > 1_600_000_000,
+            "downloaded Litecoin block {block_hash} has an implausible timestamp: {}",
+            block.header.time
+        );
     }
 }
