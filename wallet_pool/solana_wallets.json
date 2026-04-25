@@ -1,0 +1,84 @@
+{
+  "wallets": [
+    {
+      "address": "3N7BPA4RZZtChbRzJ3L3gRRgkEJVX4gE34UzFQcdn6mW",
+      "private_key": "7DQpokYqJdRHqh37o4dtG31TBcVWa1YnVDEZKLYmxFnAHw6mKezWVZokPSdxZrKa4TcmaF5mkzGfcj8wJByzT5z"
+    },
+    {
+      "address": "26gj4Ex1BwepkikSAcSCVoyKZzzY1oz7n8Dfpa97oPt3",
+      "private_key": "36qGjgSjLyb8eqpF93j4GDukGxprryWLRibJmLzs1Hu7VMsAAHn2Krq8cQGGNZ3xMSthUuekiiXfqfXm8fKnrYbq"
+    },
+    {
+      "address": "Bx3QKv7ykhjjF5FPUe1scNwrQx3Ue1SSB3r68d7wGvYt",
+      "private_key": "3gn8PZnx6ENQJuyBMgZg2puF5ajYeAoZxcg6W96KM6x7q7PfSehaDY2o3PM538VTS1Qg5pgwnVgUCgRf76Wm9kvx"
+    },
+    {
+      "address": "3ppBFR615S7kXavV1YvXQkgeKS1zsCCZcxxp8tGLHq9u",
+      "private_key": "5WEE4abXdQ1iyCd7P2cM17aioxTM1wVeoXFmGUxZpvGWk3CrFefe5VHCsDR9nSfLRZmBaAJqKGpkG99HH4Y36AN7"
+    },
+    {
+      "address": "47kK2zZHdKkE6LTewRZ3MBV4EgyVYdUdCfgG4mat95xk",
+      "private_key": "3hM6egkCiza24QYyPaKrZrRrzTVcYC18MrHNsbMeNdqtCsz2SwaJEyBVLJwm7YhPS4d3aiKuqG7oPSzbY5XaFd1r"
+    },
+    {
+      "address": "DXL6wrFV4MLebCCuBAJrk8CjS9LZ4EcidKsUabeNqFsx",
+      "private_key": "2itrNX4o64RBZX9Tv1mKvzehKJpNQJ473e4D2kKqfDFMpAz13hjjRUhswF6FX8uXQW7yaARQN58mvLPJUm2io3i2"
+    },
+    {
+      "address": "24BHR5MtkJURB5ppMtYZJkZG2cwZZmTWA5xRuxV8WSBS",
+      "private_key": "5LavAugBTP3jDT15RU4QNzmwrtSmAdhwoWUQDc6LZfttqRRwV3hh8SUPTcK5mNv8tEb8k6J814MLPtAnFG39vhpC"
+    },
+    {
+      "address": "BPiXQL3b21qwAsemEYN22bVfudK8h6LFT5jU3oHskRL",
+      "private_key": "2hM8vhyFWjcVvSUDddyK9LKquSAzFza8DpUSfkNRaYSYViqUiXhKsHMYRZ3fQi3XTGJbYFWTvUe7HdXdXya4mRca"
+    },
+    {
+      "address": "GSpq3sGur9Q9rACoQ7W3NH374c6ajMLokLSwzmc5ECc1",
+      "private_key": "3azkrzC45KTNEqgQy1AAWchnE5KEs5rCeM7iNuJyaBMB2hSR5rQV3MxpgTawBNf5ZA2MJUrbeL77898u9aQt3RH3"
+    },
+    {
+      "address": "Bn5ZVZgYJbTqcs8uFcEsef3roJdSxhQiAZ3NpD2X99Ne",
+      "private_key": "4iSEh35EvnSXHN1x1qJYWRfVKx6FbJHve6d7RuTX4fDeekp86cyxSrVSqHM7jZq2QefhjNcEZNNBb1H6LNR6D7RG"
+    },
+    {
+      "address": "HxekcgiaB6HaYtNzxchUFjSsW97Bhko1SgpjrQMCo5fJ",
+      "private_key": "3A3Z9oZEso7SKqPx7XTPW8BNSonADQ3eHkrvKEkcUezePmkX77FNYAVRfSDq3nuTyVddGbx3jjPhCCMFDw6Hg4yA"
+    },
+    {
+      "address": "FsHJB2HZF1qp4jE3pE4JLaNuFhRZGZQSRcopxAGzPu5C",
+      "private_key": "4WVFS9xeeXhjzUTuTWVMLsmPeLLQuMHmCfGbK7eWrn2HiUjxhzHRQs84dLeqpFDKeE5HECrPo4UhQgPdH4dyBwir"
+    },
+    {
+      "address": "Cnn4DoJzxMDotayvHnkuk7YwSf9gFzGPoAxysiYkG6YJ",
+      "private_key": "2qv34xtKHKWGZ8u3HHqj2gWe2FapyzEUJ6DwmSRo5p8psq8EUeaN4iL6swC7f6enewErSukAVjCmZ8YwpxBH5DH4"
+    },
+    {
+      "address": "5VfHDnWe3BxyVz2ot2zZCNdd3KK6BZkSTUBwMhP1JSjo",
+      "private_key": "5im6R1dBzMbzH8FSfsPiYv7m6U3nEJQqGCngHNgh3UszwpVfkeaHaMhrHqZh2NunQ3ZDtqthEuBwZXokeLogTjAm"
+    },
+    {
+      "address": "3vtnnhdVFqbEkzY6qo3T1NnuiEatxx5ATcxBbSJmbdDS",
+      "private_key": "3bucCwbgGpoLm3rza6u4Vy9pYDeYHhD8WeeCTe12q7xqU2JprnJse9Zf4qMtRXmAJqtg7J9bzDWSM95WcmVV8Ko6"
+    },
+    {
+      "address": "EyPpKhXWcQ6JYdTraHwFx3PiYS698qdpuhUf4n18UoCZ",
+      "private_key": "3KhtG4fK2eGXVVHmUWsfE6ofj5xqzZi1uvW7tGJC661uPbdvdi6GeTw77JnFT1nTXx9P9Q6yPErpAYetbdGmhy6V"
+    },
+    {
+      "address": "9zHdx96RAexPWzKqk4feoBeSQci7VfXagtiGgquqXXW2",
+      "private_key": "2SMUpgGLQNBeASZc3kY5SUYtaTmGSRpoNQM9oFn161ECd8QST1od7fjJaggXb3S5WacgRhxmAA6scX2VwmsyPmPY"
+    },
+    {
+      "address": "4Q3Mzsq8Sc7d1SaNktDmbV2Sx7kUBz6mF8GPithViEqV",
+      "private_key": "hwrAsjrA9SdTRtih5X8q7BFhHzJhddzGCREonrV6jvssep4GisM4cExaYqxqHNV42PMvKwN5K7vWnNPitgbu3YB"
+    },
+    {
+      "address": "HkPVuULi6goAUyqxZMeBsGaFrWZF6GTxNETE2nMfJFup",
+      "private_key": "3rEuW2qk3QNw2FKQSvL9Kn5mGyrhErPQSyTVbCnkDYCSSRA4bQnS35rzjVWTky2yAfLoJTjVNyZMuudQouJZc8e"
+    },
+    {
+      "address": "HQynqywwfVn7L7Ned48oMCXqp4xef8FvcT8vuhJKGJCc",
+      "private_key": "tr2iJUduMXAbUoWn5hQN2KqUJ2m1KtgFk4N8wG2D6uBXr5fKBt7yd6mvMsMPrF6WyXETP8oSZU7jnJipUefEfXr"
+    }
+  ]
+}

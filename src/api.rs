@@ -577,6 +577,7 @@ async fn main() {
         .unwrap_or(100);
     let chains: Vec<Chain> = match chain_str.to_lowercase().as_str() {
         "both" => vec![Chain::Bitcoin, Chain::Litecoin],
+        "solbtc" => vec![Chain::Bitcoin, Chain::Solana],
         "all" => vec![Chain::Bitcoin, Chain::Litecoin, Chain::Solana],
         other => vec![other.parse().expect(
             "Invalid CHAIN value (expected: bitcoin, litecoin, solana, btc, ltc, sol, both, all)",
