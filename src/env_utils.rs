@@ -57,9 +57,44 @@ pub fn chain_env_bool(chain: Chain, suffix: &str, global_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn proxy_env_var(names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if trimmed.is_empty()
+                || matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off" | "none" | "direct"
+                )
+            {
+                return None;
+            }
+
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+pub fn redact_url_credentials(value: &str) -> String {
+    match reqwest::Url::parse(value) {
+        Ok(mut url) => {
+            if !url.username().is_empty() {
+                let _ = url.set_username("***");
+            }
+            if url.password().is_some() {
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        }
+        Err(_) => "<redacted invalid url>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_bool;
+    use super::{parse_bool, proxy_env_var, redact_url_credentials};
 
     #[test]
     fn parses_truthy_values() {
@@ -81,5 +116,31 @@ mod tests {
     fn rejects_unknown_values() {
         assert_eq!(parse_bool("maybe"), None);
         assert_eq!(parse_bool(""), None);
+    }
+
+    #[test]
+    fn redacts_url_credentials() {
+        assert_eq!(
+            redact_url_credentials("http://user:pass@example.com:8080"),
+            "http://***:***@example.com:8080/"
+        );
+    }
+
+    #[test]
+    fn proxy_env_var_can_disable_fallback() {
+        unsafe {
+            std::env::set_var("TEST_PROXY_OVERRIDE", "off");
+            std::env::set_var("TEST_PROXY_GLOBAL", "http://user:pass@example.com:8080");
+        }
+
+        assert_eq!(
+            proxy_env_var(&["TEST_PROXY_OVERRIDE", "TEST_PROXY_GLOBAL"]),
+            None
+        );
+
+        unsafe {
+            std::env::remove_var("TEST_PROXY_OVERRIDE");
+            std::env::remove_var("TEST_PROXY_GLOBAL");
+        }
     }
 }

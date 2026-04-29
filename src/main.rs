@@ -1,7 +1,7 @@
 use crypto_payment_detector::{
     BasicAuth, Chain, ChainDetector, DetectorConfig, PaymentDetector, RetryConfig, SolanaConfig,
     SolanaDetector,
-    env_utils::{chain_env_bool, chain_env_var},
+    env_utils::{chain_env_bool, chain_env_var, proxy_env_var},
 };
 use std::sync::Arc;
 
@@ -113,7 +113,7 @@ fn build_solana_config() -> SolanaConfig {
             .and_then(|value| value.parse().ok())
             .unwrap_or(1),
         fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
-        proxy_url: std::env::var("PROXY").ok(),
+        proxy_url: proxy_env_var(&["SOLANA_PROXY", "SOL_PROXY", "PROXY"]),
         max_retries: std::env::var("MAX_RETRIES")
             .ok()
             .and_then(|value| value.parse().ok())

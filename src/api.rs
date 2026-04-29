@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crypto_payment_detector::derivation::derive_address;
-use crypto_payment_detector::env_utils::{chain_env_bool, chain_env_var};
+use crypto_payment_detector::env_utils::{chain_env_bool, chain_env_var, proxy_env_var};
 use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
@@ -426,7 +426,7 @@ fn build_solana_config() -> SolanaConfig {
             .and_then(|value| value.parse().ok())
             .unwrap_or(1),
         fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
-        proxy_url: std::env::var("PROXY").ok(),
+        proxy_url: proxy_env_var(&["SOLANA_PROXY", "SOL_PROXY", "PROXY"]),
         max_retries: std::env::var("MAX_RETRIES")
             .ok()
             .and_then(|value| value.parse().ok())

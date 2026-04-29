@@ -2,7 +2,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::error::DetectorError;
-use crate::types::WebhookEvent;
+use crate::types::{DetectedPayment, WebhookEvent};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -12,6 +12,8 @@ pub async fn send_webhook(
     secret: &str,
     event: &WebhookEvent,
 ) -> Result<(), DetectorError> {
+    log_payment_webhook(event);
+
     let payload = serde_json::to_string(event)?;
 
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
@@ -61,6 +63,31 @@ pub async fn send_webhook(
             }
         }
     }
+}
+
+fn log_payment_webhook(event: &WebhookEvent) {
+    match event {
+        WebhookEvent::PaymentDetected(payment) => {
+            log_payment_webhook_event("payment_detected", payment);
+        }
+        WebhookEvent::PaymentCredited(payment) => {
+            log_payment_webhook_event("payment_credited", payment);
+        }
+    }
+}
+
+fn log_payment_webhook_event(event_name: &str, payment: &DetectedPayment) {
+    log::info!(
+        "[{}] Sending {} webhook: txid={} address={} amount={} {} confirmations={} user_id={:?}",
+        payment.ticker,
+        event_name,
+        payment.txid,
+        payment.address,
+        payment.amount_coin,
+        payment.ticker,
+        payment.confirmations,
+        payment.user_id
+    );
 }
 
 pub fn verify_signature(secret: &str, payload: &[u8], signature_hex: &str) -> bool {

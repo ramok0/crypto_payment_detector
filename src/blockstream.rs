@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::derivation::derive_address;
+use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
 use crate::trait_def::PaymentDetector;
@@ -217,7 +218,11 @@ impl ChainDetector {
             let proxy = reqwest::Proxy::all(proxy_url)
                 .map_err(|e| DetectorError::InvalidConfig(format!("Invalid proxy URL: {e}")))?;
             client_builder = client_builder.proxy(proxy);
-            log::info!("[{}] Using proxy: {}", config.chain.ticker(), proxy_url);
+            log::info!(
+                "[{}] Using proxy: {}",
+                config.chain.ticker(),
+                redact_url_credentials(proxy_url)
+            );
         }
         let client = client_builder.build().map_err(|e| {
             DetectorError::InvalidConfig(format!("Failed to build HTTP client: {e}"))

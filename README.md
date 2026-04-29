@@ -79,6 +79,7 @@ Optional:
 
 ```env
 PROXY=socks5://user:pass@host:port
+SOLANA_PROXY=off                  # optional: disable global PROXY for Solana only
 BTC_EXPLORER_API_URL=https://blockstream.info/api
 LTC_EXPLORER_API_URLS=https://litecoinspace.org/api,https://api.blockchair.com/litecoin
 BLOCKCHAIR_API_KEY=optional_blockchair_key

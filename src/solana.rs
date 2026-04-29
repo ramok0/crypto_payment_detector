@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +13,7 @@ use solana_sdk::signature::Signer;
 use solana_sdk::transaction::Transaction;
 use solana_system_interface::instruction as system_instruction;
 
+use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
 use crate::solana_pool::{
@@ -88,7 +90,14 @@ pub struct SolanaDetector {
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse<T> {
-    result: T,
+    result: Option<T>,
+    error: Option<RpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +148,56 @@ impl RpcAccountKey {
             RpcAccountKey::Object { pubkey } => pubkey,
         }
     }
+}
+
+fn compact_error_body(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let truncated: String = chars.by_ref().take(300).collect();
+
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn describe_reqwest_error(context: &str, error: &reqwest::Error) -> String {
+    let mut labels = Vec::new();
+    if error.is_timeout() {
+        labels.push("timeout");
+    }
+    if error.is_connect() {
+        labels.push("connect");
+    }
+    if error.is_request() {
+        labels.push("request");
+    }
+    if error.is_body() {
+        labels.push("body");
+    }
+    if error.is_decode() {
+        labels.push("decode");
+    }
+    if error.is_status() {
+        labels.push("status");
+    }
+
+    let label = if labels.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", labels.join(", "))
+    };
+    let mut message = format!("{context}{label}: {error}");
+
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str("; caused by: ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+
+    message
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,7 +261,9 @@ impl SolanaDetector {
             let proxy = reqwest::Proxy::all(proxy_url)
                 .map_err(|e| DetectorError::InvalidConfig(format!("Invalid proxy URL: {e}")))?;
             rpc_builder = rpc_builder.proxy(proxy);
-            log::info!("[SOL] Using proxy: {}", proxy_url);
+            log::info!("[SOL] Using proxy: {}", redact_url_credentials(proxy_url));
+        } else {
+            rpc_builder = rpc_builder.no_proxy();
         }
         let rpc_client = rpc_builder.build().map_err(|e| {
             DetectorError::InvalidConfig(format!("Failed to build RPC client: {e}"))
@@ -604,9 +665,18 @@ impl SolanaDetector {
             match response {
                 Ok(resp) if resp.status().is_success() => {
                     let parsed: RpcResponse<T> = resp.json().await.map_err(|e| {
-                        DetectorError::ApiError(format!("Solana RPC parse failed: {e}"))
+                        DetectorError::ApiError(format!("Solana RPC {method} parse failed: {e}"))
                     })?;
-                    return Ok(parsed.result);
+                    if let Some(error) = parsed.error {
+                        return Err(DetectorError::ApiError(format!(
+                            "Solana RPC {method} returned error {}: {}",
+                            error.code, error.message
+                        )));
+                    }
+
+                    return parsed.result.ok_or_else(|| {
+                        DetectorError::ApiError(format!("Solana RPC {method} returned no result"))
+                    });
                 }
                 Ok(resp) => {
                     let status = resp.status();
@@ -616,7 +686,16 @@ impl SolanaDetector {
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.parse::<u64>().ok());
 
-                    last_error = format!("Solana RPC {} failed with status {}", method, status);
+                    let body = resp
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+                    let compact_body = compact_error_body(&body);
+                    last_error = format!("Solana RPC {method} failed with status {status}");
+                    if !compact_body.is_empty() {
+                        last_error.push_str(": ");
+                        last_error.push_str(&compact_body);
+                    }
                     attempt += 1;
                     if attempt >= max_retries {
                         break;
@@ -626,7 +705,7 @@ impl SolanaDetector {
                     let delay_ms = retry_after
                         .map(|seconds| seconds.saturating_mul(1000))
                         .unwrap_or(backoff_delay);
-                    log::warn!(
+                    log::debug!(
                         "[SOL] {} (attempt {}/{}) - retry in {}ms",
                         last_error,
                         attempt,
@@ -636,14 +715,17 @@ impl SolanaDetector {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 Err(e) => {
-                    last_error = format!("Solana RPC request failed: {e}");
+                    last_error = describe_reqwest_error(
+                        &format!("Solana RPC {method} transport failed"),
+                        &e,
+                    );
                     attempt += 1;
                     if attempt >= max_retries {
                         break;
                     }
 
                     let delay_ms = self.config.retry_base_delay_ms * 2u64.pow(attempt - 1);
-                    log::warn!(
+                    log::debug!(
                         "[SOL] {} (attempt {}/{}) - retry in {}ms",
                         last_error,
                         attempt,
