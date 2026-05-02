@@ -3,3 +3,6 @@
 detector_state.json
 btc_detector_state.json
 ltc_detector_state.json
+eth_detector_state*.json
+wallet_pool/ethereum_wallets.json
+ETH_USDC_USDT_PAYMENT_SYSTEM.md

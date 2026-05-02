@@ -28,6 +28,7 @@ pub fn chain_env_var(chain: Chain, suffix: &str) -> Option<String> {
         Chain::Bitcoin => "BTC",
         Chain::Litecoin => "LTC",
         Chain::Solana => "SOL",
+        Chain::Ethereum => "ETH",
     };
     let chain_var = format!("{chain_name}_{suffix}");
 
@@ -43,6 +44,7 @@ pub fn chain_env_bool(chain: Chain, suffix: &str, global_name: &str) -> bool {
                     Chain::Bitcoin => "BTC",
                     Chain::Litecoin => "LTC",
                     Chain::Solana => "SOL",
+                    Chain::Ethereum => "ETH",
                 };
                 log::warn!(
                     "Ignoring invalid boolean env {}_{}={:?}; expected one of 1/0, true/false, yes/no, on/off",

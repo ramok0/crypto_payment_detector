@@ -385,6 +385,11 @@ impl SolanaDetector {
                 fiat_amount: None,
                 fiat_currency: None,
                 coin_price: None,
+                asset: None,
+                asset_decimals: None,
+                amount_base_units: None,
+                swept_amount_base_units: None,
+                token_contract: None,
             };
 
             let event = WebhookEvent::PaymentDetected(detected.clone());
@@ -453,6 +458,11 @@ impl SolanaDetector {
                 fiat_amount: None,
                 fiat_currency: None,
                 coin_price: None,
+                asset: None,
+                asset_decimals: None,
+                amount_base_units: None,
+                swept_amount_base_units: None,
+                token_contract: None,
             };
 
             if let Ok(price) = self.price_fetcher.get_price().await {

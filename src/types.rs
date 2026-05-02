@@ -6,6 +6,7 @@ pub enum Chain {
     Bitcoin,
     Litecoin,
     Solana,
+    Ethereum,
 }
 
 impl Chain {
@@ -14,6 +15,7 @@ impl Chain {
             Chain::Bitcoin => "BTC",
             Chain::Litecoin => "LTC",
             Chain::Solana => "SOL",
+            Chain::Ethereum => "ETH",
         }
     }
 
@@ -22,6 +24,7 @@ impl Chain {
             Chain::Bitcoin => "Bitcoin",
             Chain::Litecoin => "Litecoin",
             Chain::Solana => "Solana",
+            Chain::Ethereum => "Ethereum",
         }
     }
 
@@ -37,6 +40,7 @@ impl Chain {
                 "https://api.blockchair.com/litecoin",
             ],
             Chain::Solana => &["https://api.mainnet.solana.com"],
+            Chain::Ethereum => &["https://cloudflare-eth.com"],
         }
     }
 
@@ -65,6 +69,7 @@ impl Chain {
                 format!("{}/block/{}/raw", self.default_explorer_api(), hash)
             }
             Chain::Solana => format!("https://api.mainnet.solana.com/block/{}", hash),
+            Chain::Ethereum => format!("https://cloudflare-eth.com/block/{}", hash),
         }
     }
 
@@ -72,6 +77,7 @@ impl Chain {
         match self {
             Chain::Bitcoin | Chain::Litecoin => false,
             Chain::Solana => false,
+            Chain::Ethereum => false,
         }
     }
 
@@ -79,6 +85,7 @@ impl Chain {
         match self {
             Chain::Bitcoin | Chain::Litecoin => 100_000_000,
             Chain::Solana => 1_000_000_000,
+            Chain::Ethereum => 1_000_000_000_000_000_000,
         }
     }
 
@@ -87,6 +94,7 @@ impl Chain {
             Chain::Bitcoin => bitcoin::Network::Bitcoin,
             Chain::Litecoin => bitcoin::Network::Bitcoin,
             Chain::Solana => bitcoin::Network::Bitcoin,
+            Chain::Ethereum => bitcoin::Network::Bitcoin,
         }
     }
 }
@@ -105,6 +113,7 @@ impl std::str::FromStr for Chain {
             "bitcoin" | "btc" => Ok(Chain::Bitcoin),
             "litecoin" | "ltc" => Ok(Chain::Litecoin),
             "solana" | "sol" => Ok(Chain::Solana),
+            "ethereum" | "eth" => Ok(Chain::Ethereum),
             _ => Err(format!("Unknown chain: {}", s)),
         }
     }
@@ -130,6 +139,16 @@ pub struct DetectedPayment {
     pub fiat_amount: Option<f64>,
     pub fiat_currency: Option<String>,
     pub coin_price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_decimals: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_base_units: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swept_amount_base_units: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_contract: Option<String>,
 }
 
 #[cfg(test)]

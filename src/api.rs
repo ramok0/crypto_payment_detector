@@ -12,15 +12,19 @@ use crypto_payment_detector::env_utils::{chain_env_bool, chain_env_var, proxy_en
 use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
-    BasicAuth, ChainDetector, DetectorConfig, DetectorError, ManagedSolanaWallet, PaymentDetector,
-    RetryConfig, SolanaConfig, SolanaDetector, SolanaReservation, load_active_reservations,
-    load_wallet_pool, reserve_wallet_for_user,
+    BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
+    EthereumReservation, ManagedEthereumWallet, ManagedSolanaWallet, PaymentDetector, RetryConfig,
+    SolanaConfig, SolanaDetector, SolanaReservation, ethereum_reservation_store_url_from_env,
+    load_active_ethereum_reservations, load_active_reservations, load_ethereum_wallet_pool,
+    load_wallet_pool, parse_erc20_tokens, reserve_ethereum_wallet_for_user,
+    reserve_wallet_for_user,
 };
 
 #[derive(Clone)]
 struct AppState {
     chains: Vec<ChainInfo>,
     solana_pool: Option<SolanaPoolApiState>,
+    ethereum_pool: Option<EthereumPoolApiState>,
 }
 
 #[derive(Clone)]
@@ -29,6 +33,15 @@ struct SolanaPoolApiState {
     redis_url: String,
     reservation_ttl_secs: u64,
     secure_deposit_address: String,
+}
+
+#[derive(Clone)]
+struct EthereumPoolApiState {
+    wallets: Vec<ManagedEthereumWallet>,
+    redis_url: String,
+    reservation_ttl_secs: u64,
+    gas_tank_address: String,
+    ledger_address: String,
 }
 
 #[derive(Clone)]
@@ -49,6 +62,7 @@ enum AddressSource {
 enum HealthEndpoint {
     ExplorerApis(Vec<String>),
     SolanaRpc(String),
+    EthereumRpc(String),
 }
 
 #[derive(Deserialize)]
@@ -62,6 +76,11 @@ struct DeriveParams {
 
 #[derive(Deserialize)]
 struct ReserveSolanaAddressRequest {
+    user_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReserveEthereumAddressRequest {
     user_id: String,
 }
 
@@ -140,6 +159,24 @@ struct ActiveSolanaReservationsResponse {
     reservations: Vec<SolanaReservation>,
 }
 
+#[derive(Serialize)]
+struct ReserveEthereumAddressResponse {
+    user_id: String,
+    address: String,
+    wallet_index: u32,
+    reserved_at_unix: i64,
+    expires_at_unix: i64,
+    reservation_ttl_secs: u64,
+    gas_tank_address: String,
+    ledger_address: String,
+}
+
+#[derive(Serialize)]
+struct ActiveEthereumReservationsResponse {
+    count: usize,
+    reservations: Vec<EthereumReservation>,
+}
+
 #[derive(Deserialize)]
 struct SolanaHealthState {
     #[serde(default)]
@@ -149,6 +186,11 @@ struct SolanaHealthState {
 #[derive(Deserialize)]
 struct SolanaAddressHealthCursor {
     last_processed_signature: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EthereumHealthState {
+    last_scanned_block: Option<u64>,
 }
 
 async fn handle_derive(
@@ -253,6 +295,23 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
                         .unwrap_or(false);
                     (None, last_processed_signature, reachable, reachable)
                 }
+                HealthEndpoint::EthereumRpc(rpc_url) => {
+                    let last_scanned_height = load_ethereum_last_scanned_block(&info.state_file);
+                    let reachable = client
+                        .post(rpc_url)
+                        .json(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "eth_blockNumber",
+                            "params": [],
+                        }))
+                        .send()
+                        .await
+                        .map(|response| response.status().is_success())
+                        .unwrap_or(false);
+                    let chain_ok = reachable && last_scanned_height.is_some();
+                    (last_scanned_height, None, reachable, chain_ok)
+                }
             };
 
         all_ok &= chain_ok;
@@ -326,16 +385,70 @@ async fn handle_solana_active(
     }))
 }
 
+async fn handle_ethereum_reserve(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ReserveEthereumAddressRequest>,
+) -> Result<Json<ReserveEthereumAddressResponse>, (StatusCode, String)> {
+    let Some(ethereum_pool) = state.ethereum_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Ethereum address pool is not configured".into(),
+        ));
+    };
+
+    let reservation = reserve_ethereum_wallet_for_user(
+        &ethereum_pool.redis_url,
+        &ethereum_pool.wallets,
+        &payload.user_id,
+        ethereum_pool.reservation_ttl_secs,
+    )
+    .await
+    .map_err(map_reservation_error)?;
+
+    Ok(Json(ReserveEthereumAddressResponse {
+        user_id: reservation.user_id,
+        address: reservation.address,
+        wallet_index: reservation.wallet_index,
+        reserved_at_unix: reservation.reserved_at_unix,
+        expires_at_unix: reservation.expires_at_unix,
+        reservation_ttl_secs: ethereum_pool.reservation_ttl_secs,
+        gas_tank_address: ethereum_pool.gas_tank_address.clone(),
+        ledger_address: ethereum_pool.ledger_address.clone(),
+    }))
+}
+
+async fn handle_ethereum_active(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ActiveEthereumReservationsResponse>, (StatusCode, String)> {
+    let Some(ethereum_pool) = state.ethereum_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Ethereum address pool is not configured".into(),
+        ));
+    };
+
+    let reservations = load_active_ethereum_reservations(&ethereum_pool.redis_url)
+        .await
+        .map_err(map_internal_error)?;
+
+    Ok(Json(ActiveEthereumReservationsResponse {
+        count: reservations.len(),
+        reservations,
+    }))
+}
+
 fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
     let state_file_default = match chain {
         Chain::Bitcoin => "btc_detector_state.json",
         Chain::Litecoin => "ltc_detector_state.json",
         Chain::Solana => "sol_detector_state.json",
+        Chain::Ethereum => "eth_detector_state.json",
     };
     let state_file_var = match chain {
         Chain::Bitcoin => "BTC_STATE_FILE",
         Chain::Litecoin => "LTC_STATE_FILE",
         Chain::Solana => "SOL_STATE_FILE",
+        Chain::Ethereum => "ETH_STATE_FILE",
     };
 
     DetectorConfig {
@@ -353,6 +466,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
                 Chain::Bitcoin => "BTC_POLL_INTERVAL",
                 Chain::Litecoin => "LTC_POLL_INTERVAL",
                 Chain::Solana => "SOL_POLL_INTERVAL",
+                Chain::Ethereum => "ETH_POLL_INTERVAL",
             };
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("POLL_INTERVAL"))
@@ -381,6 +495,7 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
                 Chain::Bitcoin => "BTC_MIN_CONFIRMATIONS",
                 Chain::Litecoin => "LTC_MIN_CONFIRMATIONS",
                 Chain::Solana => "SOL_MIN_CONFIRMATIONS",
+                Chain::Ethereum => "ETH_MIN_CONFIRMATIONS",
             };
             std::env::var(chain_var)
                 .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
@@ -442,11 +557,75 @@ fn build_solana_config() -> SolanaConfig {
     }
 }
 
+fn build_ethereum_config() -> EthereumConfig {
+    EthereumConfig {
+        rpc_url: std::env::var("ETH_RPC_URL")
+            .unwrap_or_else(|_| "https://cloudflare-eth.com".to_string()),
+        chain_id: std::env::var("ETH_CHAIN_ID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1),
+        wallet_pool_file: std::env::var("ETH_WALLET_POOL_FILE")
+            .expect("ETH_WALLET_POOL_FILE env var required for CHAIN=ethereum"),
+        gas_tank_private_key: std::env::var("ETH_GAS_TANK_PRIVATE_KEY")
+            .expect("ETH_GAS_TANK_PRIVATE_KEY env var required for CHAIN=ethereum"),
+        ledger_address: std::env::var("ETH_LEDGER_ADDRESS")
+            .expect("ETH_LEDGER_ADDRESS env var required for CHAIN=ethereum"),
+        webhook_url: std::env::var("WEBHOOK_URL").expect("WEBHOOK_URL env var required"),
+        webhook_hmac_secret: std::env::var("WEBHOOK_SECRET")
+            .expect("WEBHOOK_SECRET env var required"),
+        redis_url: ethereum_reservation_store_url_from_env(),
+        reservation_ttl_secs: std::env::var("ETH_RESERVATION_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3600),
+        state_file: std::env::var("ETH_STATE_FILE")
+            .or_else(|_| std::env::var("STATE_FILE"))
+            .unwrap_or_else(|_| "eth_detector_state.json".to_string()),
+        poll_interval_secs: std::env::var("ETH_POLL_INTERVAL")
+            .or_else(|_| std::env::var("POLL_INTERVAL"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30),
+        min_confirmations: std::env::var("ETH_MIN_CONFIRMATIONS")
+            .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(12),
+        fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
+        proxy_url: proxy_env_var(&["ETH_PROXY", "PROXY"]),
+        max_blocks_per_cycle: std::env::var("ETH_MAX_BLOCKS_PER_CYCLE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(250),
+        start_block: std::env::var("ETH_START_BLOCK")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        gas_tank_target_usd: std::env::var("ETH_GAS_TANK_TARGET_USD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20.0),
+        gas_tank_check_interval_secs: std::env::var("ETH_GAS_TANK_INTERVAL_SECS")
+            .or_else(|_| std::env::var("ETH_GAS_TANK_CHECK_INTERVAL_SECS"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(900),
+        token_transfer_gas_limit: std::env::var("ETH_TOKEN_TRANSFER_GAS_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100_000),
+        gas_top_up_multiplier: std::env::var("ETH_GAS_TOP_UP_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1.25),
+    }
+}
+
 fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
     let xpub_var = match chain {
         Chain::Bitcoin => "BTC_XPUB",
         Chain::Litecoin => "LTC_XPUB",
-        Chain::Solana => return None,
+        Chain::Solana | Chain::Ethereum => return None,
     };
     let xpub = match std::env::var(xpub_var) {
         Ok(value) if !value.is_empty() => value,
@@ -457,6 +636,7 @@ fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
         Chain::Bitcoin => ("BTC_STATE_FILE", "btc_detector_state.json"),
         Chain::Litecoin => ("LTC_STATE_FILE", "ltc_detector_state.json"),
         Chain::Solana => ("SOL_STATE_FILE", "sol_detector_state.json"),
+        Chain::Ethereum => ("ETH_STATE_FILE", "eth_detector_state.json"),
     };
     let state_file = std::env::var(state_file_var)
         .or_else(|_| std::env::var("STATE_FILE"))
@@ -495,12 +675,34 @@ fn build_solana_chain_info() -> Option<ChainInfo> {
     })
 }
 
+fn build_ethereum_chain_info(config: &EthereumConfig, gas_tank_address: String) -> ChainInfo {
+    ChainInfo {
+        chain: Chain::Ethereum,
+        address_source: AddressSource::Static(gas_tank_address),
+        state_file: config.state_file.clone(),
+        endpoint: HealthEndpoint::EthereumRpc(config.rpc_url.clone()),
+    }
+}
+
 fn build_solana_pool_api_state(config: &SolanaConfig) -> Result<SolanaPoolApiState, DetectorError> {
     Ok(SolanaPoolApiState {
         wallets: load_wallet_pool(&config.wallet_pool_file)?,
         redis_url: config.redis_url.clone(),
         reservation_ttl_secs: config.reservation_ttl_secs,
         secure_deposit_address: config.secure_deposit_address.clone(),
+    })
+}
+
+fn build_ethereum_pool_api_state(
+    config: &EthereumConfig,
+    gas_tank_address: String,
+) -> Result<EthereumPoolApiState, DetectorError> {
+    Ok(EthereumPoolApiState {
+        wallets: load_ethereum_wallet_pool(&config.wallet_pool_file)?,
+        redis_url: config.redis_url.clone(),
+        reservation_ttl_secs: config.reservation_ttl_secs,
+        gas_tank_address,
+        ledger_address: config.ledger_address.clone(),
     })
 }
 
@@ -521,6 +723,15 @@ async fn run_solana_detector(detector: Arc<SolanaDetector>) {
     loop {
         if let Err(error) = detector.run_block_scan_loop(None, 0).await {
             log::error!("[SOL] Solana scan loop error: {error} - restarting in 10s");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    }
+}
+
+async fn run_ethereum_detector(detector: Arc<EthereumDetector>) {
+    loop {
+        if let Err(error) = detector.run_block_scan_loop(None, 0).await {
+            log::error!("[ETH] Ethereum scan loop error: {error} - restarting in 10s");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     }
@@ -552,9 +763,34 @@ fn load_solana_last_processed_signature(path: &str) -> Option<String> {
     }
 }
 
+fn load_ethereum_last_scanned_block(path: &str) -> Option<u64> {
+    let file = std::path::Path::new(path);
+    if !file.exists() {
+        return None;
+    }
+
+    let data = match std::fs::read_to_string(file) {
+        Ok(data) => data,
+        Err(error) => {
+            log::warn!("[ETH] Failed to read state file '{}': {}", path, error);
+            return None;
+        }
+    };
+
+    match serde_json::from_str::<EthereumHealthState>(&data) {
+        Ok(state) => state.last_scanned_block,
+        Err(error) => {
+            log::warn!("[ETH] Failed to parse state file '{}': {}", path, error);
+            None
+        }
+    }
+}
+
 fn map_reservation_error(error: DetectorError) -> (StatusCode, String) {
     let message = error.to_string();
-    if message.contains("No unreserved Solana wallet") {
+    if message.contains("No unreserved Solana wallet")
+        || message.contains("No unreserved Ethereum wallet")
+    {
         (StatusCode::CONFLICT, message)
     } else {
         map_internal_error(error)
@@ -578,15 +814,21 @@ async fn main() {
     let chains: Vec<Chain> = match chain_str.to_lowercase().as_str() {
         "both" => vec![Chain::Bitcoin, Chain::Litecoin],
         "solbtc" => vec![Chain::Bitcoin, Chain::Solana],
-        "all" => vec![Chain::Bitcoin, Chain::Litecoin, Chain::Solana],
+        "all" => vec![
+            Chain::Bitcoin,
+            Chain::Litecoin,
+            Chain::Solana,
+            Chain::Ethereum,
+        ],
         other => vec![other.parse().expect(
-            "Invalid CHAIN value (expected: bitcoin, litecoin, solana, btc, ltc, sol, both, all)",
+            "Invalid CHAIN value (expected: bitcoin, litecoin, solana, ethereum, btc, ltc, sol, eth, both, solbtc, all)",
         )],
     };
 
     let mut chain_infos = Vec::new();
     let mut detector_handles = Vec::new();
     let mut solana_pool = None;
+    let mut ethereum_pool = None;
 
     for chain in &chains {
         match chain {
@@ -624,6 +866,7 @@ async fn main() {
                         Chain::Bitcoin => "BTC_XPUB",
                         Chain::Litecoin => "LTC_XPUB",
                         Chain::Solana => unreachable!(),
+                        Chain::Ethereum => unreachable!(),
                     };
                     log::warn!("[{}] {} not set, skipping", chain.ticker(), xpub_var);
                 }
@@ -654,17 +897,48 @@ async fn main() {
                     log::warn!("[SOL] SOLANA_DEPOSIT_ADDRESS not set, skipping");
                 }
             }
+            Chain::Ethereum => {
+                let config = build_ethereum_config();
+                let tokens = parse_erc20_tokens(std::env::var("ETH_ERC20_TOKENS").ok().as_deref())
+                    .expect("Invalid ETH_ERC20_TOKENS");
+                let detector = Arc::new(
+                    EthereumDetector::new(config.clone(), tokens)
+                        .expect("Failed to create ETH detector"),
+                );
+                let gas_tank_address = detector.gas_tank_address();
+                let pool_state = build_ethereum_pool_api_state(&config, gas_tank_address.clone())
+                    .expect("Failed to load Ethereum wallet pool");
+
+                log::info!(
+                    "[ETH] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {}",
+                    gas_tank_address,
+                    detector.ledger_address(),
+                    detector.wallet_count(),
+                    detector.token_count()
+                );
+
+                let detector_handle = detector.clone();
+                detector_handles.push(tokio::spawn(async move {
+                    run_ethereum_detector(detector_handle).await;
+                }));
+
+                chain_infos.push(build_ethereum_chain_info(&config, gas_tank_address));
+                ethereum_pool = Some(pool_state);
+            }
         }
     }
 
     if chain_infos.is_empty() {
-        eprintln!("No chain configured. Set BTC_XPUB/LTC_XPUB and/or SOLANA_DEPOSIT_ADDRESS.");
+        eprintln!(
+            "No chain configured. Set BTC_XPUB/LTC_XPUB, SOLANA_DEPOSIT_ADDRESS, or ETH_GAS_TANK_PRIVATE_KEY."
+        );
         std::process::exit(1);
     }
 
     let state = Arc::new(AppState {
         chains: chain_infos,
         solana_pool,
+        ethereum_pool,
     });
 
     let app = Router::new()
@@ -672,6 +946,8 @@ async fn main() {
         .route("/derive", get(handle_derive))
         .route("/solana/reserve", post(handle_solana_reserve))
         .route("/solana/active", get(handle_solana_active))
+        .route("/ethereum/reserve", post(handle_ethereum_reserve))
+        .route("/ethereum/active", get(handle_ethereum_active))
         .with_state(state);
 
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());
