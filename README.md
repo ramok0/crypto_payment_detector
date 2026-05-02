@@ -199,6 +199,7 @@ Note:
 
 - if `address` is present, it is validated against the private key
 - default ERC-20 token config is mainnet USDC/USDT; custom format is `SYMBOL:0xcontract:decimals,SYMBOL2:0xcontract:decimals`
+- USD-pegged ERC-20 tokens such as USDC/USDT are valued as USD first, then converted to `FIAT_CURRENCY` for webhook `fiat_amount`
 - set `ETH_RESERVATION_STORE=memory` for local testing without Redis. This only works inside one running process and reservations disappear on restart. Production should keep using Redis.
 
 ## Run

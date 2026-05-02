@@ -1137,11 +1137,32 @@ impl EthereumDetector {
                     log::warn!("[ETH] Failed to fetch ETH price: {error}");
                 }
             }
-        } else if self.price_fetcher.currency() == "USD" {
-            payment.coin_price = Some(1.0);
-            payment.fiat_currency = Some("USD".into());
-            payment.fiat_amount = Some(payment.amount_coin);
+        } else if is_usd_pegged_token(&payment.ticker) {
+            match self.usd_to_configured_fiat_rate().await {
+                Ok(rate) => {
+                    payment.coin_price = Some(rate);
+                    payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
+                    payment.fiat_amount = Some(payment.amount_coin * rate);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[ETH] Failed to convert {} from USD peg to {}: {error}",
+                        payment.ticker,
+                        self.price_fetcher.currency()
+                    );
+                }
+            }
         }
+    }
+
+    async fn usd_to_configured_fiat_rate(&self) -> Result<f64, DetectorError> {
+        if self.price_fetcher.currency() == "USD" {
+            return Ok(1.0);
+        }
+
+        let eth_fiat = self.price_fetcher.get_price().await?;
+        let eth_usd = self.eth_usd_fetcher.get_price().await?;
+        usd_to_fiat_rate_from_eth_prices(eth_fiat, eth_usd)
     }
 
     fn is_known_event(&self, event_id: &str) -> bool {
@@ -1424,6 +1445,28 @@ fn usd_to_wei(usd: f64, eth_usd: f64) -> Result<U256, DetectorError> {
     Ok(U256::from(wei.ceil() as u128))
 }
 
+fn usd_to_fiat_rate_from_eth_prices(eth_fiat: f64, eth_usd: f64) -> Result<f64, DetectorError> {
+    if !eth_fiat.is_finite() || eth_fiat <= 0.0 {
+        return Err(DetectorError::ApiError(
+            "ETH/fiat price must be positive for stablecoin conversion".into(),
+        ));
+    }
+    if !eth_usd.is_finite() || eth_usd <= 0.0 {
+        return Err(DetectorError::ApiError(
+            "ETH/USD price must be positive for stablecoin conversion".into(),
+        ));
+    }
+
+    Ok(eth_fiat / eth_usd)
+}
+
+fn is_usd_pegged_token(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "USDC" | "USDT" | "DAI" | "BUSD" | "TUSD" | "USDP" | "GUSD" | "PYUSD"
+    )
+}
+
 fn u256_to_units_f64(value: U256, decimals: u8) -> f64 {
     let base = value.to_string().parse::<f64>().unwrap_or(f64::MAX);
     base / 10f64.powi(i32::from(decimals))
@@ -1500,5 +1543,22 @@ mod tests {
             Some(value)
         );
         assert_eq!(u256_from_erc20_return(&Bytes::from(vec![1, 2, 3])), None);
+    }
+
+    #[test]
+    fn identifies_usd_pegged_tokens() {
+        assert!(is_usd_pegged_token("USDT"));
+        assert!(is_usd_pegged_token(" usdc "));
+        assert!(!is_usd_pegged_token("ETH"));
+        assert!(!is_usd_pegged_token("WBTC"));
+    }
+
+    #[test]
+    fn derives_usd_to_fiat_rate_from_eth_prices() {
+        let rate = usd_to_fiat_rate_from_eth_prices(1_800.0, 2_000.0).unwrap();
+
+        assert!((rate - 0.9).abs() < f64::EPSILON);
+        assert!(usd_to_fiat_rate_from_eth_prices(0.0, 2_000.0).is_err());
+        assert!(usd_to_fiat_rate_from_eth_prices(1_800.0, 0.0).is_err());
     }
 }
