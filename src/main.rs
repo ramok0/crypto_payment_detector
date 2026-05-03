@@ -2,7 +2,8 @@ use crypto_payment_detector::{
     BasicAuth, Chain, ChainDetector, DetectorConfig, EthereumConfig, EthereumDetector,
     PaymentDetector, RetryConfig, SolanaConfig, SolanaDetector,
     env_utils::{chain_env_bool, chain_env_var, proxy_env_var},
-    ethereum_reservation_store_url_from_env, parse_erc20_tokens, parse_spl_tokens,
+    ethereum_reservation_store_url_from_env, load_ethereum_wallet_pool, load_wallet_pool,
+    parse_erc20_tokens, parse_spl_tokens, shared_ethereum_wallets, shared_wallets,
 };
 use std::sync::Arc;
 
@@ -298,6 +299,9 @@ async fn run_solana_detector(detector: Arc<SolanaDetector>) {
 }
 
 async fn run_ethereum_detector(detector: Arc<EthereumDetector>) {
+    if let Err(error) = detector.sweep_orphan_balances().await {
+        log::warn!("[ETH] Startup orphan sweep failed: {error}");
+    }
     loop {
         if let Err(error) = detector.run_block_scan_loop(None, 0).await {
             log::error!("[ETH] Ethereum scan loop error: {error} - restarting in 10s");
@@ -373,8 +377,13 @@ async fn main() {
                 let config = build_solana_config();
                 let tokens = parse_spl_tokens(std::env::var("SOLANA_SPL_TOKENS").ok().as_deref())
                     .expect("Invalid SOLANA_SPL_TOKENS");
+                let wallets = shared_wallets(
+                    load_wallet_pool(&config.wallet_pool_file)
+                        .expect("Failed to load Solana wallet pool"),
+                );
                 let detector = Arc::new(
-                    SolanaDetector::new(config, tokens).expect("Failed to create SOL detector"),
+                    SolanaDetector::new(config, tokens, wallets)
+                        .expect("Failed to create SOL detector"),
                 );
 
                 println!("Solana Payment Detector starting");
@@ -402,8 +411,13 @@ async fn main() {
                 let config = build_ethereum_config();
                 let tokens = parse_erc20_tokens(std::env::var("ETH_ERC20_TOKENS").ok().as_deref())
                     .expect("Invalid ETH_ERC20_TOKENS");
+                let wallets = shared_ethereum_wallets(
+                    load_ethereum_wallet_pool(&config.wallet_pool_file)
+                        .expect("Failed to load Ethereum wallet pool"),
+                );
                 let detector = Arc::new(
-                    EthereumDetector::new(config, tokens).expect("Failed to create ETH detector"),
+                    EthereumDetector::new(config, tokens, wallets)
+                        .expect("Failed to create ETH detector"),
                 );
 
                 println!("Ethereum Payment Detector starting");

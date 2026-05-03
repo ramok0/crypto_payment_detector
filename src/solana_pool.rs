@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,9 @@ use solana_sdk::signature::Signer;
 use crate::error::DetectorError;
 
 const RESERVATION_KEY_PREFIX: &str = "solana:reservation:";
+const DEFAULT_SOLANA_MAX_POOL_SIZE: usize = 10_000;
+
+pub type SharedSolanaWallets = Arc<RwLock<Vec<ManagedSolanaWallet>>>;
 
 #[derive(Debug, Clone)]
 pub struct ManagedSolanaWallet {
@@ -111,11 +114,94 @@ pub fn load_wallet_pool(path: &str) -> Result<Vec<ManagedSolanaWallet>, Detector
     Ok(wallets)
 }
 
-pub fn find_wallet<'a>(
-    wallets: &'a [ManagedSolanaWallet],
-    address: &str,
-) -> Option<&'a ManagedSolanaWallet> {
-    wallets.iter().find(|wallet| wallet.address == address)
+pub fn find_wallet(wallets: &[ManagedSolanaWallet], address: &str) -> Option<ManagedSolanaWallet> {
+    wallets.iter().find(|wallet| wallet.address == address).cloned()
+}
+
+pub fn snapshot_wallets(shared: &SharedSolanaWallets) -> Vec<ManagedSolanaWallet> {
+    shared.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+pub fn shared_wallets(wallets: Vec<ManagedSolanaWallet>) -> SharedSolanaWallets {
+    Arc::new(RwLock::new(wallets))
+}
+
+pub fn generate_random_solana_wallet(index: u32) -> ManagedSolanaWallet {
+    let keypair = Keypair::new();
+    let address = keypair.pubkey().to_string();
+    ManagedSolanaWallet {
+        index,
+        address,
+        keypair: Arc::new(keypair),
+    }
+}
+
+pub fn append_solana_wallet_to_pool_file(
+    path: &str,
+    wallet: &ManagedSolanaWallet,
+) -> Result<(), DetectorError> {
+    let data = std::fs::read_to_string(path).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to read Solana wallet pool file '{}' for append: {e}",
+            path
+        ))
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to parse Solana wallet pool file '{}' for append: {e}",
+            path
+        ))
+    })?;
+
+    let secret_b58 = bs58::encode(wallet.keypair.to_bytes()).into_string();
+    let new_entry = serde_json::json!({
+        "address": wallet.address.clone(),
+        "private_key": secret_b58,
+    });
+
+    let entries = if let Some(arr) = value.as_array_mut() {
+        arr
+    } else if let Some(obj) = value.as_object_mut() {
+        let entry = obj
+            .entry("wallets".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        entry.as_array_mut().ok_or_else(|| {
+            DetectorError::InvalidConfig(format!(
+                "Solana wallet pool 'wallets' field in '{}' is not an array",
+                path
+            ))
+        })?
+    } else {
+        return Err(DetectorError::InvalidConfig(format!(
+            "Solana wallet pool file '{}' is neither a JSON array nor object",
+            path
+        )));
+    };
+    entries.push(new_entry);
+
+    let serialized = serde_json::to_string_pretty(&value)?;
+    let tmp_path = format!("{}.tmp", path);
+    std::fs::write(&tmp_path, serialized).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to write Solana wallet pool tmp file '{}': {e}",
+            tmp_path
+        ))
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to rename Solana wallet pool tmp file '{}' -> '{}': {e}",
+            tmp_path, path
+        ))
+    })?;
+    Ok(())
+}
+
+fn solana_max_pool_size() -> usize {
+    std::env::var("SOLANA_MAX_POOL_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_SOLANA_MAX_POOL_SIZE)
 }
 
 pub async fn load_active_reservations(
@@ -156,7 +242,8 @@ pub async fn load_active_reservations(
 
 pub async fn reserve_wallet_for_user(
     redis_url: &str,
-    wallets: &[ManagedSolanaWallet],
+    wallets: &SharedSolanaWallets,
+    pool_path: &str,
     user_id: &str,
     ttl_secs: u64,
 ) -> Result<SolanaReservation, DetectorError> {
@@ -206,18 +293,25 @@ pub async fn reserve_wallet_for_user(
         return Ok(existing_reservation);
     }
 
-    for wallet in wallets {
+    let candidates: Vec<(String, u32)> = {
+        let pool = wallets.read().unwrap_or_else(|p| p.into_inner());
+        pool.iter()
+            .map(|wallet| (wallet.address.clone(), wallet.index))
+            .collect()
+    };
+
+    for (address, index) in candidates {
         let reservation = SolanaReservation {
             user_id: user_id.trim().to_string(),
-            address: wallet.address.clone(),
-            wallet_index: wallet.index,
+            address: address.clone(),
+            wallet_index: index,
             reserved_at_unix: now,
             expires_at_unix: new_expires,
         };
 
         let payload = serde_json::to_string(&reservation)?;
         let response: Option<String> = redis::cmd("SET")
-            .arg(reservation_key(&wallet.address))
+            .arg(reservation_key(&address))
             .arg(payload)
             .arg("EX")
             .arg(ttl_secs)
@@ -231,9 +325,56 @@ pub async fn reserve_wallet_for_user(
         }
     }
 
-    Err(DetectorError::InvalidConfig(
-        "No unreserved Solana wallet is currently available".into(),
-    ))
+    // Pool exhausted — generate a new wallet, persist it, then reserve it.
+    let max_pool_size = solana_max_pool_size();
+    let new_wallet = {
+        let mut pool = wallets.write().unwrap_or_else(|p| p.into_inner());
+        if pool.len() >= max_pool_size {
+            return Err(DetectorError::InvalidConfig(format!(
+                "Solana wallet pool reached SOLANA_MAX_POOL_SIZE={} - refusing to grow further",
+                max_pool_size
+            )));
+        }
+        let next_index = pool.len() as u32;
+        let new_wallet = generate_random_solana_wallet(next_index);
+        append_solana_wallet_to_pool_file(pool_path, &new_wallet)?;
+        pool.push(new_wallet.clone());
+        new_wallet
+    };
+
+    log::info!(
+        "[SOL] Auto-generated new managed wallet at index {} address {} (pool path: {}); pool grew to handle exhausted reservations",
+        new_wallet.index,
+        new_wallet.address,
+        pool_path
+    );
+
+    let reservation = SolanaReservation {
+        user_id: user_id.trim().to_string(),
+        address: new_wallet.address.clone(),
+        wallet_index: new_wallet.index,
+        reserved_at_unix: now,
+        expires_at_unix: new_expires,
+    };
+    let payload = serde_json::to_string(&reservation)?;
+    let response: Option<String> = redis::cmd("SET")
+        .arg(reservation_key(&new_wallet.address))
+        .arg(payload)
+        .arg("EX")
+        .arg(ttl_secs)
+        .arg("NX")
+        .query_async(&mut connection)
+        .await
+        .map_err(redis_error)?;
+
+    if response.is_some() {
+        Ok(reservation)
+    } else {
+        // Extremely unlikely: the brand-new ATA's address collided with an existing reservation.
+        Err(DetectorError::ApiError(
+            "Failed to register reservation for newly generated Solana wallet".into(),
+        ))
+    }
 }
 
 pub fn reservation_key(address: &str) -> String {

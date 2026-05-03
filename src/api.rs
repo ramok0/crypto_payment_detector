@@ -13,11 +13,11 @@ use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
-    EthereumReservation, ManagedEthereumWallet, ManagedSolanaWallet, PaymentDetector, RetryConfig,
+    EthereumReservation, PaymentDetector, RetryConfig, SharedEthereumWallets, SharedSolanaWallets,
     SolanaConfig, SolanaDetector, SolanaReservation, ethereum_reservation_store_url_from_env,
     load_active_ethereum_reservations, load_active_reservations, load_ethereum_wallet_pool,
     load_wallet_pool, parse_erc20_tokens, parse_spl_tokens, reserve_ethereum_wallet_for_user,
-    reserve_wallet_for_user,
+    reserve_wallet_for_user, shared_ethereum_wallets, shared_wallets,
 };
 
 #[derive(Clone)]
@@ -29,7 +29,8 @@ struct AppState {
 
 #[derive(Clone)]
 struct SolanaPoolApiState {
-    wallets: Vec<ManagedSolanaWallet>,
+    wallets: SharedSolanaWallets,
+    wallet_pool_path: String,
     redis_url: String,
     reservation_ttl_secs: u64,
     secure_deposit_address: String,
@@ -37,7 +38,8 @@ struct SolanaPoolApiState {
 
 #[derive(Clone)]
 struct EthereumPoolApiState {
-    wallets: Vec<ManagedEthereumWallet>,
+    wallets: SharedEthereumWallets,
+    wallet_pool_path: String,
     redis_url: String,
     reservation_ttl_secs: u64,
     gas_tank_address: String,
@@ -362,6 +364,7 @@ async fn handle_solana_reserve(
     let reservation = reserve_wallet_for_user(
         &solana_pool.redis_url,
         &solana_pool.wallets,
+        &solana_pool.wallet_pool_path,
         &payload.user_id,
         ttl,
     )
@@ -414,6 +417,7 @@ async fn handle_ethereum_reserve(
     let reservation = reserve_ethereum_wallet_for_user(
         &ethereum_pool.redis_url,
         &ethereum_pool.wallets,
+        &ethereum_pool.wallet_pool_path,
         &payload.user_id,
         ttl,
     )
@@ -773,9 +777,13 @@ fn build_ethereum_chain_info(config: &EthereumConfig, gas_tank_address: String) 
     }
 }
 
-fn build_solana_pool_api_state(config: &SolanaConfig) -> Result<SolanaPoolApiState, DetectorError> {
+fn build_solana_pool_api_state(
+    config: &SolanaConfig,
+    wallets: SharedSolanaWallets,
+) -> Result<SolanaPoolApiState, DetectorError> {
     Ok(SolanaPoolApiState {
-        wallets: load_wallet_pool(&config.wallet_pool_file)?,
+        wallets,
+        wallet_pool_path: config.wallet_pool_file.clone(),
         redis_url: config.redis_url.clone(),
         reservation_ttl_secs: config.reservation_ttl_secs,
         secure_deposit_address: config.secure_deposit_address.clone(),
@@ -784,10 +792,12 @@ fn build_solana_pool_api_state(config: &SolanaConfig) -> Result<SolanaPoolApiSta
 
 fn build_ethereum_pool_api_state(
     config: &EthereumConfig,
+    wallets: SharedEthereumWallets,
     gas_tank_address: String,
 ) -> Result<EthereumPoolApiState, DetectorError> {
     Ok(EthereumPoolApiState {
-        wallets: load_ethereum_wallet_pool(&config.wallet_pool_file)?,
+        wallets,
+        wallet_pool_path: config.wallet_pool_file.clone(),
         redis_url: config.redis_url.clone(),
         reservation_ttl_secs: config.reservation_ttl_secs,
         gas_tank_address,
@@ -821,6 +831,9 @@ async fn run_solana_detector(detector: Arc<SolanaDetector>) {
 }
 
 async fn run_ethereum_detector(detector: Arc<EthereumDetector>) {
+    if let Err(error) = detector.sweep_orphan_balances().await {
+        log::warn!("[ETH] Startup orphan sweep failed: {error}");
+    }
     loop {
         if let Err(error) = detector.run_block_scan_loop(None, 0).await {
             log::error!("[ETH] Ethereum scan loop error: {error} - restarting in 10s");
@@ -970,10 +983,14 @@ async fn main() {
                         std::env::var("SOLANA_SPL_TOKENS").ok().as_deref(),
                     )
                     .expect("Invalid SOLANA_SPL_TOKENS");
-                    let pool_state = build_solana_pool_api_state(&config)
-                        .expect("Failed to load Solana wallet pool");
+                    let wallets = shared_wallets(
+                        load_wallet_pool(&config.wallet_pool_file)
+                            .expect("Failed to load Solana wallet pool"),
+                    );
+                    let pool_state = build_solana_pool_api_state(&config, wallets.clone())
+                        .expect("Failed to build Solana pool state");
                     let detector = Arc::new(
-                        SolanaDetector::new(config.clone(), tokens)
+                        SolanaDetector::new(config.clone(), tokens, wallets)
                             .expect("Failed to create SOL detector"),
                     );
 
@@ -1008,13 +1025,18 @@ async fn main() {
                 let config = build_ethereum_config();
                 let tokens = parse_erc20_tokens(std::env::var("ETH_ERC20_TOKENS").ok().as_deref())
                     .expect("Invalid ETH_ERC20_TOKENS");
+                let wallets = shared_ethereum_wallets(
+                    load_ethereum_wallet_pool(&config.wallet_pool_file)
+                        .expect("Failed to load Ethereum wallet pool"),
+                );
                 let detector = Arc::new(
-                    EthereumDetector::new(config.clone(), tokens)
+                    EthereumDetector::new(config.clone(), tokens, wallets.clone())
                         .expect("Failed to create ETH detector"),
                 );
                 let gas_tank_address = detector.gas_tank_address();
-                let pool_state = build_ethereum_pool_api_state(&config, gas_tank_address.clone())
-                    .expect("Failed to load Ethereum wallet pool");
+                let pool_state =
+                    build_ethereum_pool_api_state(&config, wallets, gas_tank_address.clone())
+                        .expect("Failed to build Ethereum pool state");
 
                 log::info!(
                     "[ETH] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {}",

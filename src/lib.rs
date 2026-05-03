@@ -21,15 +21,16 @@ pub use ethereum::{
     Erc20TokenConfig, EthereumConfig, EthereumDetector, default_erc20_tokens, parse_erc20_tokens,
 };
 pub use ethereum_pool::{
-    EthereumReservation, ManagedEthereumWallet, ethereum_reservation_store_url_from_env,
-    ethereum_reservations_use_memory, load_active_ethereum_reservations, load_ethereum_wallet_pool,
-    reserve_ethereum_wallet_for_user,
+    EthereumReservation, ManagedEthereumWallet, SharedEthereumWallets,
+    ethereum_reservation_store_url_from_env, ethereum_reservations_use_memory,
+    load_active_ethereum_reservations, load_ethereum_wallet_pool, reserve_ethereum_wallet_for_user,
+    shared_ethereum_wallets,
 };
 pub use pricing::PriceFetcher;
 pub use solana::{SolanaConfig, SolanaDetector};
 pub use solana_pool::{
-    ManagedSolanaWallet, SolanaReservation, load_active_reservations, load_wallet_pool,
-    reserve_wallet_for_user,
+    ManagedSolanaWallet, SharedSolanaWallets, SolanaReservation, load_active_reservations,
+    load_wallet_pool, reserve_wallet_for_user, shared_wallets,
 };
 pub use solana_tokens::{SplTokenConfig, default_spl_tokens, parse_spl_tokens};
 pub use trait_def::PaymentDetector;

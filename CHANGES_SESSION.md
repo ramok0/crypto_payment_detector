@@ -29,6 +29,64 @@ Limitations :
 - **Tokens non USD-pegged** : pas de check ratio (on n'a pas le prix). USDC/USDT/DAI/BUSD/TUSD/USDP/GUSD/PYUSD sont reconnus comme USD-pegged.
 - **SPL token rent ATA** : l'ATA de destination peut nécessiter ~0.002 SOL de rent au premier sweep. Ce coût n'est PAS compté dans le ratio (sinon le premier sweep ne se ferait jamais). Si vous voulez quand même éviter le rent à tout prix, augmentez `SOL_MIN_DEPOSIT_FIAT`.
 
+## Mise à jour : pool de wallets Solana auto-extensible
+
+Avant : si tous les wallets du pool étaient réservés, `POST /solana/reserve` retournait `409 Conflict: No unreserved Solana wallet is currently available`. Il fallait pré-générer assez de wallets dans le fichier ou attendre l'expiration des réservations.
+
+Maintenant : quand le pool est épuisé, le détecteur **génère un nouveau wallet aléatoire**, l'ajoute au fichier `SOLANA_WALLET_POOL_FILE` (write atomique `tmp + rename`), et le réserve immédiatement pour l'utilisateur. Le wallet est aussi ajouté en mémoire pour que le détecteur puisse le sweeper plus tard. Logs :
+
+```
+[SOL] Auto-generated new managed wallet at index 17 address ABCxyz... (pool path: wallet_pool/solana_wallets.json); pool grew to handle exhausted reservations
+```
+
+Sécurité :
+- **Plafond `SOLANA_MAX_POOL_SIZE`** (défaut 10000) — au-delà, l'API renvoie une erreur explicite. Évite qu'un attaquant ne fasse exploser le fichier en réservant à l'infini.
+- L'écriture du fichier est atomique : pas de risque de corruption en cas de crash pendant l'append.
+- Le pool en mémoire et le fichier disque restent synchronisés en permanence (Arc<RwLock> partagé entre détecteur et API).
+
+```env
+# Optionnel — défaut 10000
+SOLANA_MAX_POOL_SIZE=10000
+```
+
+⚠️ **Attention** : chaque nouveau wallet est généré à la volée. Sa clé privée est écrite en clair dans `SOLANA_WALLET_POOL_FILE`. **Backup régulier** de ce fichier recommandé (un cron qui le copie vers un stockage chiffré, par exemple). Si vous perdez le fichier, vous perdez tous les fonds bloqués sur des sweeps en attente.
+
+**Pareil côté Ethereum** : auto-grow ajouté symétriquement.
+
+```env
+# Optionnel — taille initiale lors de la création du fichier (défaut 10)
+ETH_WALLET_POOL_SIZE=10
+# Optionnel — plafond max pour l'auto-grow (défaut 10000)
+ETH_MAX_POOL_SIZE=10000
+```
+
+Quand `POST /ethereum/reserve` épuise le pool, un nouveau wallet ETH est généré, ajouté au fichier `ETH_WALLET_POOL_FILE`, partagé en mémoire avec le détecteur (Arc<RwLock>), et réservé dans la foulée. Logs :
+
+```
+[ETH] Auto-generated new managed wallet at index 17 address 0xabc... (pool path: wallet_pool/ethereum_wallets.json); pool grew to handle exhausted reservations
+```
+
+Marche pour les deux modes de réservation Ethereum (Redis ET in-memory via `ETH_RESERVATION_STORE=memory`).
+
+⚠️ Mêmes recommandations de backup que pour Solana : la clé privée ETH est écrite en clair dans `ETH_WALLET_POOL_FILE`. Backup régulier recommandé.
+
+## Mise à jour : ETH orphan sweep au démarrage
+
+Le détecteur Ethereum scanne maintenant tous les wallets gérés au démarrage (comme Solana). Skip ceux qui ont une réservation active, et sweep le solde ETH natif + chaque token ERC-20 vers le gas tank. Logs :
+
+```
+[ETH] Orphan sweep starting: 12 managed wallet(s), skipping 3 active reservation(s)
+[ETH] Orphan ETH swept: 50000000000000000 wei from 0xabc... (index 5, tx=0x...)
+[ETH] Orphan USDC swept: 1500000 units from 0xdef... (index 9, tx=0x...)
+[ETH] Orphan sweep complete: 1 ETH sweep(s) (50000000000000000 wei total), 1 token sweep(s)
+```
+
+Le orphan sweep respecte **toutes les protections** existantes :
+- Fee ratio guard (`ETH_MAX_FEE_RATIO`) : si le gas est trop cher, le sweep est différé et reessayé au prochain démarrage
+- Top-up automatique : si le wallet géré n'a pas assez d'ETH pour payer un transfert ERC-20, le gas tank top-up automatiquement (logique existante)
+
+Aucune action ops requise — c'est automatique. Vérifiez juste que votre gas tank ETH est funded en permanence.
+
 ## Mise à jour : durée de réservation configurable
 
 Le TTL des réservations SOL/ETH peut maintenant être :

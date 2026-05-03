@@ -18,7 +18,8 @@ use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
 use crate::solana_pool::{
-    ManagedSolanaWallet, SolanaReservation, find_wallet, load_active_reservations, load_wallet_pool,
+    ManagedSolanaWallet, SharedSolanaWallets, SolanaReservation, find_wallet,
+    load_active_reservations, snapshot_wallets,
 };
 use crate::solana_tokens::{
     SplTokenConfig, create_associated_token_account_idempotent_instruction,
@@ -99,7 +100,7 @@ struct SweepResult {
 #[derive(Debug)]
 pub struct SolanaDetector {
     config: SolanaConfig,
-    wallets: Vec<ManagedSolanaWallet>,
+    wallets: SharedSolanaWallets,
     tokens: Vec<SplTokenConfig>,
     gas_tank_keypair: Option<Arc<Keypair>>,
     gas_tank_pubkey: Option<Pubkey>,
@@ -277,6 +278,7 @@ impl SolanaDetector {
     pub fn new(
         config: SolanaConfig,
         tokens: Vec<SplTokenConfig>,
+        wallets: SharedSolanaWallets,
     ) -> Result<Self, DetectorError> {
         if config.secure_deposit_address.is_empty() {
             return Err(DetectorError::InvalidConfig(
@@ -346,8 +348,6 @@ impl SolanaDetector {
             );
         }
 
-        let wallets = load_wallet_pool(&config.wallet_pool_file)?;
-
         let mut rpc_builder = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
             .connection_verbose(false);
@@ -394,7 +394,7 @@ impl SolanaDetector {
     }
 
     pub fn wallet_count(&self) -> usize {
-        self.wallets.len()
+        self.wallets.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn token_count(&self) -> usize {
@@ -1021,7 +1021,8 @@ impl SolanaDetector {
         &self,
         address: &str,
     ) -> Result<SweepResult, DetectorError> {
-        let wallet = find_wallet(&self.wallets, address).ok_or_else(|| {
+        let snapshot = snapshot_wallets(&self.wallets);
+        let wallet = find_wallet(&snapshot, address).ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Solana wallet found for address '{}'",
                 address
@@ -1038,7 +1039,7 @@ impl SolanaDetector {
         }
 
         let recent_blockhash = self.get_latest_blockhash().await?;
-        let fee = self.estimate_transfer_fee(wallet, recent_blockhash).await?;
+        let fee = self.estimate_transfer_fee(&wallet, recent_blockhash).await?;
 
         if balance <= fee {
             log::info!(
@@ -1114,9 +1115,11 @@ impl SolanaDetector {
                 }
             };
 
+        let wallet_list = snapshot_wallets(&self.wallets);
+
         log::info!(
             "[SOL] Orphan sweep starting: {} managed wallet(s), skipping {} active reservation(s)",
-            self.wallets.len(),
+            wallet_list.len(),
             active_addresses.len()
         );
 
@@ -1124,8 +1127,7 @@ impl SolanaDetector {
         let mut swept_sol_count: usize = 0;
         let mut swept_token_count: usize = 0;
 
-        let wallets = self.wallets.clone();
-        for wallet in &wallets {
+        for wallet in &wallet_list {
             if active_addresses.contains(&wallet.address) {
                 continue;
             }
@@ -1227,7 +1229,8 @@ impl SolanaDetector {
         decimals: u8,
         deposited_amount: u64,
     ) -> Result<SweepResult, DetectorError> {
-        let wallet = find_wallet(&self.wallets, owner_address).ok_or_else(|| {
+        let snapshot = snapshot_wallets(&self.wallets);
+        let wallet = find_wallet(&snapshot, owner_address).ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Solana wallet found for address '{}'",
                 owner_address

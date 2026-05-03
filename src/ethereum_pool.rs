@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ethers::core::rand::RngCore;
@@ -17,6 +17,16 @@ const RESERVATION_KEY_PREFIX: &str = "ethereum:reservation:";
 const IN_MEMORY_RESERVATION_URL: &str = "memory://ethereum-reservations";
 const DEFAULT_ETHEREUM_WALLET_POOL_SIZE: usize = 10;
 const MAX_ETHEREUM_WALLET_POOL_SIZE: usize = 10_000;
+
+pub type SharedEthereumWallets = Arc<RwLock<Vec<ManagedEthereumWallet>>>;
+
+pub fn shared_ethereum_wallets(wallets: Vec<ManagedEthereumWallet>) -> SharedEthereumWallets {
+    Arc::new(RwLock::new(wallets))
+}
+
+pub fn snapshot_ethereum_wallets(shared: &SharedEthereumWallets) -> Vec<ManagedEthereumWallet> {
+    shared.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
 
 static IN_MEMORY_RESERVATIONS: OnceLock<Mutex<HashMap<String, EthereumReservation>>> =
     OnceLock::new();
@@ -235,11 +245,104 @@ fn ethereum_wallet_pool_size_from_env() -> Result<usize, DetectorError> {
     }
 }
 
-pub fn find_ethereum_wallet<'a>(
-    wallets: &'a [ManagedEthereumWallet],
+pub fn find_ethereum_wallet(
+    wallets: &[ManagedEthereumWallet],
     address: Address,
-) -> Option<&'a ManagedEthereumWallet> {
-    wallets.iter().find(|wallet| wallet.eth_address == address)
+) -> Option<ManagedEthereumWallet> {
+    wallets.iter().find(|wallet| wallet.eth_address == address).cloned()
+}
+
+pub fn generate_random_ethereum_wallet(index: u32) -> Result<ManagedEthereumWallet, DetectorError> {
+    let mut rng = ethers::core::rand::thread_rng();
+    for _ in 0..32 {
+        let mut private_key_bytes = [0u8; 32];
+        rng.fill_bytes(&mut private_key_bytes);
+        if let Ok(wallet) = LocalWallet::from_bytes(&private_key_bytes) {
+            let eth_address = wallet.address();
+            return Ok(ManagedEthereumWallet {
+                index,
+                address: format_address(eth_address),
+                eth_address,
+                wallet: Arc::new(wallet),
+            });
+        }
+    }
+    Err(DetectorError::ApiError(
+        "Failed to generate a valid Ethereum keypair after several attempts".into(),
+    ))
+}
+
+pub fn append_ethereum_wallet_to_pool_file(
+    path: &str,
+    wallet: &ManagedEthereumWallet,
+) -> Result<(), DetectorError> {
+    let data = std::fs::read_to_string(path).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to read Ethereum wallet pool file '{}' for append: {e}",
+            path
+        ))
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to parse Ethereum wallet pool file '{}' for append: {e}",
+            path
+        ))
+    })?;
+
+    let private_key_hex = format!(
+        "0x{}",
+        hex::encode(wallet.wallet.signer().to_bytes())
+    );
+    let new_entry = serde_json::json!({
+        "address": wallet.address.clone(),
+        "private_key": private_key_hex,
+    });
+
+    let entries = if let Some(arr) = value.as_array_mut() {
+        arr
+    } else if let Some(obj) = value.as_object_mut() {
+        let entry = obj
+            .entry("wallets".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        entry.as_array_mut().ok_or_else(|| {
+            DetectorError::InvalidConfig(format!(
+                "Ethereum wallet pool 'wallets' field in '{}' is not an array",
+                path
+            ))
+        })?
+    } else {
+        return Err(DetectorError::InvalidConfig(format!(
+            "Ethereum wallet pool file '{}' is neither a JSON array nor object",
+            path
+        )));
+    };
+    entries.push(new_entry);
+
+    let serialized = serde_json::to_string_pretty(&value)?;
+    let tmp_path = format!("{}.tmp", path);
+    std::fs::write(&tmp_path, serialized).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to write Ethereum wallet pool tmp file '{}': {e}",
+            tmp_path
+        ))
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to rename Ethereum wallet pool tmp file '{}' -> '{}': {e}",
+            tmp_path, path
+        ))
+    })?;
+    Ok(())
+}
+
+fn ethereum_max_pool_size() -> usize {
+    std::env::var("ETH_MAX_POOL_SIZE")
+        .or_else(|_| std::env::var("ETH_WALLET_POOL_MAX_SIZE"))
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(MAX_ETHEREUM_WALLET_POOL_SIZE))
+        .unwrap_or(MAX_ETHEREUM_WALLET_POOL_SIZE)
 }
 
 pub async fn load_active_ethereum_reservations(
@@ -284,7 +387,8 @@ pub async fn load_active_ethereum_reservations(
 
 pub async fn reserve_ethereum_wallet_for_user(
     redis_url: &str,
-    wallets: &[ManagedEthereumWallet],
+    wallets: &SharedEthereumWallets,
+    pool_path: &str,
     user_id: &str,
     ttl_secs: u64,
 ) -> Result<EthereumReservation, DetectorError> {
@@ -295,7 +399,7 @@ pub async fn reserve_ethereum_wallet_for_user(
     }
 
     if should_use_in_memory_reservations(redis_url) {
-        return reserve_ethereum_wallet_for_user_in_memory(wallets, user_id, ttl_secs);
+        return reserve_ethereum_wallet_for_user_in_memory(wallets, pool_path, user_id, ttl_secs);
     }
 
     let client = redis::Client::open(redis_url)
@@ -338,18 +442,25 @@ pub async fn reserve_ethereum_wallet_for_user(
         return Ok(existing_reservation);
     }
 
-    for wallet in wallets {
+    let candidates: Vec<(String, u32)> = {
+        let pool = wallets.read().unwrap_or_else(|p| p.into_inner());
+        pool.iter()
+            .map(|wallet| (wallet.address.clone(), wallet.index))
+            .collect()
+    };
+
+    for (address, index) in candidates {
         let reservation = EthereumReservation {
             user_id: user_id.trim().to_string(),
-            address: wallet.address.clone(),
-            wallet_index: wallet.index,
+            address: address.clone(),
+            wallet_index: index,
             reserved_at_unix: now,
             expires_at_unix: new_expires,
         };
 
         let payload = serde_json::to_string(&reservation)?;
         let response: Option<String> = redis::cmd("SET")
-            .arg(reservation_key(&wallet.address))
+            .arg(reservation_key(&address))
             .arg(payload)
             .arg("EX")
             .arg(ttl_secs)
@@ -363,9 +474,58 @@ pub async fn reserve_ethereum_wallet_for_user(
         }
     }
 
-    Err(DetectorError::InvalidConfig(
-        "No unreserved Ethereum wallet is currently available".into(),
-    ))
+    // Pool exhausted — generate, persist, then reserve.
+    let new_wallet = grow_ethereum_pool(wallets, pool_path)?;
+    let reservation = EthereumReservation {
+        user_id: user_id.trim().to_string(),
+        address: new_wallet.address.clone(),
+        wallet_index: new_wallet.index,
+        reserved_at_unix: now,
+        expires_at_unix: new_expires,
+    };
+    let payload = serde_json::to_string(&reservation)?;
+    let response: Option<String> = redis::cmd("SET")
+        .arg(reservation_key(&new_wallet.address))
+        .arg(payload)
+        .arg("EX")
+        .arg(ttl_secs)
+        .arg("NX")
+        .query_async(&mut connection)
+        .await
+        .map_err(redis_error)?;
+
+    if response.is_some() {
+        Ok(reservation)
+    } else {
+        Err(DetectorError::ApiError(
+            "Failed to register reservation for newly generated Ethereum wallet".into(),
+        ))
+    }
+}
+
+fn grow_ethereum_pool(
+    wallets: &SharedEthereumWallets,
+    pool_path: &str,
+) -> Result<ManagedEthereumWallet, DetectorError> {
+    let max_pool_size = ethereum_max_pool_size();
+    let mut pool = wallets.write().unwrap_or_else(|p| p.into_inner());
+    if pool.len() >= max_pool_size {
+        return Err(DetectorError::InvalidConfig(format!(
+            "Ethereum wallet pool reached ETH_MAX_POOL_SIZE={} - refusing to grow further",
+            max_pool_size
+        )));
+    }
+    let next_index = pool.len() as u32;
+    let new_wallet = generate_random_ethereum_wallet(next_index)?;
+    append_ethereum_wallet_to_pool_file(pool_path, &new_wallet)?;
+    pool.push(new_wallet.clone());
+    log::info!(
+        "[ETH] Auto-generated new managed wallet at index {} address {} (pool path: {}); pool grew to handle exhausted reservations",
+        new_wallet.index,
+        new_wallet.address,
+        pool_path
+    );
+    Ok(new_wallet)
 }
 
 pub fn reservation_key(address: &str) -> String {
@@ -433,7 +593,8 @@ fn load_active_ethereum_reservations_from_memory() -> Result<Vec<EthereumReserva
 }
 
 fn reserve_ethereum_wallet_for_user_in_memory(
-    wallets: &[ManagedEthereumWallet],
+    wallets: &SharedEthereumWallets,
+    pool_path: &str,
     user_id: &str,
     ttl_secs: u64,
 ) -> Result<EthereumReservation, DetectorError> {
@@ -444,51 +605,68 @@ fn reserve_ethereum_wallet_for_user_in_memory(
     })?;
     let new_expires = now.saturating_add(ttl_secs_i64);
 
-    let mut store = lock_in_memory_reservations();
-    store.retain(|_, reservation| reservation.expires_at_unix > now);
-
-    if let Some((key, existing)) = store
-        .iter()
-        .find(|(_, reservation)| reservation.user_id == user_id)
-        .map(|(k, v)| (k.clone(), v.clone()))
     {
-        if new_expires > existing.expires_at_unix {
-            let updated = EthereumReservation {
-                expires_at_unix: new_expires,
-                ..existing
-            };
-            store.insert(key, updated.clone());
-            log::info!(
-                "[ETH] Extended in-memory reservation for user_id={} address={} to {}s",
-                user_id,
-                updated.address,
-                ttl_secs
-            );
-            return Ok(updated);
-        }
-        return Ok(existing);
-    }
+        let mut store = lock_in_memory_reservations();
+        store.retain(|_, reservation| reservation.expires_at_unix > now);
 
-    for wallet in wallets {
-        let key = reservation_key(&wallet.address);
-        if store.contains_key(&key) {
-            continue;
+        if let Some((key, existing)) = store
+            .iter()
+            .find(|(_, reservation)| reservation.user_id == user_id)
+            .map(|(k, v)| (k.clone(), v.clone()))
+        {
+            if new_expires > existing.expires_at_unix {
+                let updated = EthereumReservation {
+                    expires_at_unix: new_expires,
+                    ..existing
+                };
+                store.insert(key, updated.clone());
+                log::info!(
+                    "[ETH] Extended in-memory reservation for user_id={} address={} to {}s",
+                    user_id,
+                    updated.address,
+                    ttl_secs
+                );
+                return Ok(updated);
+            }
+            return Ok(existing);
         }
 
-        let reservation = EthereumReservation {
-            user_id: user_id.to_string(),
-            address: wallet.address.clone(),
-            wallet_index: wallet.index,
-            reserved_at_unix: now,
-            expires_at_unix: new_expires,
+        let candidate_addresses: Vec<(String, u32)> = {
+            let pool = wallets.read().unwrap_or_else(|p| p.into_inner());
+            pool.iter()
+                .map(|w| (w.address.clone(), w.index))
+                .collect()
         };
-        store.insert(key, reservation.clone());
-        return Ok(reservation);
+
+        for (address, index) in candidate_addresses {
+            let key = reservation_key(&address);
+            if store.contains_key(&key) {
+                continue;
+            }
+            let reservation = EthereumReservation {
+                user_id: user_id.to_string(),
+                address,
+                wallet_index: index,
+                reserved_at_unix: now,
+                expires_at_unix: new_expires,
+            };
+            store.insert(key, reservation.clone());
+            return Ok(reservation);
+        }
     }
 
-    Err(DetectorError::InvalidConfig(
-        "No unreserved Ethereum wallet is currently available".into(),
-    ))
+    // Pool exhausted — grow it. (We re-acquire the in-memory lock after the grow.)
+    let new_wallet = grow_ethereum_pool(wallets, pool_path)?;
+    let mut store = lock_in_memory_reservations();
+    let reservation = EthereumReservation {
+        user_id: user_id.to_string(),
+        address: new_wallet.address.clone(),
+        wallet_index: new_wallet.index,
+        reserved_at_unix: now,
+        expires_at_unix: new_expires,
+    };
+    store.insert(reservation_key(&new_wallet.address), reservation.clone());
+    Ok(reservation)
 }
 
 fn lock_in_memory_reservations()

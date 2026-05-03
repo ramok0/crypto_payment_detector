@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
 use crate::ethereum_pool::{
-    EthereumReservation, ManagedEthereumWallet, find_ethereum_wallet, format_address,
-    load_active_ethereum_reservations, load_ethereum_wallet_pool,
+    EthereumReservation, SharedEthereumWallets, find_ethereum_wallet, format_address,
+    load_active_ethereum_reservations, snapshot_ethereum_wallets,
 };
 use crate::pricing::PriceFetcher;
 use crate::trait_def::PaymentDetector;
@@ -109,7 +109,7 @@ struct SweepResult {
 #[derive(Debug)]
 pub struct EthereumDetector {
     config: EthereumConfig,
-    wallets: Vec<ManagedEthereumWallet>,
+    wallets: SharedEthereumWallets,
     tokens: Vec<Erc20TokenConfig>,
     provider: Provider<Http>,
     gas_tank_wallet: LocalWallet,
@@ -125,6 +125,7 @@ impl EthereumDetector {
     pub fn new(
         config: EthereumConfig,
         tokens: Vec<Erc20TokenConfig>,
+        wallets: SharedEthereumWallets,
     ) -> Result<Self, DetectorError> {
         if config.rpc_url.trim().is_empty() {
             return Err(DetectorError::InvalidConfig(
@@ -160,7 +161,6 @@ impl EthereumDetector {
             ));
         }
 
-        let wallets = load_ethereum_wallet_pool(&config.wallet_pool_file)?;
         let provider = build_ethereum_provider(&config)?;
 
         let gas_tank_wallet = config
@@ -208,7 +208,7 @@ impl EthereumDetector {
     }
 
     pub fn wallet_count(&self) -> usize {
-        self.wallets.len()
+        self.wallets.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn gas_tank_address(&self) -> String {
@@ -221,6 +221,123 @@ impl EthereumDetector {
 
     pub fn token_count(&self) -> usize {
         self.tokens.len()
+    }
+
+    pub async fn sweep_orphan_balances(&self) -> Result<(), DetectorError> {
+        let active_addresses: HashSet<String> =
+            match load_active_ethereum_reservations(&self.config.redis_url).await {
+                Ok(reservations) => reservations
+                    .into_iter()
+                    .map(|r| r.address.to_ascii_lowercase())
+                    .collect(),
+                Err(error) => {
+                    log::warn!(
+                        "[ETH] Orphan sweep: failed to load active reservations ({error}); \
+                         skipping to avoid touching reserved wallets"
+                    );
+                    return Ok(());
+                }
+            };
+
+        let snapshot = snapshot_ethereum_wallets(&self.wallets);
+        log::info!(
+            "[ETH] Orphan sweep starting: {} managed wallet(s), skipping {} active reservation(s)",
+            snapshot.len(),
+            active_addresses.len()
+        );
+
+        let mut native_swept_count: usize = 0;
+        let mut native_swept_wei: U256 = U256::zero();
+        let mut token_swept_count: usize = 0;
+
+        for wallet in &snapshot {
+            if active_addresses.contains(&wallet.address.to_ascii_lowercase()) {
+                continue;
+            }
+
+            // Native ETH
+            match self.eth_balance(wallet.eth_address).await {
+                Ok(balance) if !balance.is_zero() => {
+                    match self.sweep_native_from_address(&wallet.address).await {
+                        Ok(result) if result.txid.is_some() => {
+                            log::info!(
+                                "[ETH] Orphan ETH swept: {} wei from {} (index {}, tx={})",
+                                result.amount,
+                                wallet.address,
+                                wallet.index,
+                                result.txid.clone().unwrap_or_default()
+                            );
+                            native_swept_wei = native_swept_wei.saturating_add(result.amount);
+                            native_swept_count += 1;
+                        }
+                        Ok(_) => {}
+                        Err(error) => log::warn!(
+                            "[ETH] Failed to sweep orphan ETH from {} (index {}): {error}",
+                            wallet.address,
+                            wallet.index
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!(
+                    "[ETH] Failed to read ETH balance for {} (index {}): {error}",
+                    wallet.address,
+                    wallet.index
+                ),
+            }
+
+            // Tokens
+            for token in &self.tokens {
+                let balance = match self.erc20_balance(token.contract, wallet.eth_address).await {
+                    Ok(b) => b,
+                    Err(error) => {
+                        log::warn!(
+                            "[ETH] Failed to read {} balance for {} (index {}): {error}",
+                            token.symbol,
+                            wallet.address,
+                            wallet.index
+                        );
+                        continue;
+                    }
+                };
+                if balance.is_zero() {
+                    continue;
+                }
+
+                match self
+                    .sweep_erc20_from_address(&wallet.address, token.contract, balance)
+                    .await
+                {
+                    Ok(result) if result.txid.is_some() => {
+                        log::info!(
+                            "[ETH] Orphan {} swept: {} units from {} (index {}, tx={})",
+                            token.symbol,
+                            result.amount,
+                            wallet.address,
+                            wallet.index,
+                            result.txid.clone().unwrap_or_default()
+                        );
+                        token_swept_count += 1;
+                    }
+                    Ok(_) => {}
+                    Err(error) => log::warn!(
+                        "[ETH] Failed to sweep orphan {} from {} (index {}): {error}",
+                        token.symbol,
+                        wallet.address,
+                        wallet.index
+                    ),
+                }
+            }
+        }
+
+        log::info!(
+            "[ETH] Orphan sweep complete: {} ETH sweep(s) ({} wei total), {} token sweep(s)",
+            native_swept_count,
+            native_swept_wei,
+            token_swept_count
+        );
+
+        Ok(())
     }
 
     async fn process_cycle(&self) -> Result<(), DetectorError> {
@@ -616,7 +733,11 @@ impl EthereumDetector {
                 "Invalid managed Ethereum address '{address}': {e}"
             ))
         })?;
-        let wallet = find_ethereum_wallet(&self.wallets, eth_address).ok_or_else(|| {
+        let wallet = find_ethereum_wallet(
+            &snapshot_ethereum_wallets(&self.wallets),
+            eth_address,
+        )
+        .ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Ethereum wallet found for address '{}'",
                 address
@@ -706,7 +827,11 @@ impl EthereumDetector {
                 "Invalid managed Ethereum address '{address}': {e}"
             ))
         })?;
-        let wallet = find_ethereum_wallet(&self.wallets, eth_address).ok_or_else(|| {
+        let wallet = find_ethereum_wallet(
+            &snapshot_ethereum_wallets(&self.wallets),
+            eth_address,
+        )
+        .ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Ethereum wallet found for address '{}'",
                 address
