@@ -29,6 +29,51 @@ Limitations :
 - **Tokens non USD-pegged** : pas de check ratio (on n'a pas le prix). USDC/USDT/DAI/BUSD/TUSD/USDP/GUSD/PYUSD sont reconnus comme USD-pegged.
 - **SPL token rent ATA** : l'ATA de destination peut nécessiter ~0.002 SOL de rent au premier sweep. Ce coût n'est PAS compté dans le ratio (sinon le premier sweep ne se ferait jamais). Si vous voulez quand même éviter le rent à tout prix, augmentez `SOL_MIN_DEPOSIT_FIAT`.
 
+## Mise à jour : durée de réservation configurable
+
+Le TTL des réservations SOL/ETH peut maintenant être :
+
+### Globalement, via env (s'applique à toutes les nouvelles réservations)
+
+```env
+SOLANA_RESERVATION_TTL_SECS=86400      # 24 heures (défaut 3600 = 1 heure)
+ETH_RESERVATION_TTL_SECS=86400         # 24 heures (défaut 3600 = 1 heure)
+```
+
+### Par requête API (override par appel)
+
+Champ `ttl_secs` optionnel dans le payload de `POST /solana/reserve` et `POST /ethereum/reserve` :
+
+```bash
+curl -X POST http://localhost:3030/solana/reserve \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "user_42", "ttl_secs": 86400}'
+```
+
+```json
+{
+  "user_id": "user_42",
+  "address": "...",
+  "wallet_index": 7,
+  "reserved_at_unix": 1714756800,
+  "expires_at_unix": 1714843200,
+  "reservation_ttl_secs": 86400,
+  "sweep_destination_address": "..."
+}
+```
+
+Si `ttl_secs` n'est pas fourni → fallback sur le défaut env. Si fourni > 0 → utilise la valeur, capée à 30 jours max (sécurité hardcodée).
+
+### Extension automatique d'une réservation existante
+
+Si un user a déjà une réservation active et appelle `/reserve` avec un `ttl_secs` plus long que ce qui reste, le TTL Redis est étendu. Logs :
+
+```
+[SOL] Extended reservation for user_id=user_42 address=... to 86400s
+```
+
+Si le `ttl_secs` demandé est ≤ ce qui reste, la réservation existante est retournée telle quelle (pas de raccourcissement).
+
 ## TL;DR
 
 Deux nouvelles fonctionnalités, **toutes les deux opt-in** :

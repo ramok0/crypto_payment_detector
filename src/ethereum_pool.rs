@@ -298,11 +298,6 @@ pub async fn reserve_ethereum_wallet_for_user(
         return reserve_ethereum_wallet_for_user_in_memory(wallets, user_id, ttl_secs);
     }
 
-    let existing = load_active_ethereum_reservations(redis_url).await?;
-    if let Some(reservation) = existing.into_iter().find(|r| r.user_id == user_id) {
-        return Ok(reservation);
-    }
-
     let client = redis::Client::open(redis_url)
         .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
     let mut connection = client
@@ -314,6 +309,34 @@ pub async fn reserve_ethereum_wallet_for_user(
     let ttl_secs_i64 = i64::try_from(ttl_secs).map_err(|_| {
         DetectorError::InvalidConfig("Reservation TTL is too large to store".into())
     })?;
+    let new_expires = now.saturating_add(ttl_secs_i64);
+
+    let existing = load_active_ethereum_reservations(redis_url).await?;
+    if let Some(existing_reservation) = existing.into_iter().find(|r| r.user_id == user_id.trim()) {
+        if new_expires > existing_reservation.expires_at_unix {
+            let updated = EthereumReservation {
+                expires_at_unix: new_expires,
+                ..existing_reservation.clone()
+            };
+            let payload = serde_json::to_string(&updated)?;
+            let _: Option<String> = redis::cmd("SET")
+                .arg(reservation_key(&updated.address))
+                .arg(payload)
+                .arg("EX")
+                .arg(ttl_secs)
+                .query_async(&mut connection)
+                .await
+                .map_err(redis_error)?;
+            log::info!(
+                "[ETH] Extended reservation for user_id={} address={} to {}s",
+                user_id,
+                updated.address,
+                ttl_secs
+            );
+            return Ok(updated);
+        }
+        return Ok(existing_reservation);
+    }
 
     for wallet in wallets {
         let reservation = EthereumReservation {
@@ -321,7 +344,7 @@ pub async fn reserve_ethereum_wallet_for_user(
             address: wallet.address.clone(),
             wallet_index: wallet.index,
             reserved_at_unix: now,
-            expires_at_unix: now + ttl_secs_i64,
+            expires_at_unix: new_expires,
         };
 
         let payload = serde_json::to_string(&reservation)?;
@@ -419,16 +442,31 @@ fn reserve_ethereum_wallet_for_user_in_memory(
     let ttl_secs_i64 = i64::try_from(ttl_secs).map_err(|_| {
         DetectorError::InvalidConfig("Reservation TTL is too large to store".into())
     })?;
+    let new_expires = now.saturating_add(ttl_secs_i64);
 
     let mut store = lock_in_memory_reservations();
     store.retain(|_, reservation| reservation.expires_at_unix > now);
 
-    if let Some(reservation) = store
-        .values()
-        .find(|reservation| reservation.user_id == user_id)
-        .cloned()
+    if let Some((key, existing)) = store
+        .iter()
+        .find(|(_, reservation)| reservation.user_id == user_id)
+        .map(|(k, v)| (k.clone(), v.clone()))
     {
-        return Ok(reservation);
+        if new_expires > existing.expires_at_unix {
+            let updated = EthereumReservation {
+                expires_at_unix: new_expires,
+                ..existing
+            };
+            store.insert(key, updated.clone());
+            log::info!(
+                "[ETH] Extended in-memory reservation for user_id={} address={} to {}s",
+                user_id,
+                updated.address,
+                ttl_secs
+            );
+            return Ok(updated);
+        }
+        return Ok(existing);
     }
 
     for wallet in wallets {
@@ -442,7 +480,7 @@ fn reserve_ethereum_wallet_for_user_in_memory(
             address: wallet.address.clone(),
             wallet_index: wallet.index,
             reserved_at_unix: now,
-            expires_at_unix: now + ttl_secs_i64,
+            expires_at_unix: new_expires,
         };
         store.insert(key, reservation.clone());
         return Ok(reservation);

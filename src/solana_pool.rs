@@ -166,11 +166,6 @@ pub async fn reserve_wallet_for_user(
         ));
     }
 
-    let existing = load_active_reservations(redis_url).await?;
-    if let Some(reservation) = existing.into_iter().find(|r| r.user_id == user_id) {
-        return Ok(reservation);
-    }
-
     let client = redis::Client::open(redis_url)
         .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
     let mut connection = client
@@ -182,6 +177,34 @@ pub async fn reserve_wallet_for_user(
     let ttl_secs_i64 = i64::try_from(ttl_secs).map_err(|_| {
         DetectorError::InvalidConfig("Reservation TTL is too large to store".into())
     })?;
+    let new_expires = now.saturating_add(ttl_secs_i64);
+
+    let existing = load_active_reservations(redis_url).await?;
+    if let Some(existing_reservation) = existing.into_iter().find(|r| r.user_id == user_id.trim()) {
+        if new_expires > existing_reservation.expires_at_unix {
+            let updated = SolanaReservation {
+                expires_at_unix: new_expires,
+                ..existing_reservation.clone()
+            };
+            let payload = serde_json::to_string(&updated)?;
+            let _: Option<String> = redis::cmd("SET")
+                .arg(reservation_key(&updated.address))
+                .arg(payload)
+                .arg("EX")
+                .arg(ttl_secs)
+                .query_async(&mut connection)
+                .await
+                .map_err(redis_error)?;
+            log::info!(
+                "[SOL] Extended reservation for user_id={} address={} to {}s",
+                user_id,
+                updated.address,
+                ttl_secs
+            );
+            return Ok(updated);
+        }
+        return Ok(existing_reservation);
+    }
 
     for wallet in wallets {
         let reservation = SolanaReservation {
@@ -189,7 +212,7 @@ pub async fn reserve_wallet_for_user(
             address: wallet.address.clone(),
             wallet_index: wallet.index,
             reserved_at_unix: now,
-            expires_at_unix: now + ttl_secs_i64,
+            expires_at_unix: new_expires,
         };
 
         let payload = serde_json::to_string(&reservation)?;

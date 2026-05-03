@@ -45,9 +45,11 @@ Two binaries:
 
 ### Reservation flow (SOL, ETH)
 1. Bot owns a pool of N wallets (private keys local).
-2. User calls `POST /solana/reserve` or `POST /ethereum/reserve` with `user_id`. API picks an unreserved wallet, stores `{user_id, address, wallet_index, expiry}` in Redis (key `solana:reservation:<addr>` or `ethereum:reservation:<addr>`) with TTL.
+2. User calls `POST /solana/reserve` or `POST /ethereum/reserve` with `{user_id, ttl_secs?}`. API picks an unreserved wallet, stores `{user_id, address, wallet_index, expiry}` in Redis (key `solana:reservation:<addr>` or `ethereum:reservation:<addr>`) with TTL.
 3. Detector loop loads active reservations every cycle and only watches those addresses.
 4. On confirmed deposit: webhook + sweep to secure destination; reservation key continues to exist until TTL.
+
+**TTL resolution**: per-request `ttl_secs` (capped at `MAX_RESERVATION_TTL_SECS = 30 days` in [src/api.rs](src/api.rs)) → fall back to `SOLANA_RESERVATION_TTL_SECS` / `ETH_RESERVATION_TTL_SECS` env (default 3600s = 1h). Re-calling `/reserve` with the same `user_id` and a longer `ttl_secs` extends the existing reservation's Redis TTL; calling with shorter or equal TTL returns the existing reservation unchanged.
 
 ### BTC/LTC flow (no reservations)
 - xpub-derived addresses (no per-user assignment in the bot — assignment is the caller's responsibility based on the `derivation_index` exposed by `/derive`).

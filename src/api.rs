@@ -74,14 +74,27 @@ struct DeriveParams {
     count: u32,
 }
 
+const MAX_RESERVATION_TTL_SECS: u64 = 30 * 24 * 3600; // 30 days hard cap
+
 #[derive(Deserialize)]
 struct ReserveSolanaAddressRequest {
     user_id: String,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct ReserveEthereumAddressRequest {
     user_id: String,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+fn resolve_ttl(requested: Option<u64>, default: u64) -> u64 {
+    match requested {
+        Some(value) if value > 0 => value.min(MAX_RESERVATION_TTL_SECS),
+        _ => default,
+    }
 }
 
 fn default_count() -> u32 {
@@ -345,11 +358,12 @@ async fn handle_solana_reserve(
         ));
     };
 
+    let ttl = resolve_ttl(payload.ttl_secs, solana_pool.reservation_ttl_secs);
     let reservation = reserve_wallet_for_user(
         &solana_pool.redis_url,
         &solana_pool.wallets,
         &payload.user_id,
-        solana_pool.reservation_ttl_secs,
+        ttl,
     )
     .await
     .map_err(map_reservation_error)?;
@@ -360,7 +374,7 @@ async fn handle_solana_reserve(
         wallet_index: reservation.wallet_index,
         reserved_at_unix: reservation.reserved_at_unix,
         expires_at_unix: reservation.expires_at_unix,
-        reservation_ttl_secs: solana_pool.reservation_ttl_secs,
+        reservation_ttl_secs: ttl,
         sweep_destination_address: solana_pool.secure_deposit_address.clone(),
     }))
 }
@@ -396,11 +410,12 @@ async fn handle_ethereum_reserve(
         ));
     };
 
+    let ttl = resolve_ttl(payload.ttl_secs, ethereum_pool.reservation_ttl_secs);
     let reservation = reserve_ethereum_wallet_for_user(
         &ethereum_pool.redis_url,
         &ethereum_pool.wallets,
         &payload.user_id,
-        ethereum_pool.reservation_ttl_secs,
+        ttl,
     )
     .await
     .map_err(map_reservation_error)?;
@@ -411,7 +426,7 @@ async fn handle_ethereum_reserve(
         wallet_index: reservation.wallet_index,
         reserved_at_unix: reservation.reserved_at_unix,
         expires_at_unix: reservation.expires_at_unix,
-        reservation_ttl_secs: ethereum_pool.reservation_ttl_secs,
+        reservation_ttl_secs: ttl,
         gas_tank_address: ethereum_pool.gas_tank_address.clone(),
         ledger_address: ethereum_pool.ledger_address.clone(),
     }))
