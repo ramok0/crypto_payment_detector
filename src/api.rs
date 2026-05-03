@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crypto_payment_detector::derivation::derive_address;
 use crypto_payment_detector::env_utils::{
-    chain_env_bool, chain_env_prefix, chain_env_var, proxy_env_var,
+    chain_env_bool, chain_env_prefix, chain_env_var, env_bool, proxy_env_var,
 };
 use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
@@ -1060,7 +1060,7 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(100);
-    let chains: Vec<Chain> = match chain_str.to_lowercase().as_str() {
+    let mut chains: Vec<Chain> = match chain_str.to_lowercase().as_str() {
         "both" => vec![Chain::Bitcoin, Chain::Litecoin],
         "solbtc" => vec![Chain::Bitcoin, Chain::Solana],
         "all" => vec![
@@ -1080,6 +1080,14 @@ async fn main() {
             "Invalid CHAIN value (expected: bitcoin, litecoin, solana, ethereum, base, btc, ltc, sol, eth, both, solbtc, all)",
         )],
     };
+
+    if env_bool("DISABLE_BASE").unwrap_or(false) {
+        let before = chains.len();
+        chains.retain(|chain| *chain != Chain::Base);
+        if chains.len() < before {
+            log::info!("[BASE] Disabled via DISABLE_BASE=true — skipping detector, sweep, orphan scan, and /base/* endpoints will return errors");
+        }
+    }
 
     let mut chain_infos = Vec::new();
     let mut detector_handles = Vec::new();
