@@ -2,7 +2,7 @@ use crypto_payment_detector::{
     BasicAuth, Chain, ChainDetector, DetectorConfig, EthereumConfig, EthereumDetector,
     PaymentDetector, RetryConfig, SolanaConfig, SolanaDetector,
     env_utils::{chain_env_bool, chain_env_var, proxy_env_var},
-    ethereum_reservation_store_url_from_env, parse_erc20_tokens,
+    ethereum_reservation_store_url_from_env, parse_erc20_tokens, parse_spl_tokens,
 };
 use std::sync::Arc;
 
@@ -27,6 +27,18 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
         Chain::Solana => "SOL_STATE_FILE",
         Chain::Ethereum => "ETH_STATE_FILE",
     };
+
+    let (sweep_xpriv_var, sweep_dest_var) = match chain {
+        Chain::Bitcoin => ("BTC_XPRIV", "BTC_SWEEP_DESTINATION"),
+        Chain::Litecoin => ("LTC_XPRIV", "LTC_SWEEP_DESTINATION"),
+        _ => ("", ""),
+    };
+    let sweep_xpriv = std::env::var(sweep_xpriv_var)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let sweep_destination = std::env::var(sweep_dest_var)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
     DetectorConfig {
         chain,
@@ -85,6 +97,32 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
             "SKIP_INITIAL_BLOCK_SYNC",
             "SKIP_INITIAL_BLOCK_SYNC",
         ),
+        sweep_xpriv,
+        sweep_destination,
+        sweep_fee_rate_sats_per_vb: {
+            let chain_var = match chain {
+                Chain::Bitcoin => "BTC_SWEEP_FEE_RATE_SATS_PER_VB",
+                Chain::Litecoin => "LTC_SWEEP_FEE_RATE_SATS_PER_VB",
+                _ => "",
+            };
+            std::env::var(chain_var)
+                .or_else(|_| std::env::var("SWEEP_FEE_RATE_SATS_PER_VB"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5)
+        },
+        sweep_min_sat: {
+            let chain_var = match chain {
+                Chain::Bitcoin => "BTC_SWEEP_MIN_SAT",
+                Chain::Litecoin => "LTC_SWEEP_MIN_SAT",
+                _ => "",
+            };
+            std::env::var(chain_var)
+                .or_else(|_| std::env::var("SWEEP_MIN_SAT"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5_000)
+        },
     }
 }
 
@@ -195,6 +233,19 @@ fn build_solana_config() -> SolanaConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.5),
+        gas_tank_private_key: std::env::var("SOLANA_GAS_TANK_PRIVATE_KEY")
+            .or_else(|_| std::env::var("SOLANA_FEE_PAYER_PRIVATE_KEY"))
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        gas_tank_target_usd: std::env::var("SOLANA_GAS_TANK_TARGET_USD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10.0),
+        gas_tank_check_interval_secs: std::env::var("SOLANA_GAS_TANK_INTERVAL_SECS")
+            .or_else(|_| std::env::var("SOLANA_GAS_TANK_CHECK_INTERVAL_SECS"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(900),
     }
 }
 
@@ -212,6 +263,9 @@ async fn run_detector(detector: Arc<ChainDetector>, max_index: u32) {
 }
 
 async fn run_solana_detector(detector: Arc<SolanaDetector>) {
+    if let Err(error) = detector.sweep_orphan_balances().await {
+        log::warn!("[SOL] Startup orphan sweep failed: {error}");
+    }
     loop {
         if let Err(error) = detector.run_block_scan_loop(None, 0).await {
             log::error!("[SOL] Solana scan loop error: {error} - restarting in 10s");
@@ -294,8 +348,11 @@ async fn main() {
             }
             Chain::Solana => {
                 let config = build_solana_config();
-                let detector =
-                    Arc::new(SolanaDetector::new(config).expect("Failed to create SOL detector"));
+                let tokens = parse_spl_tokens(std::env::var("SOLANA_SPL_TOKENS").ok().as_deref())
+                    .expect("Invalid SOLANA_SPL_TOKENS");
+                let detector = Arc::new(
+                    SolanaDetector::new(config, tokens).expect("Failed to create SOL detector"),
+                );
 
                 println!("Solana Payment Detector starting");
                 println!("  Chain: SOL");
@@ -304,6 +361,7 @@ async fn main() {
                     detector.derive_address(0).unwrap()
                 );
                 println!("  Managed wallet count: {}", detector.wallet_count());
+                println!("  SPL token count: {}", detector.token_count());
                 println!();
 
                 let detector_handle = detector.clone();

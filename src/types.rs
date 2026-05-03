@@ -217,6 +217,10 @@ pub struct DetectorConfig {
     pub explorer_api_url: Option<String>,
     pub min_confirmations: u64,
     pub skip_initial_block_sync: bool,
+    pub sweep_xpriv: Option<String>,
+    pub sweep_destination: Option<String>,
+    pub sweep_fee_rate_sats_per_vb: u64,
+    pub sweep_min_sat: u64,
 }
 
 impl Default for DetectorConfig {
@@ -238,6 +242,10 @@ impl Default for DetectorConfig {
             explorer_api_url: None,
             min_confirmations: 1,
             skip_initial_block_sync: false,
+            sweep_xpriv: None,
+            sweep_destination: None,
+            sweep_fee_rate_sats_per_vb: 5,
+            sweep_min_sat: 5_000,
         }
     }
 }

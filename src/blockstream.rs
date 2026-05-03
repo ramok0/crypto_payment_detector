@@ -3,6 +3,9 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::bitcoin_sweep::{
+    self, BitcoinSweepConfig, BitcoinSweepResult, validate_sweep_config,
+};
 use crate::derivation::derive_address;
 use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
@@ -179,6 +182,7 @@ pub struct ChainDetector {
     state: Arc<Mutex<SharedState>>,
     explorer_apis: Vec<ExplorerApi>,
     active_explorer_index: Mutex<usize>,
+    sweep_config: Option<BitcoinSweepConfig>,
 }
 
 impl ChainDetector {
@@ -247,6 +251,36 @@ impl ChainDetector {
             .collect::<Vec<_>>()
             .join(", ");
 
+        let sweep_config = match (&config.sweep_xpriv, &config.sweep_destination) {
+            (Some(xpriv), Some(destination))
+                if !xpriv.trim().is_empty() && !destination.trim().is_empty() =>
+            {
+                let candidate = BitcoinSweepConfig {
+                    chain: config.chain,
+                    xpriv: xpriv.clone(),
+                    destination: destination.clone(),
+                    fee_rate_sats_per_vb: config.sweep_fee_rate_sats_per_vb.max(1),
+                    min_sweep_sat: config.sweep_min_sat,
+                };
+                validate_sweep_config(&candidate)?;
+                log::info!(
+                    "[{}] Sweep enabled - destination: {} (fee_rate {} sat/vB, min_sweep {} sat)",
+                    config.chain.ticker(),
+                    candidate.destination,
+                    candidate.fee_rate_sats_per_vb,
+                    candidate.min_sweep_sat
+                );
+                Some(candidate)
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(DetectorError::InvalidConfig(format!(
+                    "[{}] sweep_xpriv and sweep_destination must both be set to enable sweep",
+                    config.chain.ticker()
+                )));
+            }
+            _ => None,
+        };
+
         log::info!(
             "[{}] Detector initialized - explorers: {}",
             config.chain.ticker(),
@@ -266,7 +300,69 @@ impl ChainDetector {
             })),
             explorer_apis,
             active_explorer_index: Mutex::new(0),
+            sweep_config,
         })
+    }
+
+    pub fn sweep_destination(&self) -> Option<&str> {
+        self.sweep_config.as_ref().map(|c| c.destination.as_str())
+    }
+
+    fn esplora_base_url(&self) -> Option<String> {
+        let index = *self.active_explorer_index.lock().unwrap();
+        self.explorer_apis
+            .get(index)
+            .or_else(|| self.explorer_apis.first())
+            .and_then(|explorer| match explorer {
+                ExplorerApi::Esplora { base_url } => Some(base_url.clone()),
+                ExplorerApi::Blockchair { .. } => None,
+            })
+            .or_else(|| {
+                self.explorer_apis.iter().find_map(|explorer| match explorer {
+                    ExplorerApi::Esplora { base_url } => Some(base_url.clone()),
+                    ExplorerApi::Blockchair { .. } => None,
+                })
+            })
+    }
+
+    async fn maybe_sweep(
+        &self,
+        derivation_index: u32,
+        address: &str,
+    ) -> Option<BitcoinSweepResult> {
+        let sweep_config = self.sweep_config.as_ref()?;
+        let esplora = match self.esplora_base_url() {
+            Some(url) => url,
+            None => {
+                log::warn!(
+                    "[{}] Cannot sweep {}: no Esplora-compatible explorer configured (Blockchair-only fallback does not support UTXOs/broadcast)",
+                    self.config.chain.ticker(),
+                    address
+                );
+                return None;
+            }
+        };
+
+        match bitcoin_sweep::sweep_address(
+            &self.client,
+            &esplora,
+            sweep_config,
+            derivation_index,
+            address,
+        )
+        .await
+        {
+            Ok(result) => Some(result),
+            Err(error) => {
+                log::error!(
+                    "[{}] Sweep failed for {} (index {}): {error}",
+                    self.config.chain.ticker(),
+                    address,
+                    derivation_index
+                );
+                None
+            }
+        }
     }
 
     pub fn chain(&self) -> Chain {
@@ -716,6 +812,19 @@ impl ChainDetector {
             let mut enriched = pending.payment.clone();
             enriched.confirmations = confs;
 
+            if let Some(result) = self
+                .maybe_sweep(pending.payment.derivation_index, &pending.payment.address)
+                .await
+            {
+                if let Some(destination) = self.sweep_destination() {
+                    enriched.swept_to_address = Some(destination.to_string());
+                }
+                enriched.swept_amount_sat = Some(result.amount_sat);
+                enriched.swept_amount_coin =
+                    Some(result.amount_sat as f64 / self.config.chain.sats_per_unit() as f64);
+                enriched.sweep_txid = result.txid.clone();
+            }
+
             match self.price_fetcher.get_price().await {
                 Ok(price) => {
                     enriched.coin_price = Some(price);
@@ -1064,6 +1173,7 @@ mod tests {
                 "https://api.blockchair.com/litecoin",
             )],
             active_explorer_index: Mutex::new(0),
+            sweep_config: None,
         }
     }
 

@@ -7,9 +7,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use solana_sdk::hash::Hash;
+use solana_sdk::instruction::Instruction;
 use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signer;
+use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use solana_system_interface::instruction as system_instruction;
 
@@ -18,6 +19,9 @@ use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
 use crate::solana_pool::{
     ManagedSolanaWallet, SolanaReservation, find_wallet, load_active_reservations, load_wallet_pool,
+};
+use crate::solana_tokens::{
+    SplTokenConfig, derive_associated_token_address, spl_transfer_checked_instruction,
 };
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, WebhookEvent};
@@ -40,16 +44,25 @@ pub struct SolanaConfig {
     pub max_retries: u32,
     pub retry_base_delay_ms: u64,
     pub min_deposit_fiat: f64,
+    pub gas_tank_private_key: Option<String>,
+    pub gas_tank_target_usd: f64,
+    pub gas_tank_check_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SolanaPendingPayment {
     signature: String,
     slot: u64,
-    amount_lamports: u64,
+    amount_base_units: u64,
     address: String,
     user_id: String,
     wallet_index: u32,
+    #[serde(default)]
+    asset: Option<String>,
+    #[serde(default)]
+    asset_decimals: Option<u8>,
+    #[serde(default)]
+    token_mint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -65,6 +78,8 @@ struct SolanaState {
     pending: Vec<SolanaPendingPayment>,
     #[serde(default)]
     credited_signatures: HashSet<String>,
+    #[serde(default)]
+    gas_tank_last_maintenance_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +89,7 @@ struct SignatureInfo {
 
 #[derive(Debug, Clone)]
 struct SweepResult {
-    amount_lamports: u64,
+    amount_base_units: u64,
     txid: Option<String>,
 }
 
@@ -82,9 +97,14 @@ struct SweepResult {
 pub struct SolanaDetector {
     config: SolanaConfig,
     wallets: Vec<ManagedSolanaWallet>,
+    tokens: Vec<SplTokenConfig>,
+    gas_tank_keypair: Option<Arc<Keypair>>,
+    gas_tank_pubkey: Option<Pubkey>,
+    ledger_pubkey: Pubkey,
     rpc_client: reqwest::Client,
     webhook_client: reqwest::Client,
     price_fetcher: PriceFetcher,
+    sol_usd_fetcher: PriceFetcher,
     state: Arc<Mutex<SolanaState>>,
 }
 
@@ -121,6 +141,26 @@ struct RpcMeta {
     post_balances: Vec<u64>,
     #[serde(default)]
     err: Option<serde_json::Value>,
+    #[serde(default, rename = "preTokenBalances")]
+    pre_token_balances: Vec<RpcTokenBalance>,
+    #[serde(default, rename = "postTokenBalances")]
+    post_token_balances: Vec<RpcTokenBalance>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RpcTokenBalance {
+    #[serde(rename = "accountIndex")]
+    account_index: u32,
+    mint: String,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(rename = "uiTokenAmount")]
+    ui_token_amount: RpcUiTokenAmount,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RpcUiTokenAmount {
+    amount: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,18 +261,22 @@ struct RpcFeeResult {
 }
 
 impl SolanaDetector {
-    pub fn new(config: SolanaConfig) -> Result<Self, DetectorError> {
+    pub fn new(
+        config: SolanaConfig,
+        tokens: Vec<SplTokenConfig>,
+    ) -> Result<Self, DetectorError> {
         if config.secure_deposit_address.is_empty() {
             return Err(DetectorError::InvalidConfig(
                 "SOLANA_DEPOSIT_ADDRESS is required".into(),
             ));
         }
-        Pubkey::from_str(&config.secure_deposit_address).map_err(|e| {
-            DetectorError::InvalidConfig(format!(
-                "Invalid SOLANA_DEPOSIT_ADDRESS '{}': {e}",
-                config.secure_deposit_address
-            ))
-        })?;
+        let ledger_pubkey =
+            Pubkey::from_str(&config.secure_deposit_address).map_err(|e| {
+                DetectorError::InvalidConfig(format!(
+                    "Invalid SOLANA_DEPOSIT_ADDRESS '{}': {e}",
+                    config.secure_deposit_address
+                ))
+            })?;
         if config.wallet_pool_file.is_empty() {
             return Err(DetectorError::InvalidConfig(
                 "SOLANA_WALLET_POOL_FILE is required".into(),
@@ -250,6 +294,43 @@ impl SolanaDetector {
             return Err(DetectorError::InvalidConfig(
                 "webhook_hmac_secret is required".into(),
             ));
+        }
+
+        let gas_tank_keypair = match config.gas_tank_private_key.as_deref() {
+            Some(value) if !value.trim().is_empty() => {
+                Some(Arc::new(parse_solana_keypair(value.trim()).map_err(|e| {
+                    DetectorError::InvalidConfig(format!(
+                        "Invalid SOLANA_GAS_TANK_PRIVATE_KEY: {e}"
+                    ))
+                })?))
+            }
+            _ => None,
+        };
+        let gas_tank_pubkey = gas_tank_keypair.as_ref().map(|kp| kp.pubkey());
+
+        if let Some(gas_tank) = gas_tank_pubkey {
+            if gas_tank == ledger_pubkey {
+                log::warn!(
+                    "[SOL] SOLANA_GAS_TANK_PRIVATE_KEY pubkey {} matches SOLANA_DEPOSIT_ADDRESS; \
+                     funds will accumulate on the same wallet that pays fees (use distinct wallets to keep cold storage segregated)",
+                    gas_tank
+                );
+            } else {
+                log::info!(
+                    "[SOL] Gas tank wallet: {} (target ${:.2}) - excess swept to ledger {}",
+                    gas_tank,
+                    config.gas_tank_target_usd,
+                    ledger_pubkey
+                );
+            }
+        }
+
+        if !tokens.is_empty() && gas_tank_keypair.is_none() {
+            log::warn!(
+                "[SOL] {} SPL token(s) configured but SOLANA_GAS_TANK_PRIVATE_KEY is not set; \
+                 token detection will work but token sweeps will fail unless managed wallets hold SOL",
+                tokens.len()
+            );
         }
 
         let wallets = load_wallet_pool(&config.wallet_pool_file)?;
@@ -286,8 +367,13 @@ impl SolanaDetector {
                 &config.fiat_currency,
                 Chain::Solana,
             ),
+            sol_usd_fetcher: PriceFetcher::new(webhook_client.clone(), "USD", Chain::Solana),
             config,
             wallets,
+            tokens,
+            gas_tank_keypair,
+            gas_tank_pubkey,
+            ledger_pubkey,
             rpc_client,
             webhook_client,
             state: Arc::new(Mutex::new(state)),
@@ -296,6 +382,14 @@ impl SolanaDetector {
 
     pub fn wallet_count(&self) -> usize {
         self.wallets.len()
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    fn ata_for_wallet(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        derive_associated_token_address(owner, mint)
     }
 
     async fn process_cycle(&self) -> Result<(), DetectorError> {
@@ -317,10 +411,176 @@ impl SolanaDetector {
         }
 
         self.process_credits(current_slot).await?;
+        self.maybe_maintain_gas_tank().await?;
         Ok(())
     }
 
+    async fn maybe_maintain_gas_tank(&self) -> Result<(), DetectorError> {
+        let Some(gas_tank_pubkey) = self.gas_tank_pubkey else {
+            return Ok(());
+        };
+        if gas_tank_pubkey == self.ledger_pubkey {
+            return Ok(());
+        }
+        if !self.config.gas_tank_target_usd.is_finite()
+            || self.config.gas_tank_target_usd <= 0.0
+        {
+            return Ok(());
+        }
+
+        let now = unix_timestamp();
+        let interval = i64::try_from(self.config.gas_tank_check_interval_secs.max(1))
+            .unwrap_or(i64::MAX);
+        let should_run = {
+            let state = self.state.lock().unwrap();
+            state
+                .gas_tank_last_maintenance_unix
+                .map_or(true, |last| now.saturating_sub(last) >= interval)
+        };
+        if !should_run {
+            return Ok(());
+        }
+
+        if let Err(error) = self.maintain_gas_tank(gas_tank_pubkey).await {
+            log::warn!("[SOL] Gas tank maintenance failed: {error}");
+        }
+
+        {
+            let mut state = self.state.lock().unwrap();
+            state.gas_tank_last_maintenance_unix = Some(now);
+        }
+        self.persist_state()
+    }
+
+    async fn maintain_gas_tank(&self, gas_tank_pubkey: Pubkey) -> Result<(), DetectorError> {
+        let sol_usd = match self.sol_usd_fetcher.get_price().await {
+            Ok(price) if price > 0.0 => price,
+            Ok(price) => {
+                log::warn!("[SOL] Ignoring invalid SOL/USD price {}", price);
+                return Ok(());
+            }
+            Err(error) => {
+                log::warn!("[SOL] Failed to fetch SOL/USD for gas tank maintenance: {error}");
+                return Ok(());
+            }
+        };
+
+        let target_lamports =
+            usd_to_lamports(self.config.gas_tank_target_usd, sol_usd).unwrap_or(0);
+        if target_lamports == 0 {
+            return Ok(());
+        }
+
+        let balance = self.get_balance(&gas_tank_pubkey.to_string()).await?;
+        if balance < target_lamports {
+            log::warn!(
+                "[SOL] Gas tank balance {} lamports below target {} lamports (~${:.2}); top up the gas tank to keep token sweeps running",
+                balance,
+                target_lamports,
+                self.config.gas_tank_target_usd
+            );
+            return Ok(());
+        }
+
+        let recent_blockhash = self.get_latest_blockhash().await?;
+        let gas_tank = self
+            .gas_tank_keypair
+            .as_ref()
+            .ok_or_else(|| DetectorError::InvalidConfig("Gas tank keypair missing".into()))?;
+        let fee = self
+            .estimate_native_transfer_fee(gas_tank.as_ref(), &self.ledger_pubkey, recent_blockhash)
+            .await?;
+
+        if balance <= target_lamports + fee {
+            return Ok(());
+        }
+        let excess = balance - target_lamports - fee;
+        if excess == 0 {
+            return Ok(());
+        }
+
+        let tx = Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &gas_tank_pubkey,
+                &self.ledger_pubkey,
+                excess,
+            )],
+            Some(&gas_tank_pubkey),
+            &[gas_tank.as_ref()],
+            recent_blockhash,
+        );
+
+        let txid = self.send_solana_transaction(&tx).await?;
+        log::info!(
+            "[SOL] Gas tank excess sweep: {} lamports ({:.9} SOL) to ledger {} (kept ~${:.2}, tx={})",
+            excess,
+            excess as f64 / Chain::Solana.sats_per_unit() as f64,
+            self.ledger_pubkey,
+            self.config.gas_tank_target_usd,
+            txid
+        );
+
+        Ok(())
+    }
+
+    async fn estimate_native_transfer_fee(
+        &self,
+        from_keypair: &Keypair,
+        destination: &Pubkey,
+        recent_blockhash: Hash,
+    ) -> Result<u64, DetectorError> {
+        let from = from_keypair.pubkey();
+        let message = Message::new_with_blockhash(
+            &[system_instruction::transfer(&from, destination, 1)],
+            Some(&from),
+            &recent_blockhash,
+        );
+        let message_bytes = bincode::serialize(&message).map_err(|e| {
+            DetectorError::InvalidConfig(format!("Failed to serialize Solana message: {e}"))
+        })?;
+        let message_b64 = BASE64_STANDARD.encode(message_bytes);
+        let fee_result: RpcFeeResult = self
+            .rpc_call(
+                "getFeeForMessage",
+                serde_json::json!([
+                    message_b64,
+                    {"commitment": "confirmed"}
+                ]),
+            )
+            .await?;
+        Ok(fee_result.value.unwrap_or(5_000))
+    }
+
     async fn process_reservation(
+        &self,
+        reservation: &SolanaReservation,
+        current_slot: u64,
+        spot_price: Option<f64>,
+    ) -> Result<(), DetectorError> {
+        self.process_native_for_reservation(reservation, current_slot, spot_price)
+            .await?;
+
+        let owner = match Pubkey::from_str(&reservation.address) {
+            Ok(owner) => owner,
+            Err(error) => {
+                log::warn!(
+                    "[SOL] Skipping token scan for invalid reservation address '{}': {error}",
+                    reservation.address
+                );
+                return Ok(());
+            }
+        };
+
+        let tokens = self.tokens.clone();
+        for token in &tokens {
+            self.process_token_for_reservation(reservation, &owner, token, current_slot)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_native_for_reservation(
         &self,
         reservation: &SolanaReservation,
         current_slot: u64,
@@ -410,15 +670,140 @@ impl SolanaDetector {
                     state.pending.push(SolanaPendingPayment {
                         signature: sig.signature.clone(),
                         slot: tx.slot,
-                        amount_lamports,
+                        amount_base_units: amount_lamports,
                         address: reservation.address.clone(),
                         user_id: reservation.user_id.clone(),
                         wallet_index: reservation.wallet_index,
+                        asset: None,
+                        asset_decimals: None,
+                        token_mint: None,
                     });
                 }
             }
 
             self.update_last_processed_signature(&reservation.address, &sig.signature)?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_token_for_reservation(
+        &self,
+        reservation: &SolanaReservation,
+        owner: &Pubkey,
+        token: &SplTokenConfig,
+        current_slot: u64,
+    ) -> Result<(), DetectorError> {
+        let ata = self.ata_for_wallet(owner, &token.mint);
+        let ata_string = ata.to_string();
+
+        let new_signatures = self.get_new_signatures(&ata_string).await?;
+        if new_signatures.is_empty() {
+            return Ok(());
+        }
+
+        let mint_string = token.mint.to_string();
+        let owner_string = owner.to_string();
+
+        for sig in &new_signatures {
+            let tx = match self.get_transaction(&sig.signature).await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    log::warn!("[SOL] Failed to load token tx {}: {}", sig.signature, e);
+                    continue;
+                }
+            };
+
+            let Some(amount_base_units) = Self::extract_positive_token_amount(
+                &tx,
+                &owner_string,
+                &mint_string,
+                &ata_string,
+            ) else {
+                self.update_last_processed_signature(&ata_string, &sig.signature)?;
+                continue;
+            };
+
+            let amount_coin = amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
+            if is_usd_pegged_token(&token.symbol)
+                && self.config.min_deposit_fiat > 0.0
+                && amount_coin > 0.0
+            {
+                if let Ok(rate) = self.usd_to_configured_fiat_rate().await {
+                    let fiat_value = amount_coin * rate;
+                    if fiat_value < self.config.min_deposit_fiat {
+                        log::info!(
+                            "[SOL] Ignoring dust {} deposit tx={} ata={} amount={} (~{:.4} {}) < min {:.2}",
+                            token.symbol,
+                            sig.signature,
+                            ata_string,
+                            amount_coin,
+                            fiat_value,
+                            self.price_fetcher.currency(),
+                            self.config.min_deposit_fiat
+                        );
+                        self.update_last_processed_signature(&ata_string, &sig.signature)?;
+                        continue;
+                    }
+                }
+            }
+
+            let confirmations = current_slot.saturating_sub(tx.slot) + 1;
+            let detected = DetectedPayment {
+                chain: Chain::Solana,
+                ticker: token.symbol.clone(),
+                txid: sig.signature.clone(),
+                address: reservation.address.clone(),
+                user_id: Some(reservation.user_id.clone()),
+                amount_sat: amount_base_units,
+                amount_coin,
+                confirmations,
+                block_height: Some(tx.slot),
+                derivation_index: reservation.wallet_index,
+                memo: None,
+                swept_to_address: None,
+                swept_amount_sat: None,
+                swept_amount_coin: None,
+                sweep_txid: None,
+                fiat_amount: None,
+                fiat_currency: None,
+                coin_price: None,
+                asset: Some(token.symbol.clone()),
+                asset_decimals: Some(token.decimals),
+                amount_base_units: Some(amount_base_units.to_string()),
+                swept_amount_base_units: None,
+                token_contract: Some(mint_string.clone()),
+            };
+
+            send_webhook(
+                &self.webhook_client,
+                &self.config.webhook_url,
+                &self.config.webhook_hmac_secret,
+                &WebhookEvent::PaymentDetected(detected),
+            )
+            .await?;
+
+            {
+                let mut state = self.state.lock().unwrap();
+                let already_pending = state.pending.iter().any(|p| p.signature == sig.signature);
+                let already_credited = state.credited_signatures.contains(&sig.signature);
+
+                if !already_pending && !already_credited {
+                    state.pending.push(SolanaPendingPayment {
+                        signature: sig.signature.clone(),
+                        slot: tx.slot,
+                        amount_base_units,
+                        address: reservation.address.clone(),
+                        user_id: reservation.user_id.clone(),
+                        wallet_index: reservation.wallet_index,
+                        asset: Some(token.symbol.clone()),
+                        asset_decimals: Some(token.decimals),
+                        token_mint: Some(mint_string.clone()),
+                    });
+                }
+            }
+
+            self.update_last_processed_signature(&ata_string, &sig.signature)?;
         }
 
         Ok(())
@@ -436,47 +821,124 @@ impl SolanaDetector {
                 continue;
             }
 
-            let sweep_result = self.sweep_available_balance(&entry.address).await?;
-            let mut credited_payment = DetectedPayment {
-                chain: Chain::Solana,
-                ticker: Chain::Solana.ticker().to_string(),
-                txid: entry.signature.clone(),
-                address: entry.address.clone(),
-                user_id: Some(entry.user_id.clone()),
-                amount_sat: entry.amount_lamports,
-                amount_coin: entry.amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64,
-                confirmations,
-                block_height: Some(entry.slot),
-                derivation_index: entry.wallet_index,
-                memo: None,
-                swept_to_address: Some(self.config.secure_deposit_address.clone()),
-                swept_amount_sat: Some(sweep_result.amount_lamports),
-                swept_amount_coin: Some(
-                    sweep_result.amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64,
-                ),
-                sweep_txid: sweep_result.txid.clone(),
-                fiat_amount: None,
-                fiat_currency: None,
-                coin_price: None,
-                asset: None,
-                asset_decimals: None,
-                amount_base_units: None,
-                swept_amount_base_units: None,
-                token_contract: None,
+            let mut credited_payment = match entry.asset.as_deref() {
+                None => {
+                    let sweep_result = self.sweep_native_sol_from_address(&entry.address).await?;
+                    let amount_coin =
+                        entry.amount_base_units as f64 / Chain::Solana.sats_per_unit() as f64;
+                    let mut payment = DetectedPayment {
+                        chain: Chain::Solana,
+                        ticker: Chain::Solana.ticker().to_string(),
+                        txid: entry.signature.clone(),
+                        address: entry.address.clone(),
+                        user_id: Some(entry.user_id.clone()),
+                        amount_sat: entry.amount_base_units,
+                        amount_coin,
+                        confirmations,
+                        block_height: Some(entry.slot),
+                        derivation_index: entry.wallet_index,
+                        memo: None,
+                        swept_to_address: Some(self.sol_native_sweep_destination().to_string()),
+                        swept_amount_sat: Some(sweep_result.amount_base_units),
+                        swept_amount_coin: Some(
+                            sweep_result.amount_base_units as f64
+                                / Chain::Solana.sats_per_unit() as f64,
+                        ),
+                        sweep_txid: sweep_result.txid.clone(),
+                        fiat_amount: None,
+                        fiat_currency: None,
+                        coin_price: None,
+                        asset: None,
+                        asset_decimals: None,
+                        amount_base_units: None,
+                        swept_amount_base_units: None,
+                        token_contract: None,
+                    };
+                    if let Ok(price) = self.price_fetcher.get_price().await {
+                        payment.coin_price = Some(price);
+                        payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
+                        payment.fiat_amount = Some(payment.amount_coin * price);
+                    }
+                    payment
+                }
+                Some(symbol) => {
+                    let mint_str = entry.token_mint.as_deref().ok_or_else(|| {
+                        DetectorError::InvalidConfig(format!(
+                            "Pending token payment {} is missing token_mint",
+                            entry.signature
+                        ))
+                    })?;
+                    let mint = Pubkey::from_str(mint_str).map_err(|e| {
+                        DetectorError::InvalidConfig(format!(
+                            "Invalid persisted token mint '{mint_str}': {e}"
+                        ))
+                    })?;
+                    let decimals = entry.asset_decimals.ok_or_else(|| {
+                        DetectorError::InvalidConfig(format!(
+                            "Pending token payment {} is missing asset_decimals",
+                            entry.signature
+                        ))
+                    })?;
+
+                    let sweep_result = self
+                        .sweep_token_from_address(
+                            &entry.address,
+                            &mint,
+                            symbol,
+                            decimals,
+                            entry.amount_base_units,
+                        )
+                        .await?;
+
+                    let amount_coin =
+                        entry.amount_base_units as f64 / 10f64.powi(i32::from(decimals));
+                    let swept_coin = sweep_result.amount_base_units as f64
+                        / 10f64.powi(i32::from(decimals));
+                    let mut payment = DetectedPayment {
+                        chain: Chain::Solana,
+                        ticker: symbol.to_string(),
+                        txid: entry.signature.clone(),
+                        address: entry.address.clone(),
+                        user_id: Some(entry.user_id.clone()),
+                        amount_sat: entry.amount_base_units,
+                        amount_coin,
+                        confirmations,
+                        block_height: Some(entry.slot),
+                        derivation_index: entry.wallet_index,
+                        memo: None,
+                        swept_to_address: Some(self.config.secure_deposit_address.clone()),
+                        swept_amount_sat: Some(sweep_result.amount_base_units),
+                        swept_amount_coin: Some(swept_coin),
+                        sweep_txid: sweep_result.txid.clone(),
+                        fiat_amount: None,
+                        fiat_currency: None,
+                        coin_price: None,
+                        asset: Some(symbol.to_string()),
+                        asset_decimals: Some(decimals),
+                        amount_base_units: Some(entry.amount_base_units.to_string()),
+                        swept_amount_base_units: Some(sweep_result.amount_base_units.to_string()),
+                        token_contract: Some(mint_str.to_string()),
+                    };
+
+                    if is_usd_pegged_token(symbol) {
+                        if let Ok(rate) = self.usd_to_configured_fiat_rate().await {
+                            payment.coin_price = Some(rate);
+                            payment.fiat_currency =
+                                Some(self.price_fetcher.currency().to_string());
+                            payment.fiat_amount = Some(amount_coin * rate);
+                        }
+                    }
+
+                    payment
+                }
             };
 
-            if let Ok(price) = self.price_fetcher.get_price().await {
-                credited_payment.coin_price = Some(price);
-                credited_payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
-                credited_payment.fiat_amount = Some(credited_payment.amount_coin * price);
-            }
-
-            let event = WebhookEvent::PaymentCredited(credited_payment);
+            let _ = &mut credited_payment;
             send_webhook(
                 &self.webhook_client,
                 &self.config.webhook_url,
                 &self.config.webhook_hmac_secret,
-                &event,
+                &WebhookEvent::PaymentCredited(credited_payment),
             )
             .await?;
 
@@ -494,7 +956,10 @@ impl SolanaDetector {
         Ok(())
     }
 
-    async fn sweep_available_balance(&self, address: &str) -> Result<SweepResult, DetectorError> {
+    async fn sweep_native_sol_from_address(
+        &self,
+        address: &str,
+    ) -> Result<SweepResult, DetectorError> {
         let wallet = find_wallet(&self.wallets, address).ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Solana wallet found for address '{}'",
@@ -505,7 +970,7 @@ impl SolanaDetector {
         let balance = self.get_balance(address).await?;
         if balance == 0 {
             return Ok(SweepResult {
-                amount_lamports: 0,
+                amount_base_units: 0,
                 txid: None,
             });
         }
@@ -521,60 +986,314 @@ impl SolanaDetector {
                 fee
             );
             return Ok(SweepResult {
-                amount_lamports: 0,
+                amount_base_units: 0,
                 txid: None,
             });
         }
 
-        let destination = Pubkey::from_str(&self.config.secure_deposit_address).map_err(|e| {
-            DetectorError::InvalidConfig(format!(
-                "Invalid secure Solana deposit address '{}': {e}",
-                self.config.secure_deposit_address
-            ))
-        })?;
         let from = wallet.keypair.pubkey();
         let amount_lamports = balance - fee;
+        let destination = self.sol_native_sweep_destination();
         let tx = Transaction::new_signed_with_payer(
-            &[system_instruction::transfer(
-                &from,
-                &destination,
-                amount_lamports,
-            )],
+            &[system_instruction::transfer(&from, &destination, amount_lamports)],
             Some(&from),
             &[wallet.keypair.as_ref()],
             recent_blockhash,
         );
 
-        let tx_bytes = bincode::serialize(&tx).map_err(|e| {
-            DetectorError::InvalidConfig(format!("Failed to serialize Solana sweep tx: {e}"))
-        })?;
-        let tx_b64 = BASE64_STANDARD.encode(tx_bytes);
-        let txid: String = self
-            .rpc_call(
-                "sendTransaction",
-                serde_json::json!([
-                    tx_b64,
-                    {
-                        "encoding": "base64",
-                        "preflightCommitment": "confirmed",
-                        "maxRetries": self.config.max_retries
-                    }
-                ]),
-            )
-            .await?;
+        let txid = self.send_solana_transaction(&tx).await?;
 
         log::info!(
             "[SOL] Swept {:.9} SOL from {} to {} (tx={})",
             amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64,
             address,
-            self.config.secure_deposit_address,
+            destination,
             txid
         );
 
         Ok(SweepResult {
-            amount_lamports,
+            amount_base_units: amount_lamports,
             txid: Some(txid),
         })
+    }
+
+    fn sol_native_sweep_destination(&self) -> Pubkey {
+        self.gas_tank_pubkey.unwrap_or(self.ledger_pubkey)
+    }
+
+    pub async fn sweep_orphan_balances(&self) -> Result<(), DetectorError> {
+        let active_addresses: HashSet<String> =
+            match load_active_reservations(&self.config.redis_url).await {
+                Ok(reservations) => reservations.into_iter().map(|r| r.address).collect(),
+                Err(error) => {
+                    log::warn!(
+                        "[SOL] Orphan sweep: failed to load active reservations ({error}); \
+                         skipping to avoid touching reserved wallets"
+                    );
+                    return Ok(());
+                }
+            };
+
+        log::info!(
+            "[SOL] Orphan sweep starting: {} managed wallet(s), skipping {} active reservation(s)",
+            self.wallets.len(),
+            active_addresses.len()
+        );
+
+        let mut swept_sol_lamports: u64 = 0;
+        let mut swept_sol_count: usize = 0;
+        let mut swept_token_count: usize = 0;
+
+        let wallets = self.wallets.clone();
+        for wallet in &wallets {
+            if active_addresses.contains(&wallet.address) {
+                continue;
+            }
+
+            // SOL natif
+            match self.get_balance(&wallet.address).await {
+                Ok(balance) if balance > 0 => {
+                    match self.sweep_native_sol_from_address(&wallet.address).await {
+                        Ok(result) if result.txid.is_some() => {
+                            log::info!(
+                                "[SOL] Orphan SOL swept: {} lamports from {} (index {}, tx={})",
+                                result.amount_base_units,
+                                wallet.address,
+                                wallet.index,
+                                result.txid.unwrap_or_default()
+                            );
+                            swept_sol_lamports =
+                                swept_sol_lamports.saturating_add(result.amount_base_units);
+                            swept_sol_count += 1;
+                        }
+                        Ok(_) => {}
+                        Err(error) => log::warn!(
+                            "[SOL] Failed to sweep orphan SOL from {} (index {}): {error}",
+                            wallet.address,
+                            wallet.index
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!(
+                    "[SOL] Failed to fetch SOL balance for {} (index {}): {error}",
+                    wallet.address,
+                    wallet.index
+                ),
+            }
+
+            // Tokens SPL
+            for token in &self.tokens {
+                let owner = wallet.keypair.pubkey();
+                let ata = self.ata_for_wallet(&owner, &token.mint);
+                let ata_str = ata.to_string();
+
+                let balance = match self.get_token_account_balance(&ata_str).await {
+                    Ok(balance) => balance,
+                    Err(_) => continue, // ATA n'existe pas → pas de fonds
+                };
+                if balance == 0 {
+                    continue;
+                }
+
+                match self
+                    .sweep_token_from_address(
+                        &wallet.address,
+                        &token.mint,
+                        &token.symbol,
+                        token.decimals,
+                        balance,
+                    )
+                    .await
+                {
+                    Ok(result) if result.txid.is_some() => {
+                        log::info!(
+                            "[SOL] Orphan {} swept: {} units from {} (index {}, ata={}, tx={})",
+                            token.symbol,
+                            result.amount_base_units,
+                            wallet.address,
+                            wallet.index,
+                            ata_str,
+                            result.txid.unwrap_or_default()
+                        );
+                        swept_token_count += 1;
+                    }
+                    Ok(_) => {}
+                    Err(error) => log::warn!(
+                        "[SOL] Failed to sweep orphan {} from {} (index {}): {error}",
+                        token.symbol,
+                        wallet.address,
+                        wallet.index
+                    ),
+                }
+            }
+        }
+
+        log::info!(
+            "[SOL] Orphan sweep complete: {} SOL sweep(s) ({} lamports total), {} token sweep(s)",
+            swept_sol_count,
+            swept_sol_lamports,
+            swept_token_count
+        );
+
+        Ok(())
+    }
+
+    async fn sweep_token_from_address(
+        &self,
+        owner_address: &str,
+        mint: &Pubkey,
+        symbol: &str,
+        decimals: u8,
+        deposited_amount: u64,
+    ) -> Result<SweepResult, DetectorError> {
+        let wallet = find_wallet(&self.wallets, owner_address).ok_or_else(|| {
+            DetectorError::InvalidConfig(format!(
+                "No managed Solana wallet found for address '{}'",
+                owner_address
+            ))
+        })?;
+
+        let owner = wallet.keypair.pubkey();
+        let source_ata = self.ata_for_wallet(&owner, mint);
+        let destination_ata = self.ata_for_wallet(&self.ledger_pubkey, mint);
+
+        let actual_balance = self
+            .get_token_account_balance(&source_ata.to_string())
+            .await
+            .unwrap_or(deposited_amount);
+        let amount = actual_balance.min(u64::MAX);
+        if amount == 0 {
+            log::info!(
+                "[SOL] Token ATA {} has zero {} balance; nothing to sweep",
+                source_ata,
+                symbol
+            );
+            return Ok(SweepResult {
+                amount_base_units: 0,
+                txid: None,
+            });
+        }
+
+        let fee_payer = self.gas_tank_keypair.as_deref().ok_or_else(|| {
+            DetectorError::InvalidConfig(
+                "SOLANA_GAS_TANK_PRIVATE_KEY is required to sweep SPL tokens".into(),
+            )
+        })?;
+
+        let recent_blockhash = self.get_latest_blockhash().await?;
+        let instruction = spl_transfer_checked_instruction(
+            &source_ata,
+            mint,
+            &destination_ata,
+            &owner,
+            amount,
+            decimals,
+        );
+        let tx = self.build_signed_token_tx(
+            &[instruction],
+            fee_payer,
+            wallet.keypair.as_ref(),
+            recent_blockhash,
+        )?;
+
+        let txid = self.send_solana_transaction(&tx).await?;
+
+        log::info!(
+            "[SOL] Swept {} {} units from {} (ata={}) to {} (ata={}) (tx={})",
+            amount,
+            symbol,
+            owner_address,
+            source_ata,
+            self.config.secure_deposit_address,
+            destination_ata,
+            txid
+        );
+
+        Ok(SweepResult {
+            amount_base_units: amount,
+            txid: Some(txid),
+        })
+    }
+
+    fn build_signed_token_tx(
+        &self,
+        instructions: &[Instruction],
+        fee_payer: &Keypair,
+        owner: &Keypair,
+        recent_blockhash: Hash,
+    ) -> Result<Transaction, DetectorError> {
+        let fee_payer_pubkey = fee_payer.pubkey();
+        let owner_pubkey = owner.pubkey();
+        let signers: Vec<&Keypair> = if fee_payer_pubkey == owner_pubkey {
+            vec![fee_payer]
+        } else {
+            vec![fee_payer, owner]
+        };
+        let tx = Transaction::new_signed_with_payer(
+            instructions,
+            Some(&fee_payer_pubkey),
+            &signers,
+            recent_blockhash,
+        );
+        Ok(tx)
+    }
+
+    async fn send_solana_transaction(&self, tx: &Transaction) -> Result<String, DetectorError> {
+        let tx_bytes = bincode::serialize(tx).map_err(|e| {
+            DetectorError::InvalidConfig(format!("Failed to serialize Solana tx: {e}"))
+        })?;
+        let tx_b64 = BASE64_STANDARD.encode(tx_bytes);
+        self.rpc_call(
+            "sendTransaction",
+            serde_json::json!([
+                tx_b64,
+                {
+                    "encoding": "base64",
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": self.config.max_retries
+                }
+            ]),
+        )
+        .await
+    }
+
+    async fn get_token_account_balance(&self, ata: &str) -> Result<u64, DetectorError> {
+        #[derive(Deserialize)]
+        struct TokenBalanceResult {
+            value: TokenBalanceValue,
+        }
+        #[derive(Deserialize)]
+        struct TokenBalanceValue {
+            amount: String,
+        }
+
+        let result: TokenBalanceResult = self
+            .rpc_call(
+                "getTokenAccountBalance",
+                serde_json::json!([ata, {"commitment": "confirmed"}]),
+            )
+            .await?;
+        result.value.amount.parse::<u64>().map_err(|e| {
+            DetectorError::ApiError(format!(
+                "Failed to parse token account balance for {}: {e}",
+                ata
+            ))
+        })
+    }
+
+    async fn usd_to_configured_fiat_rate(&self) -> Result<f64, DetectorError> {
+        if self.price_fetcher.currency() == "USD" {
+            return Ok(1.0);
+        }
+        let sol_fiat = self.price_fetcher.get_price().await?;
+        let sol_usd = self.sol_usd_fetcher.get_price().await?;
+        if !sol_fiat.is_finite() || sol_fiat <= 0.0 || !sol_usd.is_finite() || sol_usd <= 0.0 {
+            return Err(DetectorError::ApiError(
+                "Invalid SOL price for stablecoin conversion".into(),
+            ));
+        }
+        Ok(sol_fiat / sol_usd)
     }
 
     async fn estimate_transfer_fee(
@@ -845,6 +1564,41 @@ impl SolanaDetector {
         None
     }
 
+    fn extract_positive_token_amount(
+        result: &RpcTransactionResult,
+        owner: &str,
+        mint: &str,
+        ata: &str,
+    ) -> Option<u64> {
+        let meta = result.meta.as_ref()?;
+        if meta.err.is_some() {
+            return None;
+        }
+
+        let post = meta.post_token_balances.iter().find(|balance| {
+            balance.mint == mint
+                && (matches_owner_balance(balance, owner)
+                    || account_at_index(result, balance.account_index) == Some(ata))
+        })?;
+
+        let pre_amount = meta
+            .pre_token_balances
+            .iter()
+            .find(|balance| balance.account_index == post.account_index && balance.mint == mint)
+            .and_then(|balance| balance.ui_token_amount.amount.parse::<u128>().ok())
+            .unwrap_or(0);
+
+        let post_amount = post.ui_token_amount.amount.parse::<u128>().ok()?;
+        if post_amount <= pre_amount {
+            return None;
+        }
+        let delta = post_amount - pre_amount;
+        if delta > u64::MAX as u128 {
+            return None;
+        }
+        Some(delta as u64)
+    }
+
     fn update_last_processed_signature(
         &self,
         address: &str,
@@ -907,6 +1661,70 @@ impl PaymentDetector for SolanaDetector {
             .await;
         }
     }
+}
+
+fn matches_owner_balance(balance: &RpcTokenBalance, owner: &str) -> bool {
+    balance
+        .owner
+        .as_deref()
+        .map(|stored| stored == owner)
+        .unwrap_or(false)
+}
+
+fn account_at_index(result: &RpcTransactionResult, index: u32) -> Option<&str> {
+    result
+        .transaction
+        .message
+        .account_keys
+        .get(index as usize)
+        .map(|key| key.pubkey())
+}
+
+fn is_usd_pegged_token(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "USDC" | "USDT" | "DAI" | "BUSD" | "TUSD" | "USDP" | "GUSD" | "PYUSD"
+    )
+}
+
+fn usd_to_lamports(usd: f64, sol_usd: f64) -> Option<u64> {
+    if !usd.is_finite() || usd <= 0.0 || !sol_usd.is_finite() || sol_usd <= 0.0 {
+        return None;
+    }
+    let lamports = (usd / sol_usd) * 1_000_000_000.0;
+    if !lamports.is_finite() || lamports < 0.0 || lamports > u64::MAX as f64 {
+        return None;
+    }
+    Some(lamports.ceil() as u64)
+}
+
+fn unix_timestamp() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn parse_solana_keypair(value: &str) -> Result<Keypair, String> {
+    let trimmed = value.trim();
+    let bytes: Vec<u8> = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<u8>>(trimmed)
+            .map_err(|e| format!("invalid JSON byte array: {e}"))?
+    } else {
+        bs58::decode(trimmed)
+            .into_vec()
+            .map_err(|e| format!("invalid base58 string: {e}"))?
+    };
+
+    if bytes.len() != 64 {
+        return Err(format!(
+            "expected 64-byte Solana keypair, got {} byte(s)",
+            bytes.len()
+        ));
+    }
+
+    Keypair::try_from(bytes.as_slice()).map_err(|e| format!("failed to decode keypair: {e}"))
 }
 
 fn load_solana_state(path: &str) -> SolanaState {

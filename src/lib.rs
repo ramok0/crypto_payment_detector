@@ -1,3 +1,4 @@
+pub mod bitcoin_sweep;
 pub mod blockstream;
 pub mod derivation;
 pub mod env_utils;
@@ -8,10 +9,12 @@ pub mod persistence;
 pub mod pricing;
 pub mod solana;
 pub mod solana_pool;
+pub mod solana_tokens;
 pub mod trait_def;
 pub mod types;
 pub mod webhook;
 
+pub use bitcoin_sweep::{BitcoinSweepConfig, BitcoinSweepResult};
 pub use blockstream::ChainDetector;
 pub use error::DetectorError;
 pub use ethereum::{
@@ -28,6 +31,7 @@ pub use solana_pool::{
     ManagedSolanaWallet, SolanaReservation, load_active_reservations, load_wallet_pool,
     reserve_wallet_for_user,
 };
+pub use solana_tokens::{SplTokenConfig, default_spl_tokens, parse_spl_tokens};
 pub use trait_def::PaymentDetector;
 pub use types::{BasicAuth, Chain, DetectedPayment, DetectorConfig, RetryConfig, WebhookEvent};
 pub use webhook::{send_discord_webhook, send_webhook, verify_signature};
