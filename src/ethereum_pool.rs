@@ -11,12 +11,24 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
 use serde::{Deserialize, Serialize};
 
+use crate::env_utils::chain_env_prefix;
 use crate::error::DetectorError;
+use crate::types::Chain;
 
-const RESERVATION_KEY_PREFIX: &str = "ethereum:reservation:";
-const IN_MEMORY_RESERVATION_URL: &str = "memory://ethereum-reservations";
+const IN_MEMORY_RESERVATION_URL: &str = "memory://evm-reservations";
 const DEFAULT_ETHEREUM_WALLET_POOL_SIZE: usize = 10;
 const MAX_ETHEREUM_WALLET_POOL_SIZE: usize = 10_000;
+
+/// Redis key namespace per EVM chain. Distinct prefixes prevent two detectors
+/// (e.g. Ethereum + Base) from colliding on the same address space when both
+/// chains run in the same process and share a Redis instance.
+fn reservation_key_prefix(chain: Chain) -> &'static str {
+    match chain {
+        Chain::Ethereum => "ethereum:reservation:",
+        Chain::Base => "base:reservation:",
+        _ => panic!("reservation_key_prefix called with non-EVM chain {chain:?}"),
+    }
+}
 
 pub type SharedEthereumWallets = Arc<RwLock<Vec<ManagedEthereumWallet>>>;
 
@@ -63,8 +75,11 @@ struct WalletEntry {
     private_key: String,
 }
 
-pub fn load_ethereum_wallet_pool(path: &str) -> Result<Vec<ManagedEthereumWallet>, DetectorError> {
-    let data = read_or_create_ethereum_wallet_pool_file(path)?;
+pub fn load_ethereum_wallet_pool(
+    chain: Chain,
+    path: &str,
+) -> Result<Vec<ManagedEthereumWallet>, DetectorError> {
+    let data = read_or_create_ethereum_wallet_pool_file(chain, path)?;
 
     let input: WalletPoolInput = serde_json::from_str(&data).map_err(|e| {
         DetectorError::InvalidConfig(format!(
@@ -131,10 +146,15 @@ pub fn load_ethereum_wallet_pool(path: &str) -> Result<Vec<ManagedEthereumWallet
     Ok(wallets)
 }
 
-fn read_or_create_ethereum_wallet_pool_file(path: &str) -> Result<String, DetectorError> {
+fn read_or_create_ethereum_wallet_pool_file(
+    chain: Chain,
+    path: &str,
+) -> Result<String, DetectorError> {
     match std::fs::read_to_string(path) {
         Ok(data) => Ok(data),
-        Err(e) if e.kind() == ErrorKind::NotFound => create_ethereum_wallet_pool_file(path),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            create_ethereum_wallet_pool_file(chain, path)
+        }
         Err(e) => Err(DetectorError::InvalidConfig(format!(
             "Failed to read Ethereum wallet pool file '{}': {e}",
             path
@@ -142,8 +162,8 @@ fn read_or_create_ethereum_wallet_pool_file(path: &str) -> Result<String, Detect
     }
 }
 
-fn create_ethereum_wallet_pool_file(path: &str) -> Result<String, DetectorError> {
-    let wallet_count = ethereum_wallet_pool_size_from_env()?;
+fn create_ethereum_wallet_pool_file(chain: Chain, path: &str) -> Result<String, DetectorError> {
+    let wallet_count = ethereum_wallet_pool_size_from_env(chain)?;
     let data = generate_ethereum_wallet_pool_json(wallet_count)?;
     let path_ref = Path::new(path);
 
@@ -178,7 +198,8 @@ fn create_ethereum_wallet_pool_file(path: &str) -> Result<String, DetectorError>
                 ))
             })?;
             log::warn!(
-                "[ETH] Created missing Ethereum wallet pool file '{}' with {} generated wallets. Back up this file securely.",
+                "[{}] Created missing wallet pool file '{}' with {} generated wallets. Back up this file securely.",
+                chain.ticker(),
                 path,
                 wallet_count
             );
@@ -233,12 +254,13 @@ fn generate_ethereum_wallet_entries(
     Ok(wallets)
 }
 
-fn ethereum_wallet_pool_size_from_env() -> Result<usize, DetectorError> {
-    match std::env::var("ETH_WALLET_POOL_SIZE") {
+fn ethereum_wallet_pool_size_from_env(chain: Chain) -> Result<usize, DetectorError> {
+    let env_name = format!("{}_WALLET_POOL_SIZE", chain_env_prefix(chain));
+    match std::env::var(&env_name) {
         Ok(value) if value.trim().is_empty() => Ok(DEFAULT_ETHEREUM_WALLET_POOL_SIZE),
         Ok(value) => value.trim().parse::<usize>().map_err(|_| {
             DetectorError::InvalidConfig(format!(
-                "ETH_WALLET_POOL_SIZE must be between 1 and {MAX_ETHEREUM_WALLET_POOL_SIZE}"
+                "{env_name} must be between 1 and {MAX_ETHEREUM_WALLET_POOL_SIZE}"
             ))
         }),
         Err(_) => Ok(DEFAULT_ETHEREUM_WALLET_POOL_SIZE),
@@ -335,9 +357,10 @@ pub fn append_ethereum_wallet_to_pool_file(
     Ok(())
 }
 
-fn ethereum_max_pool_size() -> usize {
-    std::env::var("ETH_MAX_POOL_SIZE")
-        .or_else(|_| std::env::var("ETH_WALLET_POOL_MAX_SIZE"))
+fn ethereum_max_pool_size(chain: Chain) -> usize {
+    let prefix = chain_env_prefix(chain);
+    std::env::var(format!("{prefix}_MAX_POOL_SIZE"))
+        .or_else(|_| std::env::var(format!("{prefix}_WALLET_POOL_MAX_SIZE")))
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
@@ -346,10 +369,11 @@ fn ethereum_max_pool_size() -> usize {
 }
 
 pub async fn load_active_ethereum_reservations(
+    chain: Chain,
     redis_url: &str,
 ) -> Result<Vec<EthereumReservation>, DetectorError> {
-    if should_use_in_memory_reservations(redis_url) {
-        return load_active_ethereum_reservations_from_memory();
+    if should_use_in_memory_reservations(chain, redis_url) {
+        return load_active_ethereum_reservations_from_memory(chain);
     }
 
     let client = redis::Client::open(redis_url)
@@ -359,7 +383,7 @@ pub async fn load_active_ethereum_reservations(
         .await
         .map_err(redis_error)?;
 
-    let keys = scan_reservation_keys(&mut connection).await?;
+    let keys = scan_reservation_keys(chain, &mut connection).await?;
     let mut reservations = Vec::with_capacity(keys.len());
 
     for key in keys {
@@ -376,7 +400,12 @@ pub async fn load_active_ethereum_reservations(
         match serde_json::from_str::<EthereumReservation>(&payload) {
             Ok(reservation) => reservations.push(reservation),
             Err(e) => {
-                log::warn!("[ETH] Failed to parse reservation '{}': {}", key, e);
+                log::warn!(
+                    "[{}] Failed to parse reservation '{}': {}",
+                    chain.ticker(),
+                    key,
+                    e
+                );
             }
         }
     }
@@ -386,6 +415,7 @@ pub async fn load_active_ethereum_reservations(
 }
 
 pub async fn reserve_ethereum_wallet_for_user(
+    chain: Chain,
     redis_url: &str,
     wallets: &SharedEthereumWallets,
     pool_path: &str,
@@ -393,13 +423,16 @@ pub async fn reserve_ethereum_wallet_for_user(
     ttl_secs: u64,
 ) -> Result<EthereumReservation, DetectorError> {
     if user_id.trim().is_empty() {
-        return Err(DetectorError::InvalidConfig(
-            "user_id cannot be empty when reserving an Ethereum wallet".into(),
-        ));
+        return Err(DetectorError::InvalidConfig(format!(
+            "user_id cannot be empty when reserving a {} wallet",
+            chain.name()
+        )));
     }
 
-    if should_use_in_memory_reservations(redis_url) {
-        return reserve_ethereum_wallet_for_user_in_memory(wallets, pool_path, user_id, ttl_secs);
+    if should_use_in_memory_reservations(chain, redis_url) {
+        return reserve_ethereum_wallet_for_user_in_memory(
+            chain, wallets, pool_path, user_id, ttl_secs,
+        );
     }
 
     let client = redis::Client::open(redis_url)
@@ -415,7 +448,7 @@ pub async fn reserve_ethereum_wallet_for_user(
     })?;
     let new_expires = now.saturating_add(ttl_secs_i64);
 
-    let existing = load_active_ethereum_reservations(redis_url).await?;
+    let existing = load_active_ethereum_reservations(chain, redis_url).await?;
     if let Some(existing_reservation) = existing.into_iter().find(|r| r.user_id == user_id.trim()) {
         if new_expires > existing_reservation.expires_at_unix {
             let updated = EthereumReservation {
@@ -424,7 +457,7 @@ pub async fn reserve_ethereum_wallet_for_user(
             };
             let payload = serde_json::to_string(&updated)?;
             let _: Option<String> = redis::cmd("SET")
-                .arg(reservation_key(&updated.address))
+                .arg(reservation_key(chain, &updated.address))
                 .arg(payload)
                 .arg("EX")
                 .arg(ttl_secs)
@@ -432,7 +465,8 @@ pub async fn reserve_ethereum_wallet_for_user(
                 .await
                 .map_err(redis_error)?;
             log::info!(
-                "[ETH] Extended reservation for user_id={} address={} to {}s",
+                "[{}] Extended reservation for user_id={} address={} to {}s",
+                chain.ticker(),
                 user_id,
                 updated.address,
                 ttl_secs
@@ -460,7 +494,7 @@ pub async fn reserve_ethereum_wallet_for_user(
 
         let payload = serde_json::to_string(&reservation)?;
         let response: Option<String> = redis::cmd("SET")
-            .arg(reservation_key(&address))
+            .arg(reservation_key(chain, &address))
             .arg(payload)
             .arg("EX")
             .arg(ttl_secs)
@@ -475,7 +509,7 @@ pub async fn reserve_ethereum_wallet_for_user(
     }
 
     // Pool exhausted — generate, persist, then reserve.
-    let new_wallet = grow_ethereum_pool(wallets, pool_path)?;
+    let new_wallet = grow_ethereum_pool(chain, wallets, pool_path)?;
     let reservation = EthereumReservation {
         user_id: user_id.trim().to_string(),
         address: new_wallet.address.clone(),
@@ -485,7 +519,7 @@ pub async fn reserve_ethereum_wallet_for_user(
     };
     let payload = serde_json::to_string(&reservation)?;
     let response: Option<String> = redis::cmd("SET")
-        .arg(reservation_key(&new_wallet.address))
+        .arg(reservation_key(chain, &new_wallet.address))
         .arg(payload)
         .arg("EX")
         .arg(ttl_secs)
@@ -497,21 +531,25 @@ pub async fn reserve_ethereum_wallet_for_user(
     if response.is_some() {
         Ok(reservation)
     } else {
-        Err(DetectorError::ApiError(
-            "Failed to register reservation for newly generated Ethereum wallet".into(),
-        ))
+        Err(DetectorError::ApiError(format!(
+            "Failed to register reservation for newly generated {} wallet",
+            chain.name()
+        )))
     }
 }
 
 fn grow_ethereum_pool(
+    chain: Chain,
     wallets: &SharedEthereumWallets,
     pool_path: &str,
 ) -> Result<ManagedEthereumWallet, DetectorError> {
-    let max_pool_size = ethereum_max_pool_size();
+    let max_pool_size = ethereum_max_pool_size(chain);
     let mut pool = wallets.write().unwrap_or_else(|p| p.into_inner());
     if pool.len() >= max_pool_size {
         return Err(DetectorError::InvalidConfig(format!(
-            "Ethereum wallet pool reached ETH_MAX_POOL_SIZE={} - refusing to grow further",
+            "{} wallet pool reached {}_MAX_POOL_SIZE={} - refusing to grow further",
+            chain.name(),
+            chain_env_prefix(chain),
             max_pool_size
         )));
     }
@@ -520,7 +558,8 @@ fn grow_ethereum_pool(
     append_ethereum_wallet_to_pool_file(pool_path, &new_wallet)?;
     pool.push(new_wallet.clone());
     log::info!(
-        "[ETH] Auto-generated new managed wallet at index {} address {} (pool path: {}); pool grew to handle exhausted reservations",
+        "[{}] Auto-generated new managed wallet at index {} address {} (pool path: {}); pool grew to handle exhausted reservations",
+        chain.ticker(),
         new_wallet.index,
         new_wallet.address,
         pool_path
@@ -528,32 +567,37 @@ fn grow_ethereum_pool(
     Ok(new_wallet)
 }
 
-pub fn reservation_key(address: &str) -> String {
-    format!("{RESERVATION_KEY_PREFIX}{address}")
+pub fn reservation_key(chain: Chain, address: &str) -> String {
+    format!("{}{}", reservation_key_prefix(chain), address)
 }
 
 pub fn format_address(address: Address) -> String {
     format!("{:#x}", address)
 }
 
-pub fn ethereum_reservation_store_url_from_env() -> String {
-    if ethereum_reservations_use_memory() {
+pub fn ethereum_reservation_store_url_from_env(chain: Chain) -> String {
+    if ethereum_reservations_use_memory(chain) {
         IN_MEMORY_RESERVATION_URL.to_string()
     } else {
-        std::env::var("REDIS_URL")
-            .expect("REDIS_URL env var required unless ETH_RESERVATION_STORE=memory")
+        let prefix = chain_env_prefix(chain);
+        std::env::var("REDIS_URL").unwrap_or_else(|_| {
+            panic!(
+                "REDIS_URL env var required unless {prefix}_RESERVATION_STORE=memory"
+            )
+        })
     }
 }
 
-pub fn ethereum_reservations_use_memory() -> bool {
-    env_uses_memory_store("ETH_RESERVATION_STORE")
+pub fn ethereum_reservations_use_memory(chain: Chain) -> bool {
+    let prefix = chain_env_prefix(chain);
+    env_uses_memory_store(&format!("{prefix}_RESERVATION_STORE"))
         || env_uses_memory_store("RESERVATION_STORE")
-        || env_bool("ETH_RESERVATIONS_IN_MEMORY")
+        || env_bool(&format!("{prefix}_RESERVATIONS_IN_MEMORY"))
         || env_bool("RESERVATIONS_IN_MEMORY")
 }
 
-fn should_use_in_memory_reservations(redis_url: &str) -> bool {
-    ethereum_reservations_use_memory()
+fn should_use_in_memory_reservations(chain: Chain, redis_url: &str) -> bool {
+    ethereum_reservations_use_memory(chain)
         || redis_url.trim().eq_ignore_ascii_case("memory")
         || redis_url
             .trim()
@@ -581,18 +625,25 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn load_active_ethereum_reservations_from_memory() -> Result<Vec<EthereumReservation>, DetectorError>
-{
+fn load_active_ethereum_reservations_from_memory(
+    chain: Chain,
+) -> Result<Vec<EthereumReservation>, DetectorError> {
     let now = unix_timestamp();
+    let prefix = reservation_key_prefix(chain);
     let mut store = lock_in_memory_reservations();
     store.retain(|_, reservation| reservation.expires_at_unix > now);
 
-    let mut reservations = store.values().cloned().collect::<Vec<_>>();
+    let mut reservations = store
+        .iter()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .map(|(_, reservation)| reservation.clone())
+        .collect::<Vec<_>>();
     reservations.sort_by(|a, b| a.address.cmp(&b.address));
     Ok(reservations)
 }
 
 fn reserve_ethereum_wallet_for_user_in_memory(
+    chain: Chain,
     wallets: &SharedEthereumWallets,
     pool_path: &str,
     user_id: &str,
@@ -600,6 +651,7 @@ fn reserve_ethereum_wallet_for_user_in_memory(
 ) -> Result<EthereumReservation, DetectorError> {
     let user_id = user_id.trim();
     let now = unix_timestamp();
+    let prefix = reservation_key_prefix(chain);
     let ttl_secs_i64 = i64::try_from(ttl_secs).map_err(|_| {
         DetectorError::InvalidConfig("Reservation TTL is too large to store".into())
     })?;
@@ -609,8 +661,11 @@ fn reserve_ethereum_wallet_for_user_in_memory(
         let mut store = lock_in_memory_reservations();
         store.retain(|_, reservation| reservation.expires_at_unix > now);
 
+        // Match `user_id` only within this chain's namespace so a Base
+        // reservation doesn't collide with an Ethereum one for the same user.
         if let Some((key, existing)) = store
             .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
             .find(|(_, reservation)| reservation.user_id == user_id)
             .map(|(k, v)| (k.clone(), v.clone()))
         {
@@ -621,7 +676,8 @@ fn reserve_ethereum_wallet_for_user_in_memory(
                 };
                 store.insert(key, updated.clone());
                 log::info!(
-                    "[ETH] Extended in-memory reservation for user_id={} address={} to {}s",
+                    "[{}] Extended in-memory reservation for user_id={} address={} to {}s",
+                    chain.ticker(),
                     user_id,
                     updated.address,
                     ttl_secs
@@ -639,7 +695,7 @@ fn reserve_ethereum_wallet_for_user_in_memory(
         };
 
         for (address, index) in candidate_addresses {
-            let key = reservation_key(&address);
+            let key = reservation_key(chain, &address);
             if store.contains_key(&key) {
                 continue;
             }
@@ -656,7 +712,7 @@ fn reserve_ethereum_wallet_for_user_in_memory(
     }
 
     // Pool exhausted — grow it. (We re-acquire the in-memory lock after the grow.)
-    let new_wallet = grow_ethereum_pool(wallets, pool_path)?;
+    let new_wallet = grow_ethereum_pool(chain, wallets, pool_path)?;
     let mut store = lock_in_memory_reservations();
     let reservation = EthereumReservation {
         user_id: user_id.to_string(),
@@ -665,7 +721,10 @@ fn reserve_ethereum_wallet_for_user_in_memory(
         reserved_at_unix: now,
         expires_at_unix: new_expires,
     };
-    store.insert(reservation_key(&new_wallet.address), reservation.clone());
+    store.insert(
+        reservation_key(chain, &new_wallet.address),
+        reservation.clone(),
+    );
     Ok(reservation)
 }
 
@@ -678,16 +737,18 @@ fn lock_in_memory_reservations()
 }
 
 async fn scan_reservation_keys(
+    chain: Chain,
     connection: &mut redis::aio::MultiplexedConnection,
 ) -> Result<Vec<String>, DetectorError> {
     let mut cursor: u64 = 0;
     let mut keys = Vec::new();
+    let prefix = reservation_key_prefix(chain);
 
     loop {
         let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg(format!("{RESERVATION_KEY_PREFIX}*"))
+            .arg(format!("{prefix}*"))
             .arg("COUNT")
             .arg(256)
             .query_async(connection)
@@ -735,13 +796,14 @@ mod tests {
         let path = test_dir.join("ethereum_wallets.json");
         let path_string = path.to_string_lossy().to_string();
 
-        let wallets = load_ethereum_wallet_pool(&path_string).expect("wallet pool should load");
+        let wallets = load_ethereum_wallet_pool(Chain::Ethereum, &path_string)
+            .expect("wallet pool should load");
 
         assert_eq!(wallets.len(), DEFAULT_ETHEREUM_WALLET_POOL_SIZE);
         assert!(path.exists());
 
-        let reloaded =
-            load_ethereum_wallet_pool(&path_string).expect("created wallet pool should reload");
+        let reloaded = load_ethereum_wallet_pool(Chain::Ethereum, &path_string)
+            .expect("created wallet pool should reload");
         assert_eq!(reloaded.len(), DEFAULT_ETHEREUM_WALLET_POOL_SIZE);
         assert_eq!(reloaded[0].address, wallets[0].address);
 

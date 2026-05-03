@@ -40,9 +40,10 @@ fn normalize_xpub_to_bitcoin(xpub_str: &str, chain: Chain) -> Result<String, Det
         Chain::Solana => Err(DetectorError::InvalidXpub(
             "Solana does not use xpub/Ltub derivation in this detector".into(),
         )),
-        Chain::Ethereum => Err(DetectorError::InvalidXpub(
-            "Ethereum uses the managed wallet pool in this detector, not xpub derivation".into(),
-        )),
+        Chain::Ethereum | Chain::Base => Err(DetectorError::InvalidXpub(format!(
+            "{} uses the managed wallet pool in this detector, not xpub derivation",
+            chain.name()
+        ))),
     }
 }
 
@@ -172,10 +173,12 @@ pub fn derive_address(xpub_str: &str, index: u32, chain: Chain) -> Result<String
             index,
             reason: "Solana address derivation is not handled in BTC/LTC derivation module".into(),
         }),
-        Chain::Ethereum => Err(DetectorError::DerivationFailed {
+        Chain::Ethereum | Chain::Base => Err(DetectorError::DerivationFailed {
             index,
-            reason: "Ethereum address derivation is not handled in BTC/LTC derivation module"
-                .into(),
+            reason: format!(
+                "{} address derivation is not handled in BTC/LTC derivation module",
+                chain.name()
+            ),
         }),
     }
 }

@@ -93,6 +93,7 @@ fn blockchair_chain_slug(chain: Chain) -> &'static str {
         Chain::Litecoin => "litecoin",
         Chain::Solana => "solana",
         Chain::Ethereum => "ethereum",
+        Chain::Base => "base",
     }
 }
 
@@ -677,7 +678,7 @@ impl ChainDetector {
                                     btc_addr
                                 }
                             }
-                            Chain::Solana | Chain::Ethereum => return None,
+                            Chain::Solana | Chain::Ethereum | Chain::Base => return None,
                         };
 
                         let &index = address_lookup.get(&addr_str)?;

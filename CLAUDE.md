@@ -14,10 +14,11 @@ Supported chains/assets:
 | Litecoin | LTC    | —                       | xpub-derived BIP84 (P2WPKH, `ltc1` HRP) |
 | Solana   | SOL    | USDC + custom SPL tokens | Wallet pool (per-user reservation) + per-token ATA |
 | Ethereum | ETH    | USDC, USDT, custom ERC20 | Wallet pool (per-user reservation) |
+| Base     | ETH    | USDC, USDT, custom ERC20 | Same `EthereumDetector` parametrized over `Chain::Base`; runs side-by-side with Ethereum mainnet in the same process |
 
 Two binaries:
 - `crypto_payment_detector` ([src/main.rs](src/main.rs)) — detector loop
-- `crypto_payment_api` ([src/api.rs](src/api.rs)) — axum HTTP API for `/derive`, `/health`, `/solana/reserve`, `/ethereum/reserve`, etc.
+- `crypto_payment_api` ([src/api.rs](src/api.rs)) — axum HTTP API for `/derive`, `/health`, `/solana/reserve`, `/ethereum/reserve`, `/base/reserve`, etc.
 
 ## Module map
 
@@ -38,8 +39,8 @@ Two binaries:
 - [src/solana.rs](src/solana.rs) — `SolanaDetector`. Reservation-based: each user reserves a wallet from a pool. Per cycle, scans signatures of (a) reserved owner address for SOL, (b) each `ATA(owner, mint)` for SPL tokens. Sweeps SOL using the managed wallet as fee payer; sweeps SPL tokens using the configured `SOLANA_FEE_PAYER_PRIVATE_KEY` as fee payer + the managed wallet as token-authority signer.
 - [src/solana_pool.rs](src/solana_pool.rs) — Solana wallet pool loader + Redis-backed reservations + **auto-grow** when exhausted. The pool is a `SharedSolanaWallets = Arc<RwLock<Vec<ManagedSolanaWallet>>>` shared between the detector and the API. Wallet file format: `{"wallets": [{"address": "...", "private_key": "<base58 or [byte array]>"}]}`. When `reserve_wallet_for_user` finds no free wallet, it generates a new keypair, appends it to the pool file (atomic `tmp + rename`), pushes it into the in-memory `Vec` (so the detector sees it for sweeps), and reserves it. Bound by `SOLANA_MAX_POOL_SIZE` (default 10000) to prevent runaway growth.
 - [src/solana_tokens.rs](src/solana_tokens.rs) — SPL token helpers: `parse_spl_tokens` (env config parser), `derive_associated_token_address` (`Pubkey::find_program_address` over `[owner, token_program, mint]`), `spl_transfer_checked_instruction` (manually built TransferChecked, instruction tag `12`). No `spl-token` crate dep — instructions built by hand.
-- [src/ethereum.rs](src/ethereum.rs) — `EthereumDetector`. Per-block scan: `eth_getBlockByNumber` for native ETH transfers, `eth_getLogs` with Transfer topic + reserved-address topic2 for ERC-20s. Sweeps to a "gas tank" address; gas tank periodically forwards to the cold ledger and tops up managed wallets that need ETH for token transfers. Has its own ignored-events bookkeeping for self-initiated gas top-ups (so they don't get treated as user deposits).
-- [src/ethereum_pool.rs](src/ethereum_pool.rs) — Ethereum wallet pool. **Auto-creates missing pool file** with N random wallets controlled by `ETH_WALLET_POOL_SIZE` (default 10, max 10000). **Also auto-grows on exhaustion** when `reserve_ethereum_wallet_for_user` runs out of free wallets (capped at `ETH_MAX_POOL_SIZE`, default 10000). Pool is `SharedEthereumWallets = Arc<RwLock<Vec<ManagedEthereumWallet>>>` shared between detector and API. Supports either Redis or in-memory reservations (`ETH_RESERVATION_STORE=memory`); both paths grow the pool.
+- [src/ethereum.rs](src/ethereum.rs) — `EthereumDetector`. Per-block scan: `eth_getBlockByNumber` for native ETH transfers, `eth_getLogs` with Transfer topic + reserved-address topic2 for ERC-20s. Sweeps to a "gas tank" address; gas tank periodically forwards to the cold ledger and tops up managed wallets that need ETH for token transfers. Has its own ignored-events bookkeeping for self-initiated gas top-ups (so they don't get treated as user deposits). **Generic over `EthereumConfig.chain`**: serves both Ethereum mainnet (`Chain::Ethereum`, chain_id 1) and Base (`Chain::Base`, chain_id 8453). Same code path; the chain field drives the log prefix (`[ETH]` vs `[BASE]`), the Redis reservation namespace, the env var prefix used by the wallet pool helpers, and the `chain` field in webhook payloads.
+- [src/ethereum_pool.rs](src/ethereum_pool.rs) — EVM wallet pool (Ethereum + Base). **Auto-creates missing pool file** with N random wallets controlled by `{ETH,BASE}_WALLET_POOL_SIZE` (default 10, max 10000). **Also auto-grows on exhaustion** when `reserve_ethereum_wallet_for_user` runs out of free wallets (capped at `{ETH,BASE}_MAX_POOL_SIZE`, default 10000). Pool is `SharedEthereumWallets = Arc<RwLock<Vec<ManagedEthereumWallet>>>` shared between detector and API. Supports either Redis or in-memory reservations (`{ETH,BASE}_RESERVATION_STORE=memory`); both paths grow the pool. **Redis namespace**: `ethereum:reservation:<addr>` for mainnet, `base:reservation:<addr>` for Base — distinct prefixes so both chains can share the same Redis instance without collisions. All public functions take a `Chain` parameter to disambiguate.
 
 ## Key design patterns
 
@@ -139,10 +140,20 @@ Ethereum:
 - `ETH_RESERVATION_STORE=memory` to skip Redis (the wallet pool file auto-creates if missing).
 - `ETH_GAS_TANK_TARGET_USD` (default 20), `ETH_GAS_TANK_INTERVAL_SECS` (default 900).
 
+Base (mirrors the Ethereum env vars, just swap `ETH_` → `BASE_`):
+- `BASE_RPC_URL` (default `https://mainnet.base.org`), `BASE_CHAIN_ID` (default 8453), `BASE_WALLET_POOL_FILE`, `BASE_GAS_TANK_PRIVATE_KEY`, `BASE_LEDGER_ADDRESS`.
+- `BASE_ERC20_TOKENS` — Base USDC is `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` (6 decimals); Base USDT is `0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2` (6 decimals). Note: `default` in this env var still points to *Ethereum mainnet* contracts (USDC/USDT mainnet), so for Base you must set the env explicitly. Set `BASE_ERC20_TOKENS=USDC:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:6,USDT:0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2:6` (or `none` for ETH-only monitoring).
+- `BASE_MIN_CONFIRMATIONS` (default 5 — Base finalizes faster than mainnet thanks to ~2s blocks).
+- `BASE_POLL_INTERVAL` (default 30s, override if you want faster polling — Base's tip moves quickly).
+- `BASE_RESERVATION_STORE=memory` to skip Redis on Base (independent of the Ethereum setting; both can be memory or both Redis).
+- `BASE_STATE_FILE` (default `base_detector_state.json`).
+
+To run both Ethereum mainnet and Base in the same process: `CHAIN=ethereum,base` (comma-separated list) or `CHAIN=all`. The Redis reservation namespace differs (`ethereum:reservation:` vs `base:reservation:`), state files differ, and pool files differ — the two detectors share nothing except the webhook config and the Etherscan API key.
+
 Etherscan internal-tx scan (optional, enables detection of ETH deposits routed through contracts e.g. Coinbase withdrawals):
-- `ETHERSCAN_API_KEY` — required to enable. Free tier (5 req/s, 100k req/day) is enough for small wallet pools. The client never goes through a proxy: the API key already authenticates the request, and most public proxies are blocked by Etherscan's WAF.
+- `ETHERSCAN_API_KEY` — required to enable. Same key works for **both** Ethereum and Base (V2 multichain). Free tier (5 req/s, 100k req/day) is shared across both detectors when running side-by-side. The client never goes through a proxy: the API key already authenticates the request, and most public proxies are blocked by Etherscan's WAF.
 - `ETHERSCAN_BASE_URL` (default `https://api.etherscan.io/v2/api`) — V2 multichain endpoint.
-- `ETHERSCAN_CHAIN_ID` (default `1`) — chain to query against the V2 endpoint.
+- `ETHERSCAN_CHAIN_ID` is **ignored** when an EVM detector configures Etherscan: each detector pins the etherscan client's `chain_id` to its own `EthereumConfig.chain_id` (1 for Ethereum mainnet, 8453 for Base). This way two detectors sharing the same `EthereumConfig::etherscan` template still hit the right per-chain endpoint.
 - `ETHERSCAN_TIMEOUT_SECS` (default `15`).
 - `ETHERSCAN_MIN_REQUEST_INTERVAL_MS` (default `334`) — minimum gap between requests, enforced client-side. 334ms ≈ 3 req/s, leaves headroom under the 5 req/s free-tier ceiling for retries and concurrent callers sharing the same key. Lower values risk HTTP 429.
 - API budget: per cycle the detector makes one `txlistinternal` call **per reserved wallet** (server-side filter by address). At default `ETH_POLL_INTERVAL=30` and a pool of 10 wallets that's ~28k calls/day — well within the 100k/day free quota. The 3 req/s throttle means a 10-wallet pool takes ~3.3s of wall time per cycle just for Etherscan; pools larger than ~90 wallets won't fit a 30s cycle and need a longer interval (or a paid Etherscan tier).

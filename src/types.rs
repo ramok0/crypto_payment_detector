@@ -7,6 +7,7 @@ pub enum Chain {
     Litecoin,
     Solana,
     Ethereum,
+    Base,
 }
 
 impl Chain {
@@ -16,6 +17,7 @@ impl Chain {
             Chain::Litecoin => "LTC",
             Chain::Solana => "SOL",
             Chain::Ethereum => "ETH",
+            Chain::Base => "BASE",
         }
     }
 
@@ -25,6 +27,7 @@ impl Chain {
             Chain::Litecoin => "Litecoin",
             Chain::Solana => "Solana",
             Chain::Ethereum => "Ethereum",
+            Chain::Base => "Base",
         }
     }
 
@@ -41,6 +44,7 @@ impl Chain {
             ],
             Chain::Solana => &["https://api.mainnet.solana.com"],
             Chain::Ethereum => &["https://cloudflare-eth.com"],
+            Chain::Base => &["https://mainnet.base.org"],
         }
     }
 
@@ -70,6 +74,7 @@ impl Chain {
             }
             Chain::Solana => format!("https://api.mainnet.solana.com/block/{}", hash),
             Chain::Ethereum => format!("https://cloudflare-eth.com/block/{}", hash),
+            Chain::Base => format!("https://mainnet.base.org/block/{}", hash),
         }
     }
 
@@ -78,6 +83,7 @@ impl Chain {
             Chain::Bitcoin | Chain::Litecoin => false,
             Chain::Solana => false,
             Chain::Ethereum => false,
+            Chain::Base => false,
         }
     }
 
@@ -85,7 +91,7 @@ impl Chain {
         match self {
             Chain::Bitcoin | Chain::Litecoin => 100_000_000,
             Chain::Solana => 1_000_000_000,
-            Chain::Ethereum => 1_000_000_000_000_000_000,
+            Chain::Ethereum | Chain::Base => 1_000_000_000_000_000_000,
         }
     }
 
@@ -95,7 +101,14 @@ impl Chain {
             Chain::Litecoin => bitcoin::Network::Bitcoin,
             Chain::Solana => bitcoin::Network::Bitcoin,
             Chain::Ethereum => bitcoin::Network::Bitcoin,
+            Chain::Base => bitcoin::Network::Bitcoin,
         }
+    }
+
+    /// True for EVM-compatible chains that share the same address scheme,
+    /// JSON-RPC interface, and pricing reference (Base ETH ≡ Ethereum ETH).
+    pub fn is_evm(&self) -> bool {
+        matches!(self, Chain::Ethereum | Chain::Base)
     }
 }
 
@@ -114,6 +127,7 @@ impl std::str::FromStr for Chain {
             "litecoin" | "ltc" => Ok(Chain::Litecoin),
             "solana" | "sol" => Ok(Chain::Solana),
             "ethereum" | "eth" => Ok(Chain::Ethereum),
+            "base" => Ok(Chain::Base),
             _ => Err(format!("Unknown chain: {}", s)),
         }
     }

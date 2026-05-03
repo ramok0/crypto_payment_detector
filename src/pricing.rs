@@ -131,7 +131,7 @@ fn kraken_pair(chain: Chain, currency: &str) -> String {
         Chain::Bitcoin => "XBT",
         Chain::Litecoin => "LTC",
         Chain::Solana => "SOL",
-        Chain::Ethereum => "ETH",
+        Chain::Ethereum | Chain::Base => "ETH",
     };
     let fiat = currency.to_uppercase();
     match chain {
@@ -147,7 +147,8 @@ fn kraken_pair(chain: Chain, currency: &str) -> String {
         },
         Chain::Litecoin => format!("LTC{}", fiat),
         Chain::Solana => format!("SOL{}", fiat),
-        Chain::Ethereum => match fiat.as_str() {
+        // Base ETH is canonical bridged ETH; same price reference as mainnet.
+        Chain::Ethereum | Chain::Base => match fiat.as_str() {
             "EUR" => "XETHZEUR".to_string(),
             "USD" => "XETHZUSD".to_string(),
             "GBP" => "XETHZGBP".to_string(),
@@ -184,5 +185,11 @@ mod tests {
     fn test_eth_pair() {
         assert_eq!(kraken_pair(Chain::Ethereum, "EUR"), "XETHZEUR");
         assert_eq!(kraken_pair(Chain::Ethereum, "usd"), "XETHZUSD");
+    }
+
+    #[test]
+    fn test_base_pair_aliases_to_eth() {
+        assert_eq!(kraken_pair(Chain::Base, "EUR"), "XETHZEUR");
+        assert_eq!(kraken_pair(Chain::Base, "usd"), "XETHZUSD");
     }
 }

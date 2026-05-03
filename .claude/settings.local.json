@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cargo test *)",
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "Bash(python -c ' *)"
     ]
   }
 }

@@ -125,7 +125,7 @@ fn normalize_xpriv_to_bitcoin(xpriv_str: &str, chain: Chain) -> Result<String, D
             converted[..4].copy_from_slice(&BTC_XPRIV_VERSION);
             Ok(base58_encode_check(&converted))
         }
-        Chain::Solana | Chain::Ethereum => Err(DetectorError::InvalidXpub(format!(
+        Chain::Solana | Chain::Ethereum | Chain::Base => Err(DetectorError::InvalidXpub(format!(
             "Bitcoin-style xpriv derivation is not supported for {}",
             chain
         ))),

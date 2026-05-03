@@ -23,14 +23,22 @@ pub fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
-pub fn chain_env_var(chain: Chain, suffix: &str) -> Option<String> {
-    let chain_name = match chain {
+/// Env var prefix used for `chain_env_var` lookups. Note this is `SOLANA` for
+/// Solana (matching the existing `SOLANA_*` env vars in the codebase) — *not*
+/// `SOL` — so callers like [`chain_env_var`] resolve `SOLANA_RPC_URL` rather
+/// than `SOL_RPC_URL`.
+pub fn chain_env_prefix(chain: Chain) -> &'static str {
+    match chain {
         Chain::Bitcoin => "BTC",
         Chain::Litecoin => "LTC",
         Chain::Solana => "SOL",
         Chain::Ethereum => "ETH",
-    };
-    let chain_var = format!("{chain_name}_{suffix}");
+        Chain::Base => "BASE",
+    }
+}
+
+pub fn chain_env_var(chain: Chain, suffix: &str) -> Option<String> {
+    let chain_var = format!("{}_{}", chain_env_prefix(chain), suffix);
 
     std::env::var(chain_var).ok()
 }
@@ -40,15 +48,9 @@ pub fn chain_env_bool(chain: Chain, suffix: &str, global_name: &str) -> bool {
         .and_then(|value| match parse_bool(&value) {
             Some(parsed) => Some(parsed),
             None => {
-                let chain_name = match chain {
-                    Chain::Bitcoin => "BTC",
-                    Chain::Litecoin => "LTC",
-                    Chain::Solana => "SOL",
-                    Chain::Ethereum => "ETH",
-                };
                 log::warn!(
                     "Ignoring invalid boolean env {}_{}={:?}; expected one of 1/0, true/false, yes/no, on/off",
-                    chain_name,
+                    chain_env_prefix(chain),
                     suffix,
                     value
                 );
