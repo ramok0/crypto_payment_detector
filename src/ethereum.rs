@@ -1773,7 +1773,22 @@ impl PaymentDetector for EthereumDetector {
         _max_derivation_index: u32,
     ) -> Result<(), DetectorError> {
         loop {
-            self.process_cycle().await?;
+            if let Err(error) = self.process_cycle().await {
+                // Insufficient funds is operator-actionable, not transient.
+                // Bubbling it up triggers the 10s restart loop in the caller,
+                // which spams the logs without helping. Warn once and let the
+                // next poll cycle retry — the same payments stay in `pending`.
+                if is_rpc_insufficient_funds_error(&error) {
+                    log::warn!(
+                        "[{}] Cycle deferred: a sweep ran out of gas funding — top up the gas tank ({}) to resume. {}",
+                        self.config.chain.ticker(),
+                        self.gas_tank_address(),
+                        error
+                    );
+                } else {
+                    return Err(error);
+                }
+            }
             tokio::time::sleep(std::time::Duration::from_secs(
                 self.config.poll_interval_secs,
             ))
@@ -2066,6 +2081,21 @@ fn eth_rpc_error<E: std::fmt::Display>(context: &str, error: E) -> DetectorError
     DetectorError::ApiError(format!("Ethereum RPC {context} failed: {error}"))
 }
 
+/// Heuristic detection of "insufficient funds" responses from the chain. The
+/// node returns these when a wallet's balance can't cover `value + gas_limit *
+/// gas_price`. The condition is operator-actionable (top up the gas tank) and
+/// not transient — a 10s restart loop just spams the logs. Treat it as a
+/// deferred sweep: warn once per cycle and retry on the next poll.
+///
+/// Covers JSON-RPC `-32003` (Geth, Reth, op-geth) and the legacy `-32000` plus
+/// the human-readable substring most RPC providers wrap around it.
+fn is_rpc_insufficient_funds_error(err: &DetectorError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("insufficient funds")
+        || msg.contains("-32003")
+        || msg.contains("insufficient balance for transfer")
+}
+
 /// Heuristic detection of transient RPC overload responses that should be
 /// retried. Covers:
 /// - JSON-RPC `-32016` "over rate limit" (Base public RPC, several others)
@@ -2188,6 +2218,26 @@ mod tests {
         )));
         assert!(!is_rpc_rate_limit_error(&DetectorError::InvalidConfig(
             "ETH_LEDGER_ADDRESS missing".into()
+        )));
+    }
+
+    #[test]
+    fn detects_rpc_insufficient_funds_errors() {
+        // Real payload from Base mainnet.
+        assert!(is_rpc_insufficient_funds_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_sendRawTransaction failed: (code: -32003, message: insufficient funds for gas * price + value: have 8556359999658086 want 8556361876386681, data: None)".into()
+        )));
+        // Some providers wrap the message under a different code.
+        assert!(is_rpc_insufficient_funds_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_sendRawTransaction failed: insufficient balance for transfer".into()
+        )));
+
+        // Should NOT match unrelated failures.
+        assert!(!is_rpc_insufficient_funds_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_call failed: (code: -32016, message: over rate limit)".into()
+        )));
+        assert!(!is_rpc_insufficient_funds_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_estimateGas failed: execution reverted".into()
         )));
     }
 }
