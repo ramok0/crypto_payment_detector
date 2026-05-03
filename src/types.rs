@@ -221,6 +221,7 @@ pub struct DetectorConfig {
     pub sweep_destination: Option<String>,
     pub sweep_fee_rate_sats_per_vb: u64,
     pub sweep_min_sat: u64,
+    pub sweep_max_fee_ratio: f64,
 }
 
 impl Default for DetectorConfig {
@@ -246,6 +247,7 @@ impl Default for DetectorConfig {
             sweep_destination: None,
             sweep_fee_rate_sats_per_vb: 5,
             sweep_min_sat: 5_000,
+            sweep_max_fee_ratio: 0.10,
         }
     }
 }

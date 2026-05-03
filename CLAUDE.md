@@ -60,6 +60,21 @@ Two binaries:
 - `WebhookEvent` enum is `#[serde(tag = "event", content = "data")]` — wire format is `{"event": "payment_credited", "data": {...DetectedPayment}}`.
 - HMAC sent in `X-Signature-256` header (lowercase hex).
 
+### Fee guards (deferred sweeps)
+
+Each chain has a `max_fee_ratio` config (default 0.10 = 10%). Before broadcasting a sweep, the detector checks whether the estimated fee would exceed `max_fee_ratio × swept_amount`. If yes, the sweep is **deferred** (returns `SweepResult { deferred: true }`), the entry stays in `pending`, and the detector retries on the next cycle. This protects against ETH gas spikes, BTC mempool storms, etc.
+
+Per-chain env vars: `ETH_MAX_FEE_RATIO`, `SOLANA_MAX_FEE_RATIO` (or `SOL_MAX_FEE_RATIO`), `BTC_MAX_FEE_RATIO`, `LTC_MAX_FEE_RATIO`. Falls back to global `MAX_FEE_RATIO`. All default to 0.10.
+
+The ratio compares **fee value** vs **swept value** in matching units:
+- BTC/LTC native: `fee_sat / total_input_sat`
+- ETH native: `fee_wei / balance_wei`
+- ETH ERC-20 (USD-pegged tokens only): `fee_eth × eth_usd / token_amount` (since amount is already USD-pegged)
+- SOL native: `fee_lamports / balance_lamports`
+- SOL SPL (USD-pegged tokens only): `fee_sol × sol_usd / token_amount` — **excludes ATA creation rent** (that's a one-time bootstrap cost amortized over future sweeps; otherwise the first sweep ever would always defer)
+
+Non-USD-pegged tokens skip the ratio check (no price source) — falls back to "sweep regardless" behavior. This is by design: weird tokens need manual operator review anyway.
+
 ### Fee management
 - **BTC/LTC**: fixed fee rate from config (`BTC_SWEEP_FEE_RATE_SATS_PER_VB`, default 5). Sweep transaction is single-output P2WPKH→P2WPKH.
 - **SOL native**: managed wallet pays its own fee out of the swept SOL. The remainder lands on the **gas tank** (`SOLANA_GAS_TANK_PRIVATE_KEY` pubkey) when set, otherwise on `SOLANA_DEPOSIT_ADDRESS` (cold).

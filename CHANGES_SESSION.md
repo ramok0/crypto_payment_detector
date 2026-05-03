@@ -2,6 +2,33 @@
 
 Document destiné au shop qui consomme ce détecteur. Liste les changements de comportement, les nouvelles variables d'environnement et les actions à prendre côté ops avant de déployer.
 
+## Mise à jour : protection contre les frais excessifs (toutes chaînes)
+
+Sur chaque chaîne, un nouveau garde-fou empêche le sweep si les frais dépasseraient un % configurable du montant à sweeper. Si déclenché, le sweep est **différé** (l'entrée reste en pending) et réessayé au cycle suivant.
+
+```env
+# Plafond global, fallback pour tous les chains (défaut 0.10 = 10%)
+MAX_FEE_RATIO=0.10
+
+# Override par chaîne (recommandé)
+ETH_MAX_FEE_RATIO=0.10            # Ethereum (gas spikes)
+SOLANA_MAX_FEE_RATIO=0.10         # Solana (frais très bas en pratique)
+BTC_MAX_FEE_RATIO=0.10            # Bitcoin (mempool storms)
+LTC_MAX_FEE_RATIO=0.10            # Litecoin
+```
+
+Exemple : si vous sweepez $5 d'USDC sur Ethereum et que le gas coûterait $1.50, le ratio est 30% → si `ETH_MAX_FEE_RATIO=0.10`, le sweep est différé. Quand le gas redescend (ratio < 10%), le sweep réussira au prochain cycle.
+
+Logs au déclenchement :
+```
+[ETH] Deferring USDC sweep for 0xabc...: fee ~$1.50 would be 30.0% of swept ~$5.00 (max 10.0%) - retry when gas drops
+[SOL] Sweep deferred for ... will retry next cycle
+```
+
+Limitations :
+- **Tokens non USD-pegged** : pas de check ratio (on n'a pas le prix). USDC/USDT/DAI/BUSD/TUSD/USDP/GUSD/PYUSD sont reconnus comme USD-pegged.
+- **SPL token rent ATA** : l'ATA de destination peut nécessiter ~0.002 SOL de rent au premier sweep. Ce coût n'est PAS compté dans le ratio (sinon le premier sweep ne se ferait jamais). Si vous voulez quand même éviter le rent à tout prix, augmentez `SOL_MIN_DEPOSIT_FIAT`.
+
 ## TL;DR
 
 Deux nouvelles fonctionnalités, **toutes les deux opt-in** :

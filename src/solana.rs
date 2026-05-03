@@ -48,6 +48,7 @@ pub struct SolanaConfig {
     pub gas_tank_private_key: Option<String>,
     pub gas_tank_target_usd: f64,
     pub gas_tank_check_interval_secs: u64,
+    pub max_fee_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +93,7 @@ struct SignatureInfo {
 struct SweepResult {
     amount_base_units: u64,
     txid: Option<String>,
+    deferred: bool,
 }
 
 #[derive(Debug)]
@@ -864,9 +866,16 @@ impl SolanaDetector {
                 continue;
             }
 
-            let mut credited_payment = match entry.asset.as_deref() {
+            let credited_payment_opt: Option<DetectedPayment> = match entry.asset.as_deref() {
                 None => {
                     let sweep_result = self.sweep_native_sol_from_address(&entry.address).await?;
+                    if sweep_result.deferred {
+                        log::info!(
+                            "[SOL] Native sweep deferred for {} (signature {}); will retry next cycle",
+                            entry.address, entry.signature
+                        );
+                        continue;
+                    }
                     let amount_coin =
                         entry.amount_base_units as f64 / Chain::Solana.sats_per_unit() as f64;
                     let mut payment = DetectedPayment {
@@ -902,7 +911,7 @@ impl SolanaDetector {
                         payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
                         payment.fiat_amount = Some(payment.amount_coin * price);
                     }
-                    payment
+                    Some(payment)
                 }
                 Some(symbol) => {
                     let mint_str = entry.token_mint.as_deref().ok_or_else(|| {
@@ -932,6 +941,13 @@ impl SolanaDetector {
                             entry.amount_base_units,
                         )
                         .await?;
+                    if sweep_result.deferred {
+                        log::info!(
+                            "[SOL] {} sweep deferred for {} (signature {}); will retry next cycle",
+                            symbol, entry.address, entry.signature
+                        );
+                        continue;
+                    }
 
                     let amount_coin =
                         entry.amount_base_units as f64 / 10f64.powi(i32::from(decimals));
@@ -972,11 +988,13 @@ impl SolanaDetector {
                         }
                     }
 
-                    payment
+                    Some(payment)
                 }
             };
 
-            let _ = &mut credited_payment;
+            let Some(credited_payment) = credited_payment_opt else {
+                continue;
+            };
             send_webhook(
                 &self.webhook_client,
                 &self.config.webhook_url,
@@ -1015,6 +1033,7 @@ impl SolanaDetector {
             return Ok(SweepResult {
                 amount_base_units: 0,
                 txid: None,
+                deferred: false,
             });
         }
 
@@ -1023,7 +1042,7 @@ impl SolanaDetector {
 
         if balance <= fee {
             log::info!(
-                "[SOL] Address {} balance {} lamports is not enough to cover sweep fee {}",
+                "[SOL] Address {} balance {} lamports is not enough to cover sweep fee {} - deferring",
                 address,
                 balance,
                 fee
@@ -1031,6 +1050,23 @@ impl SolanaDetector {
             return Ok(SweepResult {
                 amount_base_units: 0,
                 txid: None,
+                deferred: true,
+            });
+        }
+
+        if fee_ratio_too_high(fee, balance, self.config.max_fee_ratio) {
+            log::info!(
+                "[SOL] Deferring native sweep for {}: fee {} lamports would be {:.1}% of balance {} (max {:.1}%) - retry later",
+                address,
+                fee,
+                fee as f64 / balance as f64 * 100.0,
+                balance,
+                self.config.max_fee_ratio * 100.0
+            );
+            return Ok(SweepResult {
+                amount_base_units: 0,
+                txid: None,
+                deferred: true,
             });
         }
 
@@ -1057,6 +1093,7 @@ impl SolanaDetector {
         Ok(SweepResult {
             amount_base_units: amount_lamports,
             txid: Some(txid),
+            deferred: false,
         })
     }
 
@@ -1215,7 +1252,38 @@ impl SolanaDetector {
             return Ok(SweepResult {
                 amount_base_units: 0,
                 txid: None,
+                deferred: false,
             });
+        }
+
+        if is_usd_pegged_token(symbol) && self.config.max_fee_ratio > 0.0 {
+            let amount_usd = amount as f64 / 10f64.powi(i32::from(decimals));
+            if amount_usd > 0.0 {
+                if let Ok(sol_usd) = self.sol_usd_fetcher.get_price().await {
+                    if sol_usd > 0.0 {
+                        // tx fee only (~5000 lamports). Don't include rent for ATA creation
+                        // since that's a one-time bootstrap cost amortized over future sweeps.
+                        let fee_lamports = 5_000u64;
+                        let fee_usd = (fee_lamports as f64 / 1_000_000_000.0) * sol_usd;
+                        if fee_usd > amount_usd * self.config.max_fee_ratio {
+                            log::info!(
+                                "[SOL] Deferring {} sweep for {}: fee ~${:.4} would be {:.1}% of swept ~${:.2} (max {:.1}%)",
+                                symbol,
+                                owner_address,
+                                fee_usd,
+                                fee_usd / amount_usd * 100.0,
+                                amount_usd,
+                                self.config.max_fee_ratio * 100.0
+                            );
+                            return Ok(SweepResult {
+                                amount_base_units: 0,
+                                txid: None,
+                                deferred: true,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         let fee_payer = self.gas_tank_keypair.as_deref().ok_or_else(|| {
@@ -1262,6 +1330,7 @@ impl SolanaDetector {
         Ok(SweepResult {
             amount_base_units: amount,
             txid: Some(txid),
+            deferred: false,
         })
     }
 
@@ -1744,6 +1813,13 @@ fn is_usd_pegged_token(symbol: &str) -> bool {
         symbol.trim().to_ascii_uppercase().as_str(),
         "USDC" | "USDT" | "DAI" | "BUSD" | "TUSD" | "USDP" | "GUSD" | "PYUSD"
     )
+}
+
+fn fee_ratio_too_high(fee: u64, total: u64, max_ratio: f64) -> bool {
+    if total == 0 || !max_ratio.is_finite() || max_ratio <= 0.0 || max_ratio >= 1.0 {
+        return false;
+    }
+    (fee as f64) / (total as f64) > max_ratio
 }
 
 fn usd_to_lamports(usd: f64, sol_usd: f64) -> Option<u64> {

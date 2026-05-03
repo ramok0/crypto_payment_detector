@@ -33,6 +33,7 @@ pub struct BitcoinSweepConfig {
     pub destination: String,
     pub fee_rate_sats_per_vb: u64,
     pub min_sweep_sat: u64,
+    pub max_fee_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub struct BitcoinSweepResult {
     pub txid: Option<String>,
     pub amount_sat: u64,
     pub fee_sat: u64,
+    pub deferred: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +261,7 @@ pub async fn sweep_address(
             txid: None,
             amount_sat: 0,
             fee_sat: 0,
+            deferred: false,
         });
     }
 
@@ -268,7 +271,7 @@ pub async fn sweep_address(
 
     if total_input <= fee {
         log::info!(
-            "[{}] Skipping sweep for {} (index {}): inputs {} sat <= fee {} sat",
+            "[{}] Deferring sweep for {} (index {}): inputs {} sat <= fee {} sat",
             config.chain.ticker(),
             address,
             derivation_index,
@@ -279,13 +282,14 @@ pub async fn sweep_address(
             txid: None,
             amount_sat: 0,
             fee_sat: 0,
+            deferred: true,
         });
     }
 
     let amount_out = total_input - fee;
     if amount_out < config.min_sweep_sat {
         log::info!(
-            "[{}] Skipping sweep for {} (index {}): net {} sat < min_sweep_sat {} sat",
+            "[{}] Deferring sweep for {} (index {}): net {} sat < min_sweep_sat {} sat",
             config.chain.ticker(),
             address,
             derivation_index,
@@ -296,6 +300,26 @@ pub async fn sweep_address(
             txid: None,
             amount_sat: 0,
             fee_sat: 0,
+            deferred: true,
+        });
+    }
+
+    if fee_ratio_too_high(fee, total_input, config.max_fee_ratio) {
+        log::info!(
+            "[{}] Deferring sweep for {} (index {}): fee {} sat would be {:.1}% of input {} sat (max {:.1}%) - retry when fee market drops",
+            config.chain.ticker(),
+            address,
+            derivation_index,
+            fee,
+            (fee as f64 / total_input as f64) * 100.0,
+            total_input,
+            config.max_fee_ratio * 100.0
+        );
+        return Ok(BitcoinSweepResult {
+            txid: None,
+            amount_sat: 0,
+            fee_sat: 0,
+            deferred: true,
         });
     }
 
@@ -386,7 +410,15 @@ pub async fn sweep_address(
         txid: Some(txid),
         amount_sat: amount_out,
         fee_sat: fee,
+        deferred: false,
     })
+}
+
+fn fee_ratio_too_high(fee: u64, total: u64, max_ratio: f64) -> bool {
+    if total == 0 || !max_ratio.is_finite() || max_ratio <= 0.0 || max_ratio >= 1.0 {
+        return false;
+    }
+    (fee as f64) / (total as f64) > max_ratio
 }
 
 fn base58_decode_check(input: &str) -> Result<Vec<u8>, String> {

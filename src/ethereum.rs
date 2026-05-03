@@ -57,6 +57,7 @@ pub struct EthereumConfig {
     pub gas_tank_check_interval_secs: u64,
     pub token_transfer_gas_limit: u64,
     pub gas_top_up_multiplier: f64,
+    pub max_fee_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +103,7 @@ struct DetectedEthereumPayment {
 struct SweepResult {
     amount: U256,
     txid: Option<String>,
+    deferred: bool,
 }
 
 #[derive(Debug)]
@@ -547,6 +549,14 @@ impl EthereumDetector {
                 self.sweep_native_from_address(&entry.address).await?
             };
 
+            if sweep.deferred {
+                log::info!(
+                    "[ETH] Sweep deferred for {} (will retry next cycle)",
+                    entry.event_id
+                );
+                continue;
+            }
+
             let mut credited_payment =
                 self.pending_to_webhook(&entry, current_block, Some(&sweep), amount);
             self.enrich_fiat(&mut credited_payment).await;
@@ -618,6 +628,7 @@ impl EthereumDetector {
             return Ok(SweepResult {
                 amount: U256::zero(),
                 txid: None,
+                deferred: false,
             });
         }
 
@@ -625,7 +636,7 @@ impl EthereumDetector {
         let fee = U256::from(NATIVE_TRANSFER_GAS_LIMIT) * gas_price;
         if balance <= fee {
             log::info!(
-                "[ETH] Address {} balance {} wei is not enough to cover native sweep fee {}",
+                "[ETH] Address {} balance {} wei is not enough to cover native sweep fee {} - deferring",
                 address,
                 balance,
                 fee
@@ -633,6 +644,23 @@ impl EthereumDetector {
             return Ok(SweepResult {
                 amount: U256::zero(),
                 txid: None,
+                deferred: true,
+            });
+        }
+
+        if fee_ratio_too_high_u256(fee, balance, self.config.max_fee_ratio) {
+            log::info!(
+                "[ETH] Deferring native sweep for {}: fee {} wei would be {:.1}% of balance {} wei (max {:.1}%) - retry when gas drops",
+                address,
+                fee,
+                ratio_percent_u256(fee, balance),
+                balance,
+                self.config.max_fee_ratio * 100.0
+            );
+            return Ok(SweepResult {
+                amount: U256::zero(),
+                txid: None,
+                deferred: true,
             });
         }
 
@@ -663,6 +691,7 @@ impl EthereumDetector {
         Ok(SweepResult {
             amount,
             txid: Some(txid),
+            deferred: false,
         })
     }
 
@@ -685,7 +714,11 @@ impl EthereumDetector {
         })?;
 
         if amount.is_zero() {
-            return Ok(SweepResult { amount, txid: None });
+            return Ok(SweepResult {
+                amount,
+                txid: None,
+                deferred: false,
+            });
         }
 
         let gas_price = self.gas_price().await?;
@@ -708,6 +741,47 @@ impl EthereumDetector {
             });
         let needed_fee =
             multiply_u256_by_f64(gas_limit * gas_price, self.config.gas_top_up_multiplier);
+
+        if let Some(token) = self.tokens.iter().find(|t| t.contract == contract) {
+            if is_usd_pegged_token(&token.symbol) {
+                let amount_usd =
+                    u256_to_units_f64(amount, token.decimals.max(1)).max(0.0);
+                if amount_usd > 0.0 {
+                    match self.eth_usd_fetcher.get_price().await {
+                        Ok(eth_usd) if eth_usd > 0.0 => {
+                            let fee_eth = u256_to_units_f64(needed_fee, ETH_DECIMALS);
+                            let fee_usd = fee_eth * eth_usd;
+                            if fee_usd
+                                > amount_usd * self.config.max_fee_ratio
+                            {
+                                log::info!(
+                                    "[ETH] Deferring {} sweep for {}: fee ~${:.2} would be {:.1}% of swept ~${:.2} (max {:.1}%) - retry when gas drops",
+                                    token.symbol,
+                                    address,
+                                    fee_usd,
+                                    fee_usd / amount_usd * 100.0,
+                                    amount_usd,
+                                    self.config.max_fee_ratio * 100.0
+                                );
+                                return Ok(SweepResult {
+                                    amount: U256::zero(),
+                                    txid: None,
+                                    deferred: true,
+                                });
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            log::warn!(
+                                "[ETH] Skipping fee-ratio check for {} sweep: failed to fetch ETH/USD: {}",
+                                token.symbol, error
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         self.ensure_eth_for_token_sweep(eth_address, needed_fee)
             .await?;
 
@@ -746,6 +820,7 @@ impl EthereumDetector {
         Ok(SweepResult {
             amount,
             txid: Some(txid),
+            deferred: false,
         })
     }
 
@@ -854,6 +929,17 @@ impl EthereumDetector {
             return Ok(());
         }
 
+        if fee_ratio_too_high_u256(fee, amount, self.config.max_fee_ratio) {
+            log::info!(
+                "[ETH] Deferring gas tank excess sweep: fee {} wei would be {:.1}% of {} wei excess (max {:.1}%)",
+                fee,
+                ratio_percent_u256(fee, amount),
+                amount,
+                self.config.max_fee_ratio * 100.0
+            );
+            return Ok(());
+        }
+
         let txid = self
             .send_native(
                 self.gas_tank_wallet.clone(),
@@ -917,6 +1003,28 @@ impl EthereumDetector {
                     balance,
                     token.symbol
                 )));
+            }
+
+            if is_usd_pegged_token(&token.symbol) {
+                let amount_usd = u256_to_units_f64(balance, token.decimals.max(1));
+                if amount_usd > 0.0 {
+                    if let Ok(eth_usd) = self.eth_usd_fetcher.get_price().await {
+                        if eth_usd > 0.0 {
+                            let fee_usd = u256_to_units_f64(fee, ETH_DECIMALS) * eth_usd;
+                            if fee_usd > amount_usd * self.config.max_fee_ratio {
+                                log::info!(
+                                    "[ETH] Deferring gas tank {} sweep to ledger: fee ~${:.2} would be {:.1}% of swept ~${:.2} (max {:.1}%)",
+                                    token.symbol,
+                                    fee_usd,
+                                    fee_usd / amount_usd * 100.0,
+                                    amount_usd,
+                                    self.config.max_fee_ratio * 100.0
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
 
             let tx = TransactionRequest::new()
@@ -1415,6 +1523,30 @@ fn address_from_topic(topic: H256) -> Address {
 
 fn is_native_gas_tank_top_up(from: Address, to: Address, gas_tank_address: Address) -> bool {
     from == gas_tank_address && to != gas_tank_address
+}
+
+fn fee_ratio_too_high_u256(fee: U256, total: U256, max_ratio: f64) -> bool {
+    if total.is_zero() || !max_ratio.is_finite() || max_ratio <= 0.0 || max_ratio >= 1.0 {
+        return false;
+    }
+    let fee_f = u256_to_f64_lossy(fee);
+    let total_f = u256_to_f64_lossy(total);
+    if total_f <= 0.0 {
+        return false;
+    }
+    fee_f / total_f > max_ratio
+}
+
+fn ratio_percent_u256(fee: U256, total: U256) -> f64 {
+    let total_f = u256_to_f64_lossy(total);
+    if total_f <= 0.0 {
+        return 0.0;
+    }
+    u256_to_f64_lossy(fee) / total_f * 100.0
+}
+
+fn u256_to_f64_lossy(value: U256) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(f64::MAX)
 }
 
 fn multiply_u256_by_f64(value: U256, multiplier: f64) -> U256 {

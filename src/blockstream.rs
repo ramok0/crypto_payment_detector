@@ -261,6 +261,7 @@ impl ChainDetector {
                     destination: destination.clone(),
                     fee_rate_sats_per_vb: config.sweep_fee_rate_sats_per_vb.max(1),
                     min_sweep_sat: config.sweep_min_sat,
+                    max_fee_ratio: config.sweep_max_fee_ratio,
                 };
                 validate_sweep_config(&candidate)?;
                 log::info!(
@@ -807,6 +808,7 @@ impl ChainDetector {
                 .collect()
         };
 
+        let mut deferred_txids: HashSet<String> = HashSet::new();
         for pending in &ready {
             let confs = tip_height.saturating_sub(pending.block_height) + 1;
             let mut enriched = pending.payment.clone();
@@ -816,6 +818,15 @@ impl ChainDetector {
                 .maybe_sweep(pending.payment.derivation_index, &pending.payment.address)
                 .await
             {
+                if result.deferred {
+                    log::info!(
+                        "[{}] Sweep deferred for txid {} - keeping in pending until next cycle",
+                        ticker,
+                        pending.payment.txid
+                    );
+                    deferred_txids.insert(pending.payment.txid.clone());
+                    continue;
+                }
                 if let Some(destination) = self.sweep_destination() {
                     enriched.swept_to_address = Some(destination.to_string());
                 }

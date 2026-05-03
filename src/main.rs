@@ -123,6 +123,18 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(5_000)
         },
+        sweep_max_fee_ratio: {
+            let chain_var = match chain {
+                Chain::Bitcoin => "BTC_MAX_FEE_RATIO",
+                Chain::Litecoin => "LTC_MAX_FEE_RATIO",
+                _ => "",
+            };
+            std::env::var(chain_var)
+                .or_else(|_| std::env::var("MAX_FEE_RATIO"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0.10)
+        },
     }
 }
 
@@ -187,6 +199,11 @@ fn build_ethereum_config() -> EthereumConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1.25),
+        max_fee_ratio: std::env::var("ETH_MAX_FEE_RATIO")
+            .or_else(|_| std::env::var("MAX_FEE_RATIO"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.10),
     }
 }
 
@@ -246,6 +263,12 @@ fn build_solana_config() -> SolanaConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(900),
+        max_fee_ratio: std::env::var("SOLANA_MAX_FEE_RATIO")
+            .or_else(|_| std::env::var("SOL_MAX_FEE_RATIO"))
+            .or_else(|_| std::env::var("MAX_FEE_RATIO"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.10),
     }
 }
 
