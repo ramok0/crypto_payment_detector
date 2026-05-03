@@ -100,7 +100,12 @@ Each chain has its own JSON state file (atomic write via `.tmp + rename`). Re-pa
 2. The detector will automatically derive the ATA for each managed wallet and start monitoring.
 3. The destination ATA (= ATA of `SOLANA_DEPOSIT_ADDRESS` for that mint) **must already exist** before the first sweep. The detector does not create it.
 
-Custom tokens use `is_usd_pegged_token(symbol)` for fiat conversion: if the symbol matches USDC/USDT/DAI/BUSD/TUSD/USDP/GUSD/PYUSD it's treated as USD-pegged and converted via `SOL/fiat / SOL/USD`. Otherwise no fiat enrichment.
+Custom tokens use `token_peg_currency(symbol)` for fiat conversion:
+- USD-pegged (`USDC|USDT|DAI|BUSD|TUSD|USDP|GUSD|PYUSD`): converted via `SOL/fiat ÷ SOL/USD`.
+- EUR-pegged (`EURC|EURT|AGEUR|EURE|EUROE`): converted via `SOL/fiat ÷ SOL/EUR` (using `sol_eur_fetcher` / `eth_eur_fetcher`).
+- Other symbols: no fiat enrichment, ratio guard skipped (sweep proceeds without check).
+
+Adding a new peg currency: add the symbol to `is_xxx_pegged_token`, extend `token_peg_currency`, add a price fetcher in the detector struct, and extend `sol_peg_price` / `eth_peg_price` match. Kraken supports SOL/USD, SOL/EUR, ETH/USD, ETH/EUR out of the box; for other quote currencies update [src/pricing.rs](src/pricing.rs).
 
 ## Adding a new ERC-20 token
 

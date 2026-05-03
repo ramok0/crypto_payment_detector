@@ -99,6 +99,13 @@ fn resolve_ttl(requested: Option<u64>, default: u64) -> u64 {
     }
 }
 
+fn log_ttl_resolution(chain: &str, user_id: &str, requested: Option<u64>, default: u64, applied: u64) {
+    log::info!(
+        "[{}] TTL resolution for user_id={}: requested={:?}, default={}s, applied={}s",
+        chain, user_id, requested, default, applied
+    );
+}
+
 fn default_count() -> u32 {
     1
 }
@@ -361,6 +368,13 @@ async fn handle_solana_reserve(
     };
 
     let ttl = resolve_ttl(payload.ttl_secs, solana_pool.reservation_ttl_secs);
+    log_ttl_resolution(
+        "SOL",
+        &payload.user_id,
+        payload.ttl_secs,
+        solana_pool.reservation_ttl_secs,
+        ttl,
+    );
     let reservation = reserve_wallet_for_user(
         &solana_pool.redis_url,
         &solana_pool.wallets,
@@ -414,6 +428,13 @@ async fn handle_ethereum_reserve(
     };
 
     let ttl = resolve_ttl(payload.ttl_secs, ethereum_pool.reservation_ttl_secs);
+    log_ttl_resolution(
+        "ETH",
+        &payload.user_id,
+        payload.ttl_secs,
+        ethereum_pool.reservation_ttl_secs,
+        ttl,
+    );
     let reservation = reserve_ethereum_wallet_for_user(
         &ethereum_pool.redis_url,
         &ethereum_pool.wallets,
@@ -995,13 +1016,14 @@ async fn main() {
                     );
 
                     log::info!(
-                        "[SOL] Detector started - ledger: {} - gas tank: {} - managed wallets: {} - tokens: {}",
+                        "[SOL] Detector started - ledger: {} - gas tank: {} - managed wallets: {} - tokens: {} - default reservation TTL: {}s",
                         detector.ledger_address(),
                         detector
                             .gas_tank_address()
                             .unwrap_or_else(|| "<not configured>".to_string()),
                         detector.wallet_count(),
-                        detector.token_count()
+                        detector.token_count(),
+                        config.reservation_ttl_secs
                     );
                     for (symbol, mint, decimals) in detector.token_summary() {
                         log::info!(
@@ -1039,11 +1061,12 @@ async fn main() {
                         .expect("Failed to build Ethereum pool state");
 
                 log::info!(
-                    "[ETH] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {}",
+                    "[ETH] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {} - default reservation TTL: {}s",
                     gas_tank_address,
                     detector.ledger_address(),
                     detector.wallet_count(),
-                    detector.token_count()
+                    detector.token_count(),
+                    config.reservation_ttl_secs
                 );
 
                 let detector_handle = detector.clone();

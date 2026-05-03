@@ -118,6 +118,7 @@ pub struct EthereumDetector {
     webhook_client: reqwest::Client,
     price_fetcher: PriceFetcher,
     eth_usd_fetcher: PriceFetcher,
+    eth_eur_fetcher: PriceFetcher,
     state: Arc<Mutex<EthereumState>>,
 }
 
@@ -190,6 +191,7 @@ impl EthereumDetector {
             Chain::Ethereum,
         );
         let eth_usd_fetcher = PriceFetcher::new(webhook_client.clone(), "USD", Chain::Ethereum);
+        let eth_eur_fetcher = PriceFetcher::new(webhook_client.clone(), "EUR", Chain::Ethereum);
         let state = load_ethereum_state(&config.state_file);
 
         Ok(Self {
@@ -203,6 +205,7 @@ impl EthereumDetector {
             webhook_client,
             price_fetcher,
             eth_usd_fetcher,
+            eth_eur_fetcher,
             state: Arc::new(Mutex::new(state)),
         })
     }
@@ -868,24 +871,26 @@ impl EthereumDetector {
             multiply_u256_by_f64(gas_limit * gas_price, self.config.gas_top_up_multiplier);
 
         if let Some(token) = self.tokens.iter().find(|t| t.contract == contract) {
-            if is_usd_pegged_token(&token.symbol) {
-                let amount_usd =
+            if let Some(peg) = token_peg_currency(&token.symbol) {
+                let amount_pegged =
                     u256_to_units_f64(amount, token.decimals.max(1)).max(0.0);
-                if amount_usd > 0.0 {
-                    match self.eth_usd_fetcher.get_price().await {
-                        Ok(eth_usd) if eth_usd > 0.0 => {
+                if amount_pegged > 0.0 {
+                    match self.eth_peg_price(peg).await {
+                        Ok(eth_peg) if eth_peg > 0.0 => {
                             let fee_eth = u256_to_units_f64(needed_fee, ETH_DECIMALS);
-                            let fee_usd = fee_eth * eth_usd;
-                            if fee_usd
-                                > amount_usd * self.config.max_fee_ratio
+                            let fee_pegged = fee_eth * eth_peg;
+                            if fee_pegged
+                                > amount_pegged * self.config.max_fee_ratio
                             {
                                 log::info!(
-                                    "[ETH] Deferring {} sweep for {}: fee ~${:.2} would be {:.1}% of swept ~${:.2} (max {:.1}%) - retry when gas drops",
+                                    "[ETH] Deferring {} sweep for {}: fee ~{:.2}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%) - retry when gas drops",
                                     token.symbol,
                                     address,
-                                    fee_usd,
-                                    fee_usd / amount_usd * 100.0,
-                                    amount_usd,
+                                    fee_pegged,
+                                    peg,
+                                    fee_pegged / amount_pegged * 100.0,
+                                    amount_pegged,
+                                    peg,
                                     self.config.max_fee_ratio * 100.0
                                 );
                                 return Ok(SweepResult {
@@ -898,8 +903,8 @@ impl EthereumDetector {
                         Ok(_) => {}
                         Err(error) => {
                             log::warn!(
-                                "[ETH] Skipping fee-ratio check for {} sweep: failed to fetch ETH/USD: {}",
-                                token.symbol, error
+                                "[ETH] Skipping fee-ratio check for {} sweep: failed to fetch ETH/{}: {}",
+                                token.symbol, peg, error
                             );
                         }
                     }
@@ -1130,19 +1135,21 @@ impl EthereumDetector {
                 )));
             }
 
-            if is_usd_pegged_token(&token.symbol) {
-                let amount_usd = u256_to_units_f64(balance, token.decimals.max(1));
-                if amount_usd > 0.0 {
-                    if let Ok(eth_usd) = self.eth_usd_fetcher.get_price().await {
-                        if eth_usd > 0.0 {
-                            let fee_usd = u256_to_units_f64(fee, ETH_DECIMALS) * eth_usd;
-                            if fee_usd > amount_usd * self.config.max_fee_ratio {
+            if let Some(peg) = token_peg_currency(&token.symbol) {
+                let amount_pegged = u256_to_units_f64(balance, token.decimals.max(1));
+                if amount_pegged > 0.0 {
+                    if let Ok(eth_peg) = self.eth_peg_price(peg).await {
+                        if eth_peg > 0.0 {
+                            let fee_pegged = u256_to_units_f64(fee, ETH_DECIMALS) * eth_peg;
+                            if fee_pegged > amount_pegged * self.config.max_fee_ratio {
                                 log::info!(
-                                    "[ETH] Deferring gas tank {} sweep to ledger: fee ~${:.2} would be {:.1}% of swept ~${:.2} (max {:.1}%)",
+                                    "[ETH] Deferring gas tank {} sweep to ledger: fee ~{:.2}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%)",
                                     token.symbol,
-                                    fee_usd,
-                                    fee_usd / amount_usd * 100.0,
-                                    amount_usd,
+                                    fee_pegged,
+                                    peg,
+                                    fee_pegged / amount_pegged * 100.0,
+                                    amount_pegged,
+                                    peg,
                                     self.config.max_fee_ratio * 100.0
                                 );
                                 continue;
@@ -1370,8 +1377,8 @@ impl EthereumDetector {
                     log::warn!("[ETH] Failed to fetch ETH price: {error}");
                 }
             }
-        } else if is_usd_pegged_token(&payment.ticker) {
-            match self.usd_to_configured_fiat_rate().await {
+        } else if let Some(peg) = token_peg_currency(&payment.ticker) {
+            match self.peg_to_configured_fiat_rate(peg).await {
                 Ok(rate) => {
                     payment.coin_price = Some(rate);
                     payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
@@ -1379,8 +1386,9 @@ impl EthereumDetector {
                 }
                 Err(error) => {
                     log::warn!(
-                        "[ETH] Failed to convert {} from USD peg to {}: {error}",
+                        "[ETH] Failed to convert {} from {} peg to {}: {error}",
                         payment.ticker,
+                        peg,
                         self.price_fetcher.currency()
                     );
                 }
@@ -1388,14 +1396,24 @@ impl EthereumDetector {
         }
     }
 
-    async fn usd_to_configured_fiat_rate(&self) -> Result<f64, DetectorError> {
-        if self.price_fetcher.currency() == "USD" {
+    async fn peg_to_configured_fiat_rate(&self, peg: &str) -> Result<f64, DetectorError> {
+        let peg_upper = peg.to_ascii_uppercase();
+        if self.price_fetcher.currency() == peg_upper {
             return Ok(1.0);
         }
-
         let eth_fiat = self.price_fetcher.get_price().await?;
-        let eth_usd = self.eth_usd_fetcher.get_price().await?;
-        usd_to_fiat_rate_from_eth_prices(eth_fiat, eth_usd)
+        let eth_peg = self.eth_peg_price(&peg_upper).await?;
+        usd_to_fiat_rate_from_eth_prices(eth_fiat, eth_peg)
+    }
+
+    async fn eth_peg_price(&self, peg: &str) -> Result<f64, DetectorError> {
+        match peg.to_ascii_uppercase().as_str() {
+            "USD" => self.eth_usd_fetcher.get_price().await,
+            "EUR" => self.eth_eur_fetcher.get_price().await,
+            other => Err(DetectorError::ApiError(format!(
+                "No ETH/{other} price source available for stablecoin conversion"
+            ))),
+        }
     }
 
     fn is_known_event(&self, event_id: &str) -> bool {
@@ -1722,6 +1740,23 @@ fn is_usd_pegged_token(symbol: &str) -> bool {
         symbol.trim().to_ascii_uppercase().as_str(),
         "USDC" | "USDT" | "DAI" | "BUSD" | "TUSD" | "USDP" | "GUSD" | "PYUSD"
     )
+}
+
+fn is_eur_pegged_token(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "EURC" | "EURT" | "AGEUR" | "EURE" | "EUROE"
+    )
+}
+
+fn token_peg_currency(symbol: &str) -> Option<&'static str> {
+    if is_usd_pegged_token(symbol) {
+        Some("USD")
+    } else if is_eur_pegged_token(symbol) {
+        Some("EUR")
+    } else {
+        None
+    }
 }
 
 fn u256_to_units_f64(value: U256, decimals: u8) -> f64 {

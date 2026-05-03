@@ -109,6 +109,7 @@ pub struct SolanaDetector {
     webhook_client: reqwest::Client,
     price_fetcher: PriceFetcher,
     sol_usd_fetcher: PriceFetcher,
+    sol_eur_fetcher: PriceFetcher,
     state: Arc<Mutex<SolanaState>>,
 }
 
@@ -381,6 +382,7 @@ impl SolanaDetector {
                 Chain::Solana,
             ),
             sol_usd_fetcher: PriceFetcher::new(webhook_client.clone(), "USD", Chain::Solana),
+            sol_eur_fetcher: PriceFetcher::new(webhook_client.clone(), "EUR", Chain::Solana),
             config,
             wallets,
             tokens,
@@ -770,11 +772,11 @@ impl SolanaDetector {
             };
 
             let amount_coin = amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
-            if is_usd_pegged_token(&token.symbol)
+            if is_fiat_pegged_token(&token.symbol)
                 && self.config.min_deposit_fiat > 0.0
                 && amount_coin > 0.0
             {
-                if let Ok(rate) = self.usd_to_configured_fiat_rate().await {
+                if let Some(rate) = self.token_to_configured_fiat_rate(&token.symbol).await {
                     let fiat_value = amount_coin * rate;
                     if fiat_value < self.config.min_deposit_fiat {
                         log::info!(
@@ -979,8 +981,8 @@ impl SolanaDetector {
                         token_contract: Some(mint_str.to_string()),
                     };
 
-                    if is_usd_pegged_token(symbol) {
-                        if let Ok(rate) = self.usd_to_configured_fiat_rate().await {
+                    if is_fiat_pegged_token(symbol) {
+                        if let Some(rate) = self.token_to_configured_fiat_rate(symbol).await {
                             payment.coin_price = Some(rate);
                             payment.fiat_currency =
                                 Some(self.price_fetcher.currency().to_string());
@@ -1259,30 +1261,35 @@ impl SolanaDetector {
             });
         }
 
-        if is_usd_pegged_token(symbol) && self.config.max_fee_ratio > 0.0 {
-            let amount_usd = amount as f64 / 10f64.powi(i32::from(decimals));
-            if amount_usd > 0.0 {
-                if let Ok(sol_usd) = self.sol_usd_fetcher.get_price().await {
-                    if sol_usd > 0.0 {
-                        // tx fee only (~5000 lamports). Don't include rent for ATA creation
-                        // since that's a one-time bootstrap cost amortized over future sweeps.
-                        let fee_lamports = 5_000u64;
-                        let fee_usd = (fee_lamports as f64 / 1_000_000_000.0) * sol_usd;
-                        if fee_usd > amount_usd * self.config.max_fee_ratio {
-                            log::info!(
-                                "[SOL] Deferring {} sweep for {}: fee ~${:.4} would be {:.1}% of swept ~${:.2} (max {:.1}%)",
-                                symbol,
-                                owner_address,
-                                fee_usd,
-                                fee_usd / amount_usd * 100.0,
-                                amount_usd,
-                                self.config.max_fee_ratio * 100.0
-                            );
-                            return Ok(SweepResult {
-                                amount_base_units: 0,
-                                txid: None,
-                                deferred: true,
-                            });
+        if let Some(peg) = token_peg_currency(symbol) {
+            if self.config.max_fee_ratio > 0.0 {
+                let amount_pegged = amount as f64 / 10f64.powi(i32::from(decimals));
+                if amount_pegged > 0.0 {
+                    if let Ok(sol_peg) = self.sol_peg_price(peg).await {
+                        if sol_peg > 0.0 {
+                            // tx fee only (~5000 lamports). Don't include rent for ATA creation
+                            // since that's a one-time bootstrap cost amortized over future sweeps.
+                            let fee_lamports = 5_000u64;
+                            let fee_pegged =
+                                (fee_lamports as f64 / 1_000_000_000.0) * sol_peg;
+                            if fee_pegged > amount_pegged * self.config.max_fee_ratio {
+                                log::info!(
+                                    "[SOL] Deferring {} sweep for {}: fee ~{:.4}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%)",
+                                    symbol,
+                                    owner_address,
+                                    fee_pegged,
+                                    peg,
+                                    fee_pegged / amount_pegged * 100.0,
+                                    amount_pegged,
+                                    peg,
+                                    self.config.max_fee_ratio * 100.0
+                                );
+                                return Ok(SweepResult {
+                                    amount_base_units: 0,
+                                    txid: None,
+                                    deferred: true,
+                                });
+                            }
                         }
                     }
                 }
@@ -1403,18 +1410,34 @@ impl SolanaDetector {
         })
     }
 
-    async fn usd_to_configured_fiat_rate(&self) -> Result<f64, DetectorError> {
-        if self.price_fetcher.currency() == "USD" {
+    async fn peg_to_configured_fiat_rate(&self, peg: &str) -> Result<f64, DetectorError> {
+        let peg_upper = peg.to_ascii_uppercase();
+        if self.price_fetcher.currency() == peg_upper {
             return Ok(1.0);
         }
         let sol_fiat = self.price_fetcher.get_price().await?;
-        let sol_usd = self.sol_usd_fetcher.get_price().await?;
-        if !sol_fiat.is_finite() || sol_fiat <= 0.0 || !sol_usd.is_finite() || sol_usd <= 0.0 {
-            return Err(DetectorError::ApiError(
-                "Invalid SOL price for stablecoin conversion".into(),
-            ));
+        let sol_peg = self.sol_peg_price(&peg_upper).await?;
+        if !sol_fiat.is_finite() || sol_fiat <= 0.0 || !sol_peg.is_finite() || sol_peg <= 0.0 {
+            return Err(DetectorError::ApiError(format!(
+                "Invalid SOL/{peg_upper} price for stablecoin conversion"
+            )));
         }
-        Ok(sol_fiat / sol_usd)
+        Ok(sol_fiat / sol_peg)
+    }
+
+    async fn sol_peg_price(&self, peg: &str) -> Result<f64, DetectorError> {
+        match peg.to_ascii_uppercase().as_str() {
+            "USD" => self.sol_usd_fetcher.get_price().await,
+            "EUR" => self.sol_eur_fetcher.get_price().await,
+            other => Err(DetectorError::ApiError(format!(
+                "No SOL/{other} price source available for stablecoin conversion"
+            ))),
+        }
+    }
+
+    async fn token_to_configured_fiat_rate(&self, symbol: &str) -> Option<f64> {
+        let peg = token_peg_currency(symbol)?;
+        self.peg_to_configured_fiat_rate(peg).await.ok()
     }
 
     async fn estimate_transfer_fee(
@@ -1816,6 +1839,27 @@ fn is_usd_pegged_token(symbol: &str) -> bool {
         symbol.trim().to_ascii_uppercase().as_str(),
         "USDC" | "USDT" | "DAI" | "BUSD" | "TUSD" | "USDP" | "GUSD" | "PYUSD"
     )
+}
+
+fn is_eur_pegged_token(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "EURC" | "EURT" | "AGEUR" | "EURE" | "EUROE"
+    )
+}
+
+fn is_fiat_pegged_token(symbol: &str) -> bool {
+    is_usd_pegged_token(symbol) || is_eur_pegged_token(symbol)
+}
+
+fn token_peg_currency(symbol: &str) -> Option<&'static str> {
+    if is_usd_pegged_token(symbol) {
+        Some("USD")
+    } else if is_eur_pegged_token(symbol) {
+        Some("EUR")
+    } else {
+        None
+    }
 }
 
 fn fee_ratio_too_high(fee: u64, total: u64, max_ratio: f64) -> bool {
