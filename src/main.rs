@@ -356,12 +356,18 @@ async fn main() {
 
                 println!("Solana Payment Detector starting");
                 println!("  Chain: SOL");
+                println!("  Cold/ledger destination: {}", detector.ledger_address());
                 println!(
-                    "  Sweep destination: {}",
-                    detector.derive_address(0).unwrap()
+                    "  Gas tank address: {}",
+                    detector
+                        .gas_tank_address()
+                        .unwrap_or_else(|| "<not configured>".to_string())
                 );
                 println!("  Managed wallet count: {}", detector.wallet_count());
                 println!("  SPL token count: {}", detector.token_count());
+                for (symbol, mint, decimals) in detector.token_summary() {
+                    println!("    - {} mint={} decimals={}", symbol, mint, decimals);
+                }
                 println!();
 
                 let detector_handle = detector.clone();

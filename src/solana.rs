@@ -145,6 +145,16 @@ struct RpcMeta {
     pre_token_balances: Vec<RpcTokenBalance>,
     #[serde(default, rename = "postTokenBalances")]
     post_token_balances: Vec<RpcTokenBalance>,
+    #[serde(default, rename = "loadedAddresses")]
+    loaded_addresses: Option<RpcLoadedAddresses>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct RpcLoadedAddresses {
+    #[serde(default)]
+    writable: Vec<String>,
+    #[serde(default)]
+    readonly: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -386,6 +396,21 @@ impl SolanaDetector {
 
     pub fn token_count(&self) -> usize {
         self.tokens.len()
+    }
+
+    pub fn token_summary(&self) -> Vec<(String, String, u8)> {
+        self.tokens
+            .iter()
+            .map(|t| (t.symbol.clone(), t.mint.to_string(), t.decimals))
+            .collect()
+    }
+
+    pub fn gas_tank_address(&self) -> Option<String> {
+        self.gas_tank_pubkey.map(|pk| pk.to_string())
+    }
+
+    pub fn ledger_address(&self) -> String {
+        self.ledger_pubkey.to_string()
     }
 
     fn ata_for_wallet(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
@@ -697,10 +722,23 @@ impl SolanaDetector {
         let ata = self.ata_for_wallet(owner, &token.mint);
         let ata_string = ata.to_string();
 
+        log::debug!(
+            "[SOL] Scanning {} ATA {} for reservation {} (mint={})",
+            token.symbol, ata_string, reservation.address, token.mint
+        );
+
         let new_signatures = self.get_new_signatures(&ata_string).await?;
         if new_signatures.is_empty() {
             return Ok(());
         }
+
+        log::info!(
+            "[SOL] Found {} new {} signature(s) on ATA {} (owner={})",
+            new_signatures.len(),
+            token.symbol,
+            ata_string,
+            reservation.address
+        );
 
         let mint_string = token.mint.to_string();
         let owner_string = owner.to_string();
@@ -720,6 +758,10 @@ impl SolanaDetector {
                 &mint_string,
                 &ata_string,
             ) else {
+                log::info!(
+                    "[SOL] {} tx {} on ata {} produced no positive balance change for owner {} (likely outgoing transfer or zero-amount)",
+                    token.symbol, sig.signature, ata_string, owner_string
+                );
                 self.update_last_processed_signature(&ata_string, &sig.signature)?;
                 continue;
             };
@@ -1672,12 +1714,22 @@ fn matches_owner_balance(balance: &RpcTokenBalance, owner: &str) -> bool {
 }
 
 fn account_at_index(result: &RpcTransactionResult, index: u32) -> Option<&str> {
-    result
-        .transaction
-        .message
-        .account_keys
-        .get(index as usize)
-        .map(|key| key.pubkey())
+    let static_keys = &result.transaction.message.account_keys;
+    let static_len = static_keys.len();
+    let idx = index as usize;
+
+    if idx < static_len {
+        return static_keys.get(idx).map(|key| key.pubkey());
+    }
+
+    let loaded = result.meta.as_ref()?.loaded_addresses.as_ref()?;
+    let writable_idx = idx - static_len;
+    if writable_idx < loaded.writable.len() {
+        return loaded.writable.get(writable_idx).map(String::as_str);
+    }
+
+    let readonly_idx = writable_idx - loaded.writable.len();
+    loaded.readonly.get(readonly_idx).map(String::as_str)
 }
 
 fn is_usd_pegged_token(symbol: &str) -> bool {

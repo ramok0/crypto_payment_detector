@@ -940,11 +940,20 @@ async fn main() {
                     );
 
                     log::info!(
-                        "[SOL] Detector started - sweep destination: {} - managed wallets: {} - tokens: {}",
-                        detector.derive_address(0).unwrap(),
+                        "[SOL] Detector started - ledger: {} - gas tank: {} - managed wallets: {} - tokens: {}",
+                        detector.ledger_address(),
+                        detector
+                            .gas_tank_address()
+                            .unwrap_or_else(|| "<not configured>".to_string()),
                         detector.wallet_count(),
                         detector.token_count()
                     );
+                    for (symbol, mint, decimals) in detector.token_summary() {
+                        log::info!(
+                            "[SOL] SPL token configured: {} mint={} decimals={}",
+                            symbol, mint, decimals
+                        );
+                    }
 
                     let detector_handle = detector.clone();
                     detector_handles.push(tokio::spawn(async move {
