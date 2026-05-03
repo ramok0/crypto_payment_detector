@@ -254,6 +254,21 @@ fn build_evm_config(chain: Chain) -> EthereumConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.10),
+        // Public Base RPC (mainnet.base.org) returns -32016 "over rate limit"
+        // under burst load (orphan sweep on a 10-wallet pool). 200ms ≈ 5 req/s
+        // is a safe default for the public endpoint. Mainnet Ethereum users
+        // typically have a paid endpoint and don't need throttling — default 0.
+        // Override per-chain: ETH_RPC_MIN_REQUEST_INTERVAL_MS / BASE_RPC_MIN_REQUEST_INTERVAL_MS.
+        rpc_min_request_interval_ms: std::env::var(format!(
+            "{prefix}_RPC_MIN_REQUEST_INTERVAL_MS"
+        ))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(match chain {
+            Chain::Ethereum => 0,
+            Chain::Base => 200,
+            _ => 0,
+        }),
         etherscan,
     }
 }

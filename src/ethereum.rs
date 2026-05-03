@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ethers::middleware::SignerMiddleware;
 use ethers::providers::{Http, Middleware, Provider};
@@ -63,6 +63,13 @@ pub struct EthereumConfig {
     pub token_transfer_gas_limit: u64,
     pub gas_top_up_multiplier: f64,
     pub max_fee_ratio: f64,
+    /// Minimum gap (milliseconds) between successive JSON-RPC requests issued
+    /// by this detector. Acts as a client-side rate limiter so public RPCs
+    /// (e.g. `mainnet.base.org`) don't return `-32016 over rate limit` during
+    /// hot loops like the orphan sweep. Set to 0 to disable. Defaults differ
+    /// per chain at the binary level — paid Ethereum endpoints typically use
+    /// 0; the public Base RPC needs ~150-300ms.
+    pub rpc_min_request_interval_ms: u64,
     /// Optional Etherscan client config. When set, the detector also scans
     /// internal CALL traces for native ETH (e.g. Coinbase withdrawals routed
     /// through their hot-wallet contract) which are invisible to
@@ -131,6 +138,12 @@ pub struct EthereumDetector {
     eth_eur_fetcher: PriceFetcher,
     etherscan: Option<EtherscanClient>,
     state: Arc<Mutex<EthereumState>>,
+    /// Client-side rate limiter for the JSON-RPC provider. The mutex is
+    /// async (`tokio`) so callers from different tasks serialize through
+    /// `acquire_rpc_slot` — holding the mutex across `sleep + send` is
+    /// intentional, otherwise concurrent calls would bypass the gap.
+    rpc_throttle: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    rpc_min_interval: Duration,
 }
 
 impl EthereumDetector {
@@ -238,6 +251,14 @@ impl EthereumDetector {
         };
 
         let state = load_ethereum_state(config.chain, &config.state_file);
+        let rpc_min_interval = Duration::from_millis(config.rpc_min_request_interval_ms);
+        if !rpc_min_interval.is_zero() {
+            log::info!(
+                "[{}] RPC throttle: min interval {}ms between JSON-RPC requests",
+                chain_ticker,
+                rpc_min_interval.as_millis()
+            );
+        }
 
         Ok(Self {
             config,
@@ -253,7 +274,65 @@ impl EthereumDetector {
             eth_eur_fetcher,
             etherscan,
             state: Arc::new(Mutex::new(state)),
+            rpc_throttle: Arc::new(tokio::sync::Mutex::new(None)),
+            rpc_min_interval,
         })
+    }
+
+    /// Block until the next JSON-RPC request is allowed under the configured
+    /// minimum interval. No-op when `rpc_min_interval` is zero. Holds the
+    /// mutex across `sleep` so concurrent callers serialize properly — a
+    /// drop-then-sleep would let a second task race in during the gap.
+    async fn acquire_rpc_slot(&self) {
+        if self.rpc_min_interval.is_zero() {
+            // Still update the timestamp so a future change to a non-zero
+            // interval would be respected — but skip the sleep path.
+            let mut last = self.rpc_throttle.lock().await;
+            *last = Some(Instant::now());
+            return;
+        }
+        let mut last = self.rpc_throttle.lock().await;
+        if let Some(previous) = *last {
+            let elapsed = previous.elapsed();
+            if elapsed < self.rpc_min_interval {
+                tokio::time::sleep(self.rpc_min_interval - elapsed).await;
+            }
+        }
+        *last = Some(Instant::now());
+    }
+
+    /// Run an RPC call through the throttle, retrying on transient
+    /// rate-limit / overload errors with exponential backoff. Non-rate-limit
+    /// errors propagate immediately. Use for every `self.provider.*().await`
+    /// call site in the detector.
+    async fn with_rpc_retry<F, Fut, T>(&self, op: &str, mut f: F) -> Result<T, DetectorError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, DetectorError>>,
+    {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut delay = Duration::from_millis(500);
+        for attempt in 0..MAX_ATTEMPTS {
+            self.acquire_rpc_slot().await;
+            match f().await {
+                Ok(value) => return Ok(value),
+                Err(err) if attempt + 1 < MAX_ATTEMPTS && is_rpc_rate_limit_error(&err) => {
+                    log::warn!(
+                        "[{}] {} rate-limited (attempt {}/{}); backing off {}ms — error: {}",
+                        self.config.chain.ticker(),
+                        op,
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                        delay.as_millis(),
+                        err
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(8));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("with_rpc_retry loop should return inside the for body")
     }
 
     pub fn wallet_count(&self) -> usize {
@@ -501,10 +580,13 @@ impl EthereumDetector {
 
         for block_number in from_block..=to_block {
             let block = self
-                .provider
-                .get_block_with_txs(block_number)
-                .await
-                .map_err(|e| eth_rpc_error("eth_getBlockByNumber", e))?;
+                .with_rpc_retry("eth_getBlockByNumber", || async {
+                    self.provider
+                        .get_block_with_txs(block_number)
+                        .await
+                        .map_err(|e| eth_rpc_error("eth_getBlockByNumber", e))
+                })
+                .await?;
             let Some(block) = block else {
                 continue;
             };
@@ -582,10 +664,13 @@ impl EthereumDetector {
                 .topic2(ValueOrArray::Array(to_topics.clone()));
 
             let logs = self
-                .provider
-                .get_logs(&filter)
-                .await
-                .map_err(|e| eth_rpc_error("eth_getLogs", e))?;
+                .with_rpc_retry("eth_getLogs", || async {
+                    self.provider
+                        .get_logs(&filter)
+                        .await
+                        .map_err(|e| eth_rpc_error("eth_getLogs", e))
+                })
+                .await?;
 
             for log in logs {
                 if log.topics.len() < 3 || log.data.0.len() != 32 {
@@ -860,10 +945,13 @@ impl EthereumDetector {
             ))
         })?;
         let Some(tx) = self
-            .provider
-            .get_transaction(tx_hash)
-            .await
-            .map_err(|e| eth_rpc_error("eth_getTransactionByHash", e))?
+            .with_rpc_retry("eth_getTransactionByHash", || async {
+                self.provider
+                    .get_transaction(tx_hash)
+                    .await
+                    .map_err(|e| eth_rpc_error("eth_getTransactionByHash", e))
+            })
+            .await?
         else {
             return Ok(false);
         };
@@ -1327,6 +1415,13 @@ impl EthereumDetector {
         wallet: LocalWallet,
         tx: TransactionRequest,
     ) -> Result<String, DetectorError> {
+        // SignerMiddleware::send_transaction issues several JSON-RPC calls
+        // internally (eth_chainId, eth_estimateGas, eth_gasPrice, eth_getTxCount,
+        // eth_sendRawTransaction). Acquiring one slot is enough for back-pressure
+        // — we don't retry the whole send because eth_sendRawTransaction may
+        // have already submitted the tx (a retry would risk a double-spend with
+        // an incremented nonce).
+        self.acquire_rpc_slot().await;
         let client = SignerMiddleware::new(self.provider.clone(), wallet);
         let pending = client
             .send_transaction(tx, None)
@@ -1362,25 +1457,34 @@ impl EthereumDetector {
             .value(U256::zero())
             .data(erc20_transfer_data(to, amount));
         let typed: TypedTransaction = tx.into();
-        self.provider
-            .estimate_gas(&typed, None)
-            .await
-            .map_err(|e| eth_rpc_error("eth_estimateGas", e))
+        self.with_rpc_retry("eth_estimateGas", || async {
+            self.provider
+                .estimate_gas(&typed, None)
+                .await
+                .map_err(|e| eth_rpc_error("eth_estimateGas", e))
+        })
+        .await
     }
 
     async fn current_block_number(&self) -> Result<u64, DetectorError> {
-        self.provider
-            .get_block_number()
-            .await
-            .map(|block| block.as_u64())
-            .map_err(|e| eth_rpc_error("eth_blockNumber", e))
+        self.with_rpc_retry("eth_blockNumber", || async {
+            self.provider
+                .get_block_number()
+                .await
+                .map(|block| block.as_u64())
+                .map_err(|e| eth_rpc_error("eth_blockNumber", e))
+        })
+        .await
     }
 
     async fn eth_balance(&self, address: Address) -> Result<U256, DetectorError> {
-        self.provider
-            .get_balance(address, None)
-            .await
-            .map_err(|e| eth_rpc_error("eth_getBalance", e))
+        self.with_rpc_retry("eth_getBalance", || async {
+            self.provider
+                .get_balance(address, None)
+                .await
+                .map_err(|e| eth_rpc_error("eth_getBalance", e))
+        })
+        .await
     }
 
     async fn erc20_balance(
@@ -1393,10 +1497,13 @@ impl EthereumDetector {
             .data(erc20_balance_of_data(owner));
         let typed: TypedTransaction = tx.into();
         let response = self
-            .provider
-            .call(&typed, None)
-            .await
-            .map_err(|e| eth_rpc_error("eth_call", e))?;
+            .with_rpc_retry("eth_call balanceOf", || async {
+                self.provider
+                    .call(&typed, None)
+                    .await
+                    .map_err(|e| eth_rpc_error("eth_call", e))
+            })
+            .await?;
 
         u256_from_erc20_return(&response).ok_or_else(|| {
             DetectorError::ApiError(format!(
@@ -1409,10 +1516,13 @@ impl EthereumDetector {
     }
 
     async fn gas_price(&self) -> Result<U256, DetectorError> {
-        self.provider
-            .get_gas_price()
-            .await
-            .map_err(|e| eth_rpc_error("eth_gasPrice", e))
+        self.with_rpc_retry("eth_gasPrice", || async {
+            self.provider
+                .get_gas_price()
+                .await
+                .map_err(|e| eth_rpc_error("eth_gasPrice", e))
+        })
+        .await
     }
 
     fn payment_to_webhook(
@@ -1610,17 +1720,30 @@ fn build_ethereum_provider(config: &EthereumConfig) -> Result<Provider<Http>, De
         .pool_max_idle_per_host(0)
         .connection_verbose(false);
 
+    let prefix = chain_env_prefix(config.chain);
     if let Some(ref proxy_url) = config.proxy_url {
         let proxy = reqwest_ethers::Proxy::all(proxy_url)
             .map_err(|e| DetectorError::InvalidConfig(format!("Invalid proxy URL: {e}")))?;
         client_builder = client_builder.proxy(proxy);
         log::info!(
-            "[{}] Using proxy: {}",
+            "[{}] RPC client using proxy {} (resolved from {prefix}_PROXY or PROXY env)",
             config.chain.ticker(),
             redact_url_credentials(proxy_url)
         );
     } else {
+        // Explicit no-op vs auto-pickup from HTTP_PROXY system env, which
+        // would be surprising. If you want a proxy for this chain's RPC, set
+        // {prefix}_PROXY (e.g. BASE_PROXY=http://...) or the global PROXY
+        // env. Etherscan deliberately ignores the proxy in [src/etherscan.rs]
+        // (the API key authenticates and most public proxies hit the WAF) —
+        // that is a different decision and should not be conflated.
         client_builder = client_builder.no_proxy();
+        log::info!(
+            "[{}] RPC client running without proxy (no {prefix}_PROXY/PROXY env set). \
+             Set one of those to route RPC through a proxy — useful when the public \
+             endpoint rate-limits your egress IP.",
+            config.chain.ticker()
+        );
     }
 
     let client = client_builder.build().map_err(|e| {
@@ -1943,6 +2066,31 @@ fn eth_rpc_error<E: std::fmt::Display>(context: &str, error: E) -> DetectorError
     DetectorError::ApiError(format!("Ethereum RPC {context} failed: {error}"))
 }
 
+/// Heuristic detection of transient RPC overload responses that should be
+/// retried. Covers:
+/// - JSON-RPC `-32016` "over rate limit" (Base public RPC, several others)
+/// - JSON-RPC `-32005` "request limit exceeded" (Infura, Alchemy)
+/// - JSON-RPC `-32603` overload variants (some providers)
+/// - HTTP 429 / "too many requests"
+/// - "service unavailable" / "503" / "502" / "timeout" — bursty failure modes
+///   that recover on retry; safer than blocking forward progress.
+fn is_rpc_rate_limit_error(err: &DetectorError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("over rate limit")
+        || msg.contains("rate limit")
+        || msg.contains("rate-limit")
+        || msg.contains("rate limited")
+        || msg.contains("-32016")
+        || msg.contains("-32005")
+        || msg.contains("request limit exceeded")
+        || msg.contains("too many requests")
+        || msg.contains("429")
+        || msg.contains("503 service")
+        || msg.contains("502 bad gateway")
+        || msg.contains("connection reset")
+        || msg.contains("connection refused")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,5 +2160,34 @@ mod tests {
         assert!((rate - 0.9).abs() < f64::EPSILON);
         assert!(usd_to_fiat_rate_from_eth_prices(0.0, 2_000.0).is_err());
         assert!(usd_to_fiat_rate_from_eth_prices(1_800.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn detects_rpc_rate_limit_errors() {
+        // Real-world payloads we've seen.
+        assert!(is_rpc_rate_limit_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_call failed: (code: -32016, message: over rate limit, data: None)"
+                .into()
+        )));
+        assert!(is_rpc_rate_limit_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_getLogs failed: HTTP 429 Too Many Requests".into()
+        )));
+        assert!(is_rpc_rate_limit_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_call failed: (code: -32005, message: request limit exceeded)".into()
+        )));
+        assert!(is_rpc_rate_limit_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_blockNumber failed: 503 Service Unavailable".into()
+        )));
+
+        // Should NOT match — these are real failures, not transient.
+        assert!(!is_rpc_rate_limit_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_estimateGas failed: execution reverted".into()
+        )));
+        assert!(!is_rpc_rate_limit_error(&DetectorError::ApiError(
+            "Ethereum RPC eth_call failed: (code: -32000, message: invalid argument)".into()
+        )));
+        assert!(!is_rpc_rate_limit_error(&DetectorError::InvalidConfig(
+            "ETH_LEDGER_ADDRESS missing".into()
+        )));
     }
 }

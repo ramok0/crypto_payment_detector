@@ -147,6 +147,8 @@ Base (mirrors the Ethereum env vars, just swap `ETH_` → `BASE_`):
 - `BASE_POLL_INTERVAL` (default 30s, override if you want faster polling — Base's tip moves quickly).
 - `BASE_RESERVATION_STORE=memory` to skip Redis on Base (independent of the Ethereum setting; both can be memory or both Redis).
 - `BASE_STATE_FILE` (default `base_detector_state.json`).
+- `BASE_RPC_MIN_REQUEST_INTERVAL_MS` (default 200) — client-side throttle. The public `mainnet.base.org` endpoint returns `-32016 over rate limit` under burst load (orphan sweep on a 10-wallet pool fires ~40 RPC calls back-to-back). 200ms ≈ 5 req/s is safe for the public endpoint; set to 0 with a paid Base RPC.
+- `ETH_RPC_MIN_REQUEST_INTERVAL_MS` (default 0) — same knob for the Ethereum mainnet detector. Default 0 because operators typically use a paid Ethereum endpoint.
 
 To run both Ethereum mainnet and Base in the same process: `CHAIN=ethereum,base` (comma-separated list) or `CHAIN=all`. The Redis reservation namespace differs (`ethereum:reservation:` vs `base:reservation:`), state files differ, and pool files differ — the two detectors share nothing except the webhook config and the Etherscan API key.
 
@@ -182,6 +184,7 @@ Live tests in `blockstream.rs` are `#[ignore]`-gated — run with `cargo test --
 - **`xpub` env for `MAX_DERIVATION_INDEX`**: BTC/LTC pre-build a HashMap of `address → index` for `0..=MAX_DERIVATION_INDEX` before the scan loop. Setting this too high (e.g. 100_000) makes startup slow and memory-hungry. Default is 100, current `.env` has `1500`.
 - **Atomic state writes**: state files use `path + ".tmp"` then rename. Don't write directly to the final path — partially-written files would prevent restart.
 - **Don't add `spl-token` or `spl-associated-token-account` crates lightly**: they pull in a large solana toolchain. The current code builds the two SPL instructions it needs by hand. Extend [src/solana_tokens.rs](src/solana_tokens.rs) the same way unless you genuinely need more.
+- **EVM RPC rate limits**: every `self.provider.*().await` call in [src/ethereum.rs](src/ethereum.rs) MUST go through `self.with_rpc_retry("op_name", || async { ... })` (or at minimum `self.acquire_rpc_slot().await` for `send_transaction` which can't safely retry). The wrapper applies a configurable minimum gap between requests (`{ETH,BASE}_RPC_MIN_REQUEST_INTERVAL_MS`) and exponential-backoff retries on transient rate-limit responses (JSON-RPC `-32016`, `-32005`, HTTP 429/502/503). Forgetting the wrapper is invisible until the orphan sweep at startup hammers a public RPC like `mainnet.base.org` and starts dropping balance reads. The rate-limit detector logic lives in `is_rpc_rate_limit_error` — extend the substring list when a new provider surfaces a different error shape.
 
 ## Code style observed in this repo
 

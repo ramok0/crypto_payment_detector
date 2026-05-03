@@ -817,6 +817,16 @@ fn build_evm_config(chain: Chain) -> EthereumConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.10),
+        rpc_min_request_interval_ms: std::env::var(format!(
+            "{prefix}_RPC_MIN_REQUEST_INTERVAL_MS"
+        ))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(match chain {
+            Chain::Ethereum => 0,
+            Chain::Base => 200,
+            _ => 0,
+        }),
         etherscan,
     }
 }
