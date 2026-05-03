@@ -712,6 +712,20 @@ fn build_solana_config() -> SolanaConfig {
     }
 }
 
+/// Parse `{prefix}_ETHERSCAN_ENABLED`. Defaults to `true`. Setting the
+/// chain-specific var to `false`/`0`/`no`/`off` disables the etherscan client
+/// for that chain only — useful when the free Etherscan plan covers
+/// Ethereum mainnet but rejects Base.
+fn parse_etherscan_enabled_env(prefix: &str) -> bool {
+    match std::env::var(format!("{prefix}_ETHERSCAN_ENABLED")) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" | "disabled" => false,
+            _ => true,
+        },
+        Err(_) => true,
+    }
+}
+
 fn build_evm_config(chain: Chain) -> EthereumConfig {
     assert!(chain.is_evm(), "build_evm_config requires an EVM chain");
     let prefix = chain_env_prefix(chain);
@@ -738,10 +752,21 @@ fn build_evm_config(chain: Chain) -> EthereumConfig {
         .and_then(|value| value.parse().ok())
         .unwrap_or(default_chain_id);
 
-    let etherscan = EtherscanConfig::from_env().map(|mut config| {
-        config.chain_id = chain_id;
-        config
-    });
+    // Etherscan's free tier does NOT cover Base. Set BASE_ETHERSCAN_ENABLED=false
+    // to skip the etherscan client on Base while keeping it on Ethereum.
+    let etherscan_enabled = parse_etherscan_enabled_env(prefix);
+    let etherscan = if etherscan_enabled {
+        EtherscanConfig::from_env().map(|mut config| {
+            config.chain_id = chain_id;
+            config
+        })
+    } else {
+        log::info!(
+            "[{}] Etherscan internal-tx scan disabled via {prefix}_ETHERSCAN_ENABLED=false",
+            chain.ticker()
+        );
+        None
+    };
 
     EthereumConfig {
         chain,

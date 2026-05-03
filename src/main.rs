@@ -143,6 +143,22 @@ fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
     }
 }
 
+/// Parse `{prefix}_ETHERSCAN_ENABLED`. Defaults to `true` (preserve existing
+/// behavior — when ETHERSCAN_API_KEY is set, the scan runs). Setting the
+/// chain-specific var to `false`/`0`/`no`/`off` disables the etherscan client
+/// for that chain only — useful when the free Etherscan plan covers
+/// Ethereum mainnet but rejects Base (`Free API access is not supported for
+/// this chain`).
+fn parse_etherscan_enabled_env(prefix: &str) -> bool {
+    match std::env::var(format!("{prefix}_ETHERSCAN_ENABLED")) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" | "disabled" => false,
+            _ => true,
+        },
+        Err(_) => true,
+    }
+}
+
 fn build_evm_config(chain: Chain) -> EthereumConfig {
     assert!(chain.is_evm(), "build_evm_config requires an EVM chain");
     let prefix = chain_env_prefix(chain);
@@ -173,10 +189,26 @@ fn build_evm_config(chain: Chain) -> EthereumConfig {
     // same API key — only the chain_id changes. Pin the etherscan client to
     // this detector's chain so a process running both chains side-by-side
     // hits the right endpoint per detector.
-    let etherscan = EtherscanConfig::from_env().map(|mut config| {
-        config.chain_id = chain_id;
-        config
-    });
+    //
+    // Etherscan's free tier does NOT cover Base (returns
+    // `Free API access is not supported for this chain`). To run Base on the
+    // free tier without crashing the scan loop, set BASE_ETHERSCAN_ENABLED=false.
+    // The detector falls back to the standard `eth_getBlockByNumber` scan,
+    // which still catches direct ETH transfers — just not internal CALLs
+    // (Coinbase-style contract withdrawals).
+    let etherscan_enabled = parse_etherscan_enabled_env(prefix);
+    let etherscan = if etherscan_enabled {
+        EtherscanConfig::from_env().map(|mut config| {
+            config.chain_id = chain_id;
+            config
+        })
+    } else {
+        log::info!(
+            "[{}] Etherscan internal-tx scan disabled via {prefix}_ETHERSCAN_ENABLED=false",
+            chain.ticker()
+        );
+        None
+    };
 
     EthereumConfig {
         chain,

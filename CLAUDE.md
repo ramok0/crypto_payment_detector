@@ -149,6 +149,7 @@ Base (mirrors the Ethereum env vars, just swap `ETH_` → `BASE_`):
 - `BASE_STATE_FILE` (default `base_detector_state.json`).
 - `BASE_RPC_MIN_REQUEST_INTERVAL_MS` (default 200) — client-side throttle. The public `mainnet.base.org` endpoint returns `-32016 over rate limit` under burst load (orphan sweep on a 10-wallet pool fires ~40 RPC calls back-to-back). 200ms ≈ 5 req/s is safe for the public endpoint; set to 0 with a paid Base RPC.
 - `ETH_RPC_MIN_REQUEST_INTERVAL_MS` (default 0) — same knob for the Ethereum mainnet detector. Default 0 because operators typically use a paid Ethereum endpoint.
+- `{ETH,BASE}_ETHERSCAN_ENABLED` (default `true`) — per-chain toggle for the Etherscan internal-tx scan. The free Etherscan plan returns `Free API access is not supported for this chain` on Base; setting `BASE_ETHERSCAN_ENABLED=false` skips the etherscan client for Base only while keeping it active on Ethereum mainnet. Disabling it loses Coinbase-style internal-CALL detection but the rest of the scan (`eth_getBlockByNumber` + `eth_getLogs`) is unaffected.
 
 To run both Ethereum mainnet and Base in the same process: `CHAIN=ethereum,base` (comma-separated list) or `CHAIN=all`. The Redis reservation namespace differs (`ethereum:reservation:` vs `base:reservation:`), state files differ, and pool files differ — the two detectors share nothing except the webhook config and the Etherscan API key.
 
