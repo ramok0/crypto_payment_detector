@@ -13,11 +13,12 @@ use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
-    EthereumReservation, PaymentDetector, RetryConfig, SharedEthereumWallets, SharedSolanaWallets,
-    SolanaConfig, SolanaDetector, SolanaReservation, ethereum_reservation_store_url_from_env,
-    load_active_ethereum_reservations, load_active_reservations, load_ethereum_wallet_pool,
-    load_wallet_pool, parse_erc20_tokens, parse_spl_tokens, reserve_ethereum_wallet_for_user,
-    reserve_wallet_for_user, shared_ethereum_wallets, shared_wallets,
+    EthereumReservation, EtherscanConfig, PaymentDetector, RetryConfig, SharedEthereumWallets,
+    SharedSolanaWallets, SolanaConfig, SolanaDetector, SolanaReservation,
+    ethereum_reservation_store_url_from_env, load_active_ethereum_reservations,
+    load_active_reservations, load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens,
+    parse_spl_tokens, reserve_ethereum_wallet_for_user, reserve_wallet_for_user,
+    shared_ethereum_wallets, shared_wallets,
 };
 
 #[derive(Clone)]
@@ -99,10 +100,20 @@ fn resolve_ttl(requested: Option<u64>, default: u64) -> u64 {
     }
 }
 
-fn log_ttl_resolution(chain: &str, user_id: &str, requested: Option<u64>, default: u64, applied: u64) {
+fn log_ttl_resolution(
+    chain: &str,
+    user_id: &str,
+    requested: Option<u64>,
+    default: u64,
+    applied: u64,
+) {
     log::info!(
         "[{}] TTL resolution for user_id={}: requested={:?}, default={}s, applied={}s",
-        chain, user_id, requested, default, applied
+        chain,
+        user_id,
+        requested,
+        default,
+        applied
     );
 }
 
@@ -732,6 +743,7 @@ fn build_ethereum_config() -> EthereumConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.10),
+        etherscan: EtherscanConfig::from_env(),
     }
 }
 
@@ -1000,10 +1012,9 @@ async fn main() {
             Chain::Solana => {
                 if let Some(info) = build_solana_chain_info() {
                     let config = build_solana_config();
-                    let tokens = parse_spl_tokens(
-                        std::env::var("SOLANA_SPL_TOKENS").ok().as_deref(),
-                    )
-                    .expect("Invalid SOLANA_SPL_TOKENS");
+                    let tokens =
+                        parse_spl_tokens(std::env::var("SOLANA_SPL_TOKENS").ok().as_deref())
+                            .expect("Invalid SOLANA_SPL_TOKENS");
                     let wallets = shared_wallets(
                         load_wallet_pool(&config.wallet_pool_file)
                             .expect("Failed to load Solana wallet pool"),
@@ -1028,7 +1039,9 @@ async fn main() {
                     for (symbol, mint, decimals) in detector.token_summary() {
                         log::info!(
                             "[SOL] SPL token configured: {} mint={} decimals={}",
-                            symbol, mint, decimals
+                            symbol,
+                            mint,
+                            decimals
                         );
                     }
 

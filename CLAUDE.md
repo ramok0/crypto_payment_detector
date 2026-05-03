@@ -139,6 +139,14 @@ Ethereum:
 - `ETH_RESERVATION_STORE=memory` to skip Redis (the wallet pool file auto-creates if missing).
 - `ETH_GAS_TANK_TARGET_USD` (default 20), `ETH_GAS_TANK_INTERVAL_SECS` (default 900).
 
+Etherscan internal-tx scan (optional, enables detection of ETH deposits routed through contracts e.g. Coinbase withdrawals):
+- `ETHERSCAN_API_KEY` — required to enable. Free tier (5 req/s, 100k req/day) is enough for small wallet pools. The client never goes through a proxy: the API key already authenticates the request, and most public proxies are blocked by Etherscan's WAF.
+- `ETHERSCAN_BASE_URL` (default `https://api.etherscan.io/v2/api`) — V2 multichain endpoint.
+- `ETHERSCAN_CHAIN_ID` (default `1`) — chain to query against the V2 endpoint.
+- `ETHERSCAN_TIMEOUT_SECS` (default `15`).
+- `ETHERSCAN_MIN_REQUEST_INTERVAL_MS` (default `334`) — minimum gap between requests, enforced client-side. 334ms ≈ 3 req/s, leaves headroom under the 5 req/s free-tier ceiling for retries and concurrent callers sharing the same key. Lower values risk HTTP 429.
+- API budget: per cycle the detector makes one `txlistinternal` call **per reserved wallet** (server-side filter by address). At default `ETH_POLL_INTERVAL=30` and a pool of 10 wallets that's ~28k calls/day — well within the 100k/day free quota. The 3 req/s throttle means a 10-wallet pool takes ~3.3s of wall time per cycle just for Etherscan; pools larger than ~90 wallets won't fit a 30s cycle and need a longer interval (or a paid Etherscan tier).
+
 ## Build / test
 
 ```bash
@@ -157,6 +165,7 @@ Live tests in `blockstream.rs` are `#[ignore]`-gated — run with `cargo test --
 - **Solana SPL transfer detection**: `getSignaturesForAddress(owner)` does **not** return token transfer signatures because the owner pubkey isn't in the account_keys for SPL transfers — only the ATA is. The detector must scan the ATA address separately.
 - **Solana SPL transfer destination ATA is auto-created**: the sweep tx prepends `CreateAssociatedTokenAccountIdempotent` (data=`[1]`, program=`ATokenGPv...`) before the `TransferChecked`. If the destination ATA already exists, the instruction is a no-op; otherwise the gas tank pays the rent (~0.002 SOL) and creates it. The instruction is implemented manually in [src/solana_tokens.rs](src/solana_tokens.rs) — no `spl-associated-token-account` crate dependency.
 - **Ethereum gas-tank top-ups look like deposits**: a top-up from the gas tank to a managed wallet would otherwise be detected as a payment. The detector uses `is_native_gas_tank_top_up(from, to, gas_tank)` and an `ignored_events` set to filter these. When changing the gas-tank logic, preserve this behavior.
+- **`eth_getBlockByNumber` misses internal CALLs**: native ETH sent through a contract (Coinbase withdrawals, Gnosis Safe, batchers) is invisible to the standard block scan because the top-level tx's `to` is the contract, not the user. The optional `ETHERSCAN_API_KEY` path in [src/etherscan.rs](src/etherscan.rs) (called from `EthereumDetector::scan_internal_calls`) closes that gap. Idempotency uses `event_id = "internal:{tx_hash}:{trace_id}:{address}"` — distinct from the `native:...` namespace so a top-level + internal pair on the same tx hash doesn't collide. Without `ETHERSCAN_API_KEY` the scan is a no-op and Coinbase-style deposits will be missed.
 - **Webhook retries are infinite**: `webhook::send_webhook` retries forever with exponential backoff capped at 60s. A wedged webhook receiver will block forward progress. There is currently no "send to dead-letter and continue" path.
 - **The `derive_address` trait method is overloaded for non-BIP32 chains**: for SOL, it returns `secure_deposit_address`; for ETH, it returns the gas-tank address. Don't expect it to derive distinct per-index addresses on those chains.
 - **`xpub` env for `MAX_DERIVATION_INDEX`**: BTC/LTC pre-build a HashMap of `address → index` for `0..=MAX_DERIVATION_INDEX` before the scan loop. Setting this too high (e.g. 100_000) makes startup slow and memory-hungry. Default is 100, current `.env` has `1500`.

@@ -19,6 +19,7 @@ use crate::ethereum_pool::{
     EthereumReservation, SharedEthereumWallets, find_ethereum_wallet, format_address,
     load_active_ethereum_reservations, snapshot_ethereum_wallets,
 };
+use crate::etherscan::{EtherscanClient, EtherscanConfig};
 use crate::pricing::PriceFetcher;
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, WebhookEvent};
@@ -58,6 +59,11 @@ pub struct EthereumConfig {
     pub token_transfer_gas_limit: u64,
     pub gas_top_up_multiplier: f64,
     pub max_fee_ratio: f64,
+    /// Optional Etherscan client config. When set, the detector also scans
+    /// internal CALL traces for native ETH (e.g. Coinbase withdrawals routed
+    /// through their hot-wallet contract) which are invisible to
+    /// `eth_getBlockByNumber`.
+    pub etherscan: Option<EtherscanConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +125,7 @@ pub struct EthereumDetector {
     price_fetcher: PriceFetcher,
     eth_usd_fetcher: PriceFetcher,
     eth_eur_fetcher: PriceFetcher,
+    etherscan: Option<EtherscanClient>,
     state: Arc<Mutex<EthereumState>>,
 }
 
@@ -192,6 +199,26 @@ impl EthereumDetector {
         );
         let eth_usd_fetcher = PriceFetcher::new(webhook_client.clone(), "USD", Chain::Ethereum);
         let eth_eur_fetcher = PriceFetcher::new(webhook_client.clone(), "EUR", Chain::Ethereum);
+
+        let etherscan = match config.etherscan.clone() {
+            Some(etherscan_config) => {
+                let client = EtherscanClient::new(etherscan_config)?;
+                log::info!(
+                    "[ETH] Etherscan internal-tx scan enabled (chain_id={}, base_url={})",
+                    client.chain_id(),
+                    client.base_url_redacted()
+                );
+                Some(client)
+            }
+            None => {
+                log::info!(
+                    "[ETH] Etherscan internal-tx scan disabled (set ETHERSCAN_API_KEY to enable; \
+                     deposits routed through contracts e.g. Coinbase withdrawals will not be detected)"
+                );
+                None
+            }
+        };
+
         let state = load_ethereum_state(&config.state_file);
 
         Ok(Self {
@@ -206,6 +233,7 @@ impl EthereumDetector {
             price_fetcher,
             eth_usd_fetcher,
             eth_eur_fetcher,
+            etherscan,
             state: Arc::new(Mutex::new(state)),
         })
     }
@@ -409,6 +437,10 @@ impl EthereumDetector {
             self.scan_erc20_logs(from_block, to_block, current_block, &reservation_lookup)
                 .await?,
         );
+        detected.extend(
+            self.scan_internal_calls(from_block, to_block, current_block, &reservation_lookup)
+                .await?,
+        );
 
         for payment in detected {
             self.emit_detected_and_enqueue(payment, current_block)
@@ -587,6 +619,113 @@ impl EthereumDetector {
         Ok(detected)
     }
 
+    /// Detect native ETH transfers that happened via internal CALLs (e.g.
+    /// Coinbase routes user withdrawals through their hot-wallet contract;
+    /// the actual ETH transfer to the user is an internal CALL invisible to
+    /// `eth_getBlockByNumber`). Uses Etherscan `txlistinternal` per reserved
+    /// address. Disabled if `EtherscanClient` was not configured.
+    async fn scan_internal_calls(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        _current_block: u64,
+        reservations: &HashMap<Address, EthereumReservation>,
+    ) -> Result<Vec<DetectedEthereumPayment>, DetectorError> {
+        let Some(ref etherscan) = self.etherscan else {
+            return Ok(Vec::new());
+        };
+        if reservations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut detected = Vec::new();
+        let mut total_internal_seen: usize = 0;
+
+        for (address, reservation) in reservations {
+            let internals = match etherscan
+                .list_internal_for_address(*address, from_block, to_block)
+                .await
+            {
+                Ok(list) => list,
+                Err(error) => {
+                    // Don't fail the whole scan on a transient Etherscan error
+                    // (rate-limit, timeout, transient HTTP). The cursor only
+                    // advances after the whole loop succeeds via the caller's
+                    // `set_last_scanned_block`, so we return the error to keep
+                    // the cursor put and retry next cycle.
+                    log::warn!(
+                        "[ETH] Etherscan scan failed for {} ({}..={}): {error}",
+                        format_address(*address),
+                        from_block,
+                        to_block
+                    );
+                    return Err(error);
+                }
+            };
+
+            total_internal_seen += internals.len();
+
+            for tx in internals {
+                if tx.is_error {
+                    continue;
+                }
+                if tx.value.is_zero() {
+                    continue;
+                }
+                // Server-side filter is by address but the API returns both
+                // incoming and outgoing internals; only credit incoming.
+                if tx.to != *address {
+                    continue;
+                }
+                if is_native_gas_tank_top_up(tx.from, tx.to, self.gas_tank_address) {
+                    log::debug!(
+                        "[ETH] Ignoring internal gas tank top-up tx {} to reserved address {}",
+                        tx.hash,
+                        format_address(tx.to)
+                    );
+                    continue;
+                }
+
+                // traceId disambiguates multiple internal CALLs in the same tx.
+                // Distinct from the `native:...` event_id namespace so a top-level
+                // tx that ALSO produces an internal call (rare but possible)
+                // wouldn't collide.
+                let txid = normalize_etherscan_hash(&tx.hash);
+                let event_id = format!(
+                    "internal:{}:{}:{}",
+                    txid,
+                    tx.trace_id,
+                    format_address(tx.to)
+                );
+                if self.is_known_event(&event_id) {
+                    continue;
+                }
+
+                detected.push(DetectedEthereumPayment {
+                    event_id,
+                    txid,
+                    block_number: tx.block_number,
+                    amount: tx.value,
+                    asset: "ETH".into(),
+                    asset_decimals: ETH_DECIMALS,
+                    token_contract: None,
+                    reservation: reservation.clone(),
+                });
+            }
+        }
+
+        log::debug!(
+            "[ETH] Internal scan {}..={} across {} reserved address(es) inspected {} entry(ies), produced {} candidate(s)",
+            from_block,
+            to_block,
+            reservations.len(),
+            total_internal_seen,
+            detected.len()
+        );
+
+        Ok(detected)
+    }
+
     async fn emit_detected_and_enqueue(
         &self,
         payment: DetectedEthereumPayment,
@@ -736,11 +875,8 @@ impl EthereumDetector {
                 "Invalid managed Ethereum address '{address}': {e}"
             ))
         })?;
-        let wallet = find_ethereum_wallet(
-            &snapshot_ethereum_wallets(&self.wallets),
-            eth_address,
-        )
-        .ok_or_else(|| {
+        let wallet = find_ethereum_wallet(&snapshot_ethereum_wallets(&self.wallets), eth_address)
+            .ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Ethereum wallet found for address '{}'",
                 address
@@ -830,11 +966,8 @@ impl EthereumDetector {
                 "Invalid managed Ethereum address '{address}': {e}"
             ))
         })?;
-        let wallet = find_ethereum_wallet(
-            &snapshot_ethereum_wallets(&self.wallets),
-            eth_address,
-        )
-        .ok_or_else(|| {
+        let wallet = find_ethereum_wallet(&snapshot_ethereum_wallets(&self.wallets), eth_address)
+            .ok_or_else(|| {
             DetectorError::InvalidConfig(format!(
                 "No managed Ethereum wallet found for address '{}'",
                 address
@@ -872,16 +1005,13 @@ impl EthereumDetector {
 
         if let Some(token) = self.tokens.iter().find(|t| t.contract == contract) {
             if let Some(peg) = token_peg_currency(&token.symbol) {
-                let amount_pegged =
-                    u256_to_units_f64(amount, token.decimals.max(1)).max(0.0);
+                let amount_pegged = u256_to_units_f64(amount, token.decimals.max(1)).max(0.0);
                 if amount_pegged > 0.0 {
                     match self.eth_peg_price(peg).await {
                         Ok(eth_peg) if eth_peg > 0.0 => {
                             let fee_eth = u256_to_units_f64(needed_fee, ETH_DECIMALS);
                             let fee_pegged = fee_eth * eth_peg;
-                            if fee_pegged
-                                > amount_pegged * self.config.max_fee_ratio
-                            {
+                            if fee_pegged > amount_pegged * self.config.max_fee_ratio {
                                 log::info!(
                                     "[ETH] Deferring {} sweep for {}: fee ~{:.2}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%) - retry when gas drops",
                                     token.symbol,
@@ -904,7 +1034,9 @@ impl EthereumDetector {
                         Err(error) => {
                             log::warn!(
                                 "[ETH] Skipping fee-ratio check for {} sweep: failed to fetch ETH/{}: {}",
-                                token.symbol, peg, error
+                                token.symbol,
+                                peg,
+                                error
                             );
                         }
                     }
@@ -1666,6 +1798,19 @@ fn address_from_topic(topic: H256) -> Address {
 
 fn is_native_gas_tank_top_up(from: Address, to: Address, gas_tank_address: Address) -> bool {
     from == gas_tank_address && to != gas_tank_address
+}
+
+/// Normalize a tx hash returned by Etherscan to the same `0x{:x}` format used
+/// by the rest of the detector (otherwise idempotency event_ids and pending
+/// entry txids would diverge between native scan and internal scan).
+fn normalize_etherscan_hash(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if let Ok(hash) = H256::from_str(stripped) {
+        format!("{:#x}", hash)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn fee_ratio_too_high_u256(fee: U256, total: U256, max_ratio: f64) -> bool {

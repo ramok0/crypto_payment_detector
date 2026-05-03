@@ -5,6 +5,7 @@ pub mod env_utils;
 pub mod error;
 pub mod ethereum;
 pub mod ethereum_pool;
+pub mod etherscan;
 pub mod persistence;
 pub mod pricing;
 pub mod solana;
@@ -26,6 +27,7 @@ pub use ethereum_pool::{
     load_active_ethereum_reservations, load_ethereum_wallet_pool, reserve_ethereum_wallet_for_user,
     shared_ethereum_wallets,
 };
+pub use etherscan::{EtherscanClient, EtherscanConfig, EtherscanInternalTx};
 pub use pricing::PriceFetcher;
 pub use solana::{SolanaConfig, SolanaDetector};
 pub use solana_pool::{

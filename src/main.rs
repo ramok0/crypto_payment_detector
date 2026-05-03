@@ -1,6 +1,6 @@
 use crypto_payment_detector::{
     BasicAuth, Chain, ChainDetector, DetectorConfig, EthereumConfig, EthereumDetector,
-    PaymentDetector, RetryConfig, SolanaConfig, SolanaDetector,
+    EtherscanConfig, PaymentDetector, RetryConfig, SolanaConfig, SolanaDetector,
     env_utils::{chain_env_bool, chain_env_var, proxy_env_var},
     ethereum_reservation_store_url_from_env, load_ethereum_wallet_pool, load_wallet_pool,
     parse_erc20_tokens, parse_spl_tokens, shared_ethereum_wallets, shared_wallets,
@@ -205,6 +205,7 @@ fn build_ethereum_config() -> EthereumConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.10),
+        etherscan: EtherscanConfig::from_env(),
     }
 }
 
