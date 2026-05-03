@@ -101,17 +101,13 @@ Aucune action ops requise — c'est automatique. Si le scan échoue (Redis injoi
 
 1. **Générer le gas tank** comme un wallet Solana standard (cf. méthodes plus bas), récupérer pubkey + private key.
 
-2. **Créer l'ATA de destination sur le wallet COLD** (pas sur le gas tank) — le détecteur ne la crée pas, pour ne pas payer le rent à chaque sweep raté :
+2. **(Optionnel) Pré-créer l'ATA de destination** — le détecteur la crée automatiquement au premier sweep via `CreateAssociatedTokenAccountIdempotent`, donc plus obligatoire. Si vous voulez la créer manuellement quand même :
    ```bash
    spl-token create-account <USDC_MINT> \
      --owner <SOLANA_DEPOSIT_ADDRESS> \
      --fee-payer <gas_tank.json>
    ```
-   Vérifier :
-   ```bash
-   spl-token accounts --owner <SOLANA_DEPOSIT_ADDRESS>
-   # Doit lister une ligne pour chaque mint configuré
-   ```
+   Le coût de création (~0.002 SOL pour le rent) est payé par le gas tank dans tous les cas, qu'il l'ait pré-créée ou que ce soit le premier sweep qui le fasse.
 
 3. **Funder le gas tank en SOL** — minimum équivalent à `SOLANA_GAS_TANK_TARGET_USD` + une marge :
    ```bash

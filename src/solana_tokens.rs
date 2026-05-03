@@ -7,6 +7,7 @@ use crate::error::DetectorError;
 
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+pub const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
 pub const USDC_MAINNET_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub const USDC_DEFAULT_DECIMALS: u8 = 6;
@@ -27,6 +28,10 @@ pub fn associated_token_program_id() -> Pubkey {
         .expect("hardcoded SPL associated token program id")
 }
 
+pub fn system_program_id() -> Pubkey {
+    Pubkey::from_str(SYSTEM_PROGRAM_ID).expect("hardcoded system program id")
+}
+
 pub fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     let token_program = token_program_id();
     let ata_program = associated_token_program_id();
@@ -39,6 +44,26 @@ pub fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey 
         &ata_program,
     );
     ata
+}
+
+pub fn create_associated_token_account_idempotent_instruction(
+    funder: &Pubkey,
+    associated_token_address: &Pubkey,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: associated_token_program_id(),
+        accounts: vec![
+            AccountMeta::new(*funder, true),
+            AccountMeta::new(*associated_token_address, false),
+            AccountMeta::new_readonly(*wallet, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(system_program_id(), false),
+            AccountMeta::new_readonly(token_program_id(), false),
+        ],
+        data: vec![1u8], // CreateIdempotent discriminator
+    }
 }
 
 pub fn spl_transfer_checked_instruction(

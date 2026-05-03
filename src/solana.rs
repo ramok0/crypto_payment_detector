@@ -21,7 +21,8 @@ use crate::solana_pool::{
     ManagedSolanaWallet, SolanaReservation, find_wallet, load_active_reservations, load_wallet_pool,
 };
 use crate::solana_tokens::{
-    SplTokenConfig, derive_associated_token_address, spl_transfer_checked_instruction,
+    SplTokenConfig, create_associated_token_account_idempotent_instruction,
+    derive_associated_token_address, spl_transfer_checked_instruction,
 };
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, WebhookEvent};
@@ -1224,7 +1225,13 @@ impl SolanaDetector {
         })?;
 
         let recent_blockhash = self.get_latest_blockhash().await?;
-        let instruction = spl_transfer_checked_instruction(
+        let create_destination_ata = create_associated_token_account_idempotent_instruction(
+            &fee_payer.pubkey(),
+            &destination_ata,
+            &self.ledger_pubkey,
+            mint,
+        );
+        let transfer = spl_transfer_checked_instruction(
             &source_ata,
             mint,
             &destination_ata,
@@ -1233,7 +1240,7 @@ impl SolanaDetector {
             decimals,
         );
         let tx = self.build_signed_token_tx(
-            &[instruction],
+            &[create_destination_ata, transfer],
             fee_payer,
             wallet.keypair.as_ref(),
             recent_blockhash,

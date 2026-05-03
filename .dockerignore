@@ -1,0 +1,16 @@
+target/
+.git/
+.env
+.env.*
+*.local.json
+*.tmp
+*.md
+docker-compose*.yml
+.dockerignore
+.gitignore
+.claude/
+wallet_pool/*.json
+btc_detector_state*.json
+ltc_detector_state*.json
+sol_detector_state*.json
+eth_detector_state*.json
