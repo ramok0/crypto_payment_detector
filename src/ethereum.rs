@@ -1052,7 +1052,7 @@ impl EthereumDetector {
             .as_ref()
             .clone()
             .with_chain_id(self.config.chain_id);
-        let data = erc20_transfer_data(self.gas_tank_address, amount);
+        let data = erc20_transfer_data(self.ledger_address, amount);
         let tx = TransactionRequest::new()
             .from(eth_address)
             .to(contract)
@@ -1063,10 +1063,10 @@ impl EthereumDetector {
         let txid = self.send_transaction(wallet, tx).await?;
 
         log::info!(
-            "[ETH] Swept ERC-20 {} units from {} to gas tank {} (contract={}, tx={})",
+            "[ETH] Swept ERC-20 {} units from {} directly to ledger {} (contract={}, tx={})",
             amount,
             address,
-            self.gas_tank_address(),
+            self.ledger_address(),
             format_address(contract),
             txid
         );
@@ -1433,6 +1433,7 @@ impl EthereumDetector {
     ) -> DetectedPayment {
         let amount_coin = u256_to_units_f64(payment.amount, payment.asset_decimals);
         let swept_amount = sweep.map(|result| result.amount);
+        let is_token = payment.token_contract.is_some();
         DetectedPayment {
             chain: Chain::Ethereum,
             ticker: payment.asset.clone(),
@@ -1445,7 +1446,13 @@ impl EthereumDetector {
             block_height: Some(payment.block_number),
             derivation_index: payment.reservation.wallet_index,
             memo: None,
-            swept_to_address: sweep.map(|_| self.gas_tank_address()),
+            swept_to_address: sweep.map(|_| {
+                if is_token {
+                    self.ledger_address()
+                } else {
+                    self.gas_tank_address()
+                }
+            }),
             swept_amount_sat: swept_amount.map(u256_to_u64_saturating),
             swept_amount_coin: swept_amount
                 .map(|amount| u256_to_units_f64(amount, payment.asset_decimals)),
@@ -1469,6 +1476,7 @@ impl EthereumDetector {
         amount: U256,
     ) -> DetectedPayment {
         let swept_amount = sweep.map(|result| result.amount);
+        let is_token = entry.token_contract.is_some();
         DetectedPayment {
             chain: Chain::Ethereum,
             ticker: entry.asset.clone(),
@@ -1481,7 +1489,13 @@ impl EthereumDetector {
             block_height: Some(entry.block_number),
             derivation_index: entry.wallet_index,
             memo: None,
-            swept_to_address: sweep.map(|_| self.gas_tank_address()),
+            swept_to_address: sweep.map(|_| {
+                if is_token {
+                    self.ledger_address()
+                } else {
+                    self.gas_tank_address()
+                }
+            }),
             swept_amount_sat: swept_amount.map(u256_to_u64_saturating),
             swept_amount_coin: swept_amount
                 .map(|value| u256_to_units_f64(value, entry.asset_decimals)),

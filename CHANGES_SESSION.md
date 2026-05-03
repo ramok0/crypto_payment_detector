@@ -132,6 +132,33 @@ Si un user a déjà une réservation active et appelle `/reserve` avec un `ttl_s
 
 Si le `ttl_secs` demandé est ≤ ce qui reste, la réservation existante est retournée telle quelle (pas de raccourcissement).
 
+## Mise à jour : sweep ERC-20 direct vers le ledger
+
+Avant : USDC/USDT/EURC sur ETH étaient sweepés en deux étapes :
+1. `managed wallet → gas tank` (1 tx, ~$5 de gas)
+2. `gas tank → ledger` (1 tx, ~$5 de gas) lors de la maintenance périodique
+
+→ ~$10 de gas par dépôt, gas tank stockait temporairement les tokens, latence.
+
+Maintenant : sweep direct en **une seule tx** :
+1. `managed wallet → ledger` (1 tx, ~$5 de gas)
+
+Le gas tank ne fait plus que ça :
+- Payer les frais quand le managed wallet n'a pas assez d'ETH (top-up auto pré-sweep)
+- Recevoir le sweep ETH natif des managed wallets, et envoyer l'excès vers le ledger
+
+Donc le gas tank ne stocke **plus jamais de tokens**. Logs au sweep token :
+
+```
+[ETH] Swept ERC-20 1500000 units from 0xabc... directly to ledger 0xdef... (contract=0xA0b8..., tx=0x...)
+```
+
+Le webhook `payment_credited` pour un dépôt ERC-20 a maintenant `swept_to_address` = `ETH_LEDGER_ADDRESS` (avant c'était `ETH_GAS_TANK_PRIVATE_KEY` pubkey).
+
+⚠️ Compatibilité : si vous parsez le webhook côté backend pour rapprocher avec un solde on-chain, mettez à jour pour vérifier le solde sur `ETH_LEDGER_ADDRESS` au lieu du gas tank pour les tokens.
+
+La fonction de cleanup `sweep_gas_tank_tokens_to_ledger` est conservée pour vider tout token résiduel sur le gas tank (legacy state ou direct deposit malencontreux), mais ne sera plus déclenchée en pratique.
+
 ## TL;DR
 
 Deux nouvelles fonctionnalités, **toutes les deux opt-in** :
