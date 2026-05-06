@@ -19,7 +19,7 @@ use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
 use crate::solana_pool::{
     ManagedSolanaWallet, SharedSolanaWallets, SolanaReservation, find_wallet,
-    load_active_reservations, snapshot_wallets,
+    load_active_reservations, load_assignment_for_user, snapshot_wallets,
 };
 use crate::solana_tokens::{
     SplTokenConfig, create_associated_token_account_idempotent_instruction,
@@ -420,6 +420,45 @@ impl SolanaDetector {
 
     fn ata_for_wallet(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
         derive_associated_token_address(owner, mint)
+    }
+
+    /// Manually scan + sweep + credit deposits for a single user's assigned
+    /// Solana address. Triggered by the `/solana/claim` HTTP endpoint when
+    /// the user clicks "I deposited" on the frontend. Returns the address
+    /// that was scanned. The webhook (`payment_detected` then
+    /// `payment_credited`) is fired by the underlying scan/credit pipeline.
+    pub async fn claim_for_user(&self, user_id: &str) -> Result<String, DetectorError> {
+        let assignment = load_assignment_for_user(&self.config.redis_url, user_id)
+            .await?
+            .ok_or_else(|| {
+                DetectorError::InvalidConfig(format!(
+                    "No Solana deposit address assigned to user_id={user_id} - call /solana/address first"
+                ))
+            })?;
+
+        let address = assignment.address.clone();
+        log::info!(
+            "[SOL] /claim triggered for user_id={} address={}",
+            user_id,
+            address
+        );
+
+        let current_slot = self.get_current_slot().await?;
+        let spot_price = match self.price_fetcher.get_price().await {
+            Ok(price) => Some(price),
+            Err(error) => {
+                log::warn!(
+                    "[SOL] /claim: failed to fetch spot price (continuing without fiat dust filter): {error}"
+                );
+                None
+            }
+        };
+
+        self.process_reservation(&assignment, current_slot, spot_price)
+            .await?;
+        self.process_credits(current_slot).await?;
+
+        Ok(address)
     }
 
     async fn process_cycle(&self) -> Result<(), DetectorError> {

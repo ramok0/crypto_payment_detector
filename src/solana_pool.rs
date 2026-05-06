@@ -9,7 +9,10 @@ use solana_sdk::signature::Signer;
 
 use crate::error::DetectorError;
 
-const RESERVATION_KEY_PREFIX: &str = "solana:reservation:";
+// Permanent address assignments (no TTL). Each user gets a single managed
+// wallet for the lifetime of the deposit address — the user explicitly
+// triggers a /claim to credit their balance.
+const ASSIGNMENT_KEY_PREFIX: &str = "solana:assignment:";
 const DEFAULT_SOLANA_MAX_POOL_SIZE: usize = 10_000;
 
 pub type SharedSolanaWallets = Arc<RwLock<Vec<ManagedSolanaWallet>>>;
@@ -21,14 +24,34 @@ pub struct ManagedSolanaWallet {
     pub keypair: Arc<Keypair>,
 }
 
+/// Permanent assignment of a managed Solana wallet to a single user.
+///
+/// Replaces the previous TTL-based reservation: the assignment never
+/// expires (stored without Redis EX), and the user explicitly triggers a
+/// /claim to scan + sweep + credit funds received at `address`. The
+/// `expires_at_unix` field is kept for wire-format compatibility with
+/// downstream consumers and is set to the sentinel value 0 to indicate
+/// "no expiration".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolanaReservation {
     pub user_id: String,
     pub address: String,
     pub wallet_index: u32,
     pub reserved_at_unix: i64,
+    /// Sentinel value `0` indicates the assignment never expires. Older
+    /// payloads written by the previous TTL-based reservation system may
+    /// still carry a real Unix timestamp here; both are tolerated.
+    #[serde(default)]
     pub expires_at_unix: i64,
 }
+
+/// Public alias matching the new domain language. Internally identical to
+/// [`SolanaReservation`] for source-compatibility with the existing
+/// detector loop.
+pub type SolanaAssignment = SolanaReservation;
+
+/// Sentinel `expires_at_unix` value meaning "no expiration".
+pub const NEVER_EXPIRES: i64 = 0;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -231,7 +254,7 @@ pub async fn load_active_reservations(
         match serde_json::from_str::<SolanaReservation>(&payload) {
             Ok(reservation) => reservations.push(reservation),
             Err(e) => {
-                log::warn!("[SOL] Failed to parse reservation '{}': {}", key, e);
+                log::warn!("[SOL] Failed to parse assignment '{}': {}", key, e);
             }
         }
     }
@@ -240,16 +263,44 @@ pub async fn load_active_reservations(
     Ok(reservations)
 }
 
-pub async fn reserve_wallet_for_user(
+/// Domain-aliased wrapper around [`load_active_reservations`] using the
+/// new "assignment" terminology. Returns the same payload — all currently
+/// assigned addresses with their owning user.
+pub async fn load_active_assignments(
+    redis_url: &str,
+) -> Result<Vec<SolanaAssignment>, DetectorError> {
+    load_active_reservations(redis_url).await
+}
+
+/// Look up the permanent assignment for a single `user_id` if any.
+pub async fn load_assignment_for_user(
+    redis_url: &str,
+    user_id: &str,
+) -> Result<Option<SolanaAssignment>, DetectorError> {
+    let user_id = user_id.trim();
+    if user_id.is_empty() {
+        return Ok(None);
+    }
+    let assignments = load_active_assignments(redis_url).await?;
+    Ok(assignments.into_iter().find(|a| a.user_id == user_id))
+}
+
+/// Get-or-create the permanent Solana deposit address for `user_id`.
+///
+/// If the user already has an assignment, returns it unchanged. Otherwise
+/// picks the first unassigned wallet from the in-memory pool, persists the
+/// assignment to Redis without TTL, and returns it. Grows the pool by one
+/// random wallet when no free wallet is available (subject to
+/// `SOLANA_MAX_POOL_SIZE`).
+pub async fn assign_wallet_for_user(
     redis_url: &str,
     wallets: &SharedSolanaWallets,
     pool_path: &str,
     user_id: &str,
-    ttl_secs: u64,
-) -> Result<SolanaReservation, DetectorError> {
+) -> Result<SolanaAssignment, DetectorError> {
     if user_id.trim().is_empty() {
         return Err(DetectorError::InvalidConfig(
-            "user_id cannot be empty when reserving a Solana wallet".into(),
+            "user_id cannot be empty when assigning a Solana wallet".into(),
         ));
     }
 
@@ -261,36 +312,12 @@ pub async fn reserve_wallet_for_user(
         .map_err(redis_error)?;
 
     let now = unix_timestamp();
-    let ttl_secs_i64 = i64::try_from(ttl_secs).map_err(|_| {
-        DetectorError::InvalidConfig("Reservation TTL is too large to store".into())
-    })?;
-    let new_expires = now.saturating_add(ttl_secs_i64);
 
-    let existing = load_active_reservations(redis_url).await?;
-    if let Some(existing_reservation) = existing.into_iter().find(|r| r.user_id == user_id.trim()) {
-        if new_expires > existing_reservation.expires_at_unix {
-            let updated = SolanaReservation {
-                expires_at_unix: new_expires,
-                ..existing_reservation.clone()
-            };
-            let payload = serde_json::to_string(&updated)?;
-            let _: Option<String> = redis::cmd("SET")
-                .arg(reservation_key(&updated.address))
-                .arg(payload)
-                .arg("EX")
-                .arg(ttl_secs)
-                .query_async(&mut connection)
-                .await
-                .map_err(redis_error)?;
-            log::info!(
-                "[SOL] Extended reservation for user_id={} address={} to {}s",
-                user_id,
-                updated.address,
-                ttl_secs
-            );
-            return Ok(updated);
-        }
-        return Ok(existing_reservation);
+    let existing = load_active_assignments(redis_url).await?;
+    if let Some(existing_assignment) =
+        existing.into_iter().find(|a| a.user_id == user_id.trim())
+    {
+        return Ok(existing_assignment);
     }
 
     let candidates: Vec<(String, u32)> = {
@@ -301,31 +328,35 @@ pub async fn reserve_wallet_for_user(
     };
 
     for (address, index) in candidates {
-        let reservation = SolanaReservation {
+        let assignment = SolanaAssignment {
             user_id: user_id.trim().to_string(),
             address: address.clone(),
             wallet_index: index,
             reserved_at_unix: now,
-            expires_at_unix: new_expires,
+            expires_at_unix: NEVER_EXPIRES,
         };
 
-        let payload = serde_json::to_string(&reservation)?;
+        let payload = serde_json::to_string(&assignment)?;
         let response: Option<String> = redis::cmd("SET")
             .arg(reservation_key(&address))
             .arg(payload)
-            .arg("EX")
-            .arg(ttl_secs)
             .arg("NX")
             .query_async(&mut connection)
             .await
             .map_err(redis_error)?;
 
         if response.is_some() {
-            return Ok(reservation);
+            log::info!(
+                "[SOL] Assigned wallet {} (index {}) to user_id={} (no TTL)",
+                address,
+                index,
+                user_id
+            );
+            return Ok(assignment);
         }
     }
 
-    // Pool exhausted — generate a new wallet, persist it, then reserve it.
+    // Pool exhausted — generate a new wallet, persist it, then assign it.
     let max_pool_size = solana_max_pool_size();
     let new_wallet = {
         let mut pool = wallets.write().unwrap_or_else(|p| p.into_inner());
@@ -343,42 +374,52 @@ pub async fn reserve_wallet_for_user(
     };
 
     log::info!(
-        "[SOL] Auto-generated new managed wallet at index {} address {} (pool path: {}); pool grew to handle exhausted reservations",
+        "[SOL] Auto-generated new managed wallet at index {} address {} (pool path: {}); pool grew to handle exhausted assignments",
         new_wallet.index,
         new_wallet.address,
         pool_path
     );
 
-    let reservation = SolanaReservation {
+    let assignment = SolanaAssignment {
         user_id: user_id.trim().to_string(),
         address: new_wallet.address.clone(),
         wallet_index: new_wallet.index,
         reserved_at_unix: now,
-        expires_at_unix: new_expires,
+        expires_at_unix: NEVER_EXPIRES,
     };
-    let payload = serde_json::to_string(&reservation)?;
+    let payload = serde_json::to_string(&assignment)?;
     let response: Option<String> = redis::cmd("SET")
         .arg(reservation_key(&new_wallet.address))
         .arg(payload)
-        .arg("EX")
-        .arg(ttl_secs)
         .arg("NX")
         .query_async(&mut connection)
         .await
         .map_err(redis_error)?;
 
     if response.is_some() {
-        Ok(reservation)
+        Ok(assignment)
     } else {
-        // Extremely unlikely: the brand-new ATA's address collided with an existing reservation.
         Err(DetectorError::ApiError(
-            "Failed to register reservation for newly generated Solana wallet".into(),
+            "Failed to register assignment for newly generated Solana wallet".into(),
         ))
     }
 }
 
+/// Backwards-compatible alias used by older callers (and the API binary
+/// during the transition). The `_ttl_secs` argument is ignored — the new
+/// system never expires assignments.
+pub async fn reserve_wallet_for_user(
+    redis_url: &str,
+    wallets: &SharedSolanaWallets,
+    pool_path: &str,
+    user_id: &str,
+    _ttl_secs: u64,
+) -> Result<SolanaReservation, DetectorError> {
+    assign_wallet_for_user(redis_url, wallets, pool_path, user_id).await
+}
+
 pub fn reservation_key(address: &str) -> String {
-    format!("{RESERVATION_KEY_PREFIX}{address}")
+    format!("{ASSIGNMENT_KEY_PREFIX}{address}")
 }
 
 fn parse_private_key_bytes(
@@ -436,7 +477,7 @@ async fn scan_reservation_keys(
         let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg(format!("{RESERVATION_KEY_PREFIX}*"))
+            .arg(format!("{ASSIGNMENT_KEY_PREFIX}*"))
             .arg("COUNT")
             .arg(256)
             .query_async(connection)

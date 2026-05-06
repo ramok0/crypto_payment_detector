@@ -17,10 +17,10 @@ use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
     EthereumReservation, EtherscanConfig, PaymentDetector, RetryConfig, SharedEthereumWallets,
     SharedSolanaWallets, SolanaConfig, SolanaDetector, SolanaReservation,
+    assign_ethereum_wallet_for_user, assign_wallet_for_user,
     ethereum_reservation_store_url_from_env, load_active_ethereum_reservations,
     load_active_reservations, load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens,
-    parse_spl_tokens, reserve_ethereum_wallet_for_user, reserve_wallet_for_user,
-    shared_ethereum_wallets, shared_wallets,
+    parse_spl_tokens, shared_ethereum_wallets, shared_wallets,
 };
 
 #[derive(Clone)]
@@ -36,8 +36,12 @@ struct SolanaPoolApiState {
     wallets: SharedSolanaWallets,
     wallet_pool_path: String,
     redis_url: String,
-    reservation_ttl_secs: u64,
     secure_deposit_address: String,
+    /// Live detector handle used by `/solana/claim` to trigger an
+    /// immediate scan + sweep + credit cycle on demand. `None` when the
+    /// API binary runs without a co-located detector (rare; primarily for
+    /// tests and read-only deployments).
+    detector: Option<Arc<SolanaDetector>>,
 }
 
 #[derive(Clone)]
@@ -46,9 +50,11 @@ struct EthereumPoolApiState {
     wallets: SharedEthereumWallets,
     wallet_pool_path: String,
     redis_url: String,
-    reservation_ttl_secs: u64,
     gas_tank_address: String,
     ledger_address: String,
+    /// Live detector handle used by `/<chain>/claim` to trigger an
+    /// immediate scan + sweep + credit cycle on demand.
+    detector: Option<Arc<EthereumDetector>>,
 }
 
 #[derive(Clone)]
@@ -81,44 +87,19 @@ struct DeriveParams {
     count: u32,
 }
 
-const MAX_RESERVATION_TTL_SECS: u64 = 30 * 24 * 3600; // 30 days hard cap
-
+/// Request body for the `/<chain>/address` endpoint. Returns the user's
+/// permanent deposit address, creating one if it does not yet exist.
 #[derive(Deserialize)]
-struct ReserveSolanaAddressRequest {
+struct AddressRequest {
     user_id: String,
-    #[serde(default)]
-    ttl_secs: Option<u64>,
 }
 
+/// Request body for the `/<chain>/claim` endpoint. Triggered by the user
+/// clicking "I deposited" on the frontend; runs an immediate scan + sweep
+/// + credit cycle for that user's assigned address.
 #[derive(Deserialize)]
-struct ReserveEthereumAddressRequest {
+struct ClaimRequest {
     user_id: String,
-    #[serde(default)]
-    ttl_secs: Option<u64>,
-}
-
-fn resolve_ttl(requested: Option<u64>, default: u64) -> u64 {
-    match requested {
-        Some(value) if value > 0 => value.min(MAX_RESERVATION_TTL_SECS),
-        _ => default,
-    }
-}
-
-fn log_ttl_resolution(
-    chain: &str,
-    user_id: &str,
-    requested: Option<u64>,
-    default: u64,
-    applied: u64,
-) {
-    log::info!(
-        "[{}] TTL resolution for user_id={}: requested={:?}, default={}s, applied={}s",
-        chain,
-        user_id,
-        requested,
-        default,
-        applied
-    );
 }
 
 fn default_count() -> u32 {
@@ -180,38 +161,44 @@ struct ChainHealthStatus {
 }
 
 #[derive(Serialize)]
-struct ReserveSolanaAddressResponse {
+struct SolanaAddressResponse {
     user_id: String,
     address: String,
     wallet_index: u32,
-    reserved_at_unix: i64,
-    expires_at_unix: i64,
-    reservation_ttl_secs: u64,
+    assigned_at_unix: i64,
     sweep_destination_address: String,
 }
 
 #[derive(Serialize)]
-struct ActiveSolanaReservationsResponse {
+struct ActiveSolanaAssignmentsResponse {
     count: usize,
-    reservations: Vec<SolanaReservation>,
+    assignments: Vec<SolanaReservation>,
 }
 
 #[derive(Serialize)]
-struct ReserveEthereumAddressResponse {
+struct EthereumAddressResponse {
     user_id: String,
     address: String,
     wallet_index: u32,
-    reserved_at_unix: i64,
-    expires_at_unix: i64,
-    reservation_ttl_secs: u64,
+    assigned_at_unix: i64,
     gas_tank_address: String,
     ledger_address: String,
 }
 
 #[derive(Serialize)]
-struct ActiveEthereumReservationsResponse {
+struct ActiveEthereumAssignmentsResponse {
     count: usize,
-    reservations: Vec<EthereumReservation>,
+    assignments: Vec<EthereumReservation>,
+}
+
+#[derive(Serialize)]
+struct ClaimResponse {
+    user_id: String,
+    address: String,
+    chain: String,
+    /// Always "scanning" — the actual credit/sweep result is delivered
+    /// asynchronously via the configured webhook (`payment_credited`).
+    status: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -371,10 +358,10 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
     })
 }
 
-async fn handle_solana_reserve(
+async fn handle_solana_address(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ReserveSolanaAddressRequest>,
-) -> Result<Json<ReserveSolanaAddressResponse>, (StatusCode, String)> {
+    Json(payload): Json<AddressRequest>,
+) -> Result<Json<SolanaAddressResponse>, (StatusCode, String)> {
     let Some(solana_pool) = state.solana_pool.as_ref() else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -382,38 +369,27 @@ async fn handle_solana_reserve(
         ));
     };
 
-    let ttl = resolve_ttl(payload.ttl_secs, solana_pool.reservation_ttl_secs);
-    log_ttl_resolution(
-        "SOL",
-        &payload.user_id,
-        payload.ttl_secs,
-        solana_pool.reservation_ttl_secs,
-        ttl,
-    );
-    let reservation = reserve_wallet_for_user(
+    let assignment = assign_wallet_for_user(
         &solana_pool.redis_url,
         &solana_pool.wallets,
         &solana_pool.wallet_pool_path,
         &payload.user_id,
-        ttl,
     )
     .await
-    .map_err(map_reservation_error)?;
+    .map_err(map_assignment_error)?;
 
-    Ok(Json(ReserveSolanaAddressResponse {
-        user_id: reservation.user_id,
-        address: reservation.address,
-        wallet_index: reservation.wallet_index,
-        reserved_at_unix: reservation.reserved_at_unix,
-        expires_at_unix: reservation.expires_at_unix,
-        reservation_ttl_secs: ttl,
+    Ok(Json(SolanaAddressResponse {
+        user_id: assignment.user_id,
+        address: assignment.address,
+        wallet_index: assignment.wallet_index,
+        assigned_at_unix: assignment.reserved_at_unix,
         sweep_destination_address: solana_pool.secure_deposit_address.clone(),
     }))
 }
 
 async fn handle_solana_active(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ActiveSolanaReservationsResponse>, (StatusCode, String)> {
+) -> Result<Json<ActiveSolanaAssignmentsResponse>, (StatusCode, String)> {
     let Some(solana_pool) = state.solana_pool.as_ref() else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -421,20 +397,48 @@ async fn handle_solana_active(
         ));
     };
 
-    let reservations = load_active_reservations(&solana_pool.redis_url)
+    let assignments = load_active_reservations(&solana_pool.redis_url)
         .await
         .map_err(map_internal_error)?;
 
-    Ok(Json(ActiveSolanaReservationsResponse {
-        count: reservations.len(),
-        reservations,
+    Ok(Json(ActiveSolanaAssignmentsResponse {
+        count: assignments.len(),
+        assignments,
     }))
 }
 
-async fn handle_evm_reserve(
+async fn handle_solana_claim(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ClaimRequest>,
+) -> Result<Json<ClaimResponse>, (StatusCode, String)> {
+    let Some(solana_pool) = state.solana_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Solana address pool is not configured".into(),
+        ));
+    };
+    let detector = solana_pool.detector.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Solana detector is not running in this process".to_string(),
+    ))?;
+
+    let address = detector
+        .claim_for_user(&payment_user_id(&payload.user_id)?)
+        .await
+        .map_err(map_claim_error)?;
+
+    Ok(Json(ClaimResponse {
+        user_id: payload.user_id,
+        address,
+        chain: "solana".to_string(),
+        status: "scanning",
+    }))
+}
+
+async fn handle_evm_address(
     pool: Option<&EthereumPoolApiState>,
-    payload: ReserveEthereumAddressRequest,
-) -> Result<Json<ReserveEthereumAddressResponse>, (StatusCode, String)> {
+    payload: AddressRequest,
+) -> Result<Json<EthereumAddressResponse>, (StatusCode, String)> {
     let Some(pool) = pool else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -442,32 +446,21 @@ async fn handle_evm_reserve(
         ));
     };
 
-    let ttl = resolve_ttl(payload.ttl_secs, pool.reservation_ttl_secs);
-    log_ttl_resolution(
-        pool.chain.ticker(),
-        &payload.user_id,
-        payload.ttl_secs,
-        pool.reservation_ttl_secs,
-        ttl,
-    );
-    let reservation = reserve_ethereum_wallet_for_user(
+    let assignment = assign_ethereum_wallet_for_user(
         pool.chain,
         &pool.redis_url,
         &pool.wallets,
         &pool.wallet_pool_path,
         &payload.user_id,
-        ttl,
     )
     .await
-    .map_err(map_reservation_error)?;
+    .map_err(map_assignment_error)?;
 
-    Ok(Json(ReserveEthereumAddressResponse {
-        user_id: reservation.user_id,
-        address: reservation.address,
-        wallet_index: reservation.wallet_index,
-        reserved_at_unix: reservation.reserved_at_unix,
-        expires_at_unix: reservation.expires_at_unix,
-        reservation_ttl_secs: ttl,
+    Ok(Json(EthereumAddressResponse {
+        user_id: assignment.user_id,
+        address: assignment.address,
+        wallet_index: assignment.wallet_index,
+        assigned_at_unix: assignment.reserved_at_unix,
         gas_tank_address: pool.gas_tank_address.clone(),
         ledger_address: pool.ledger_address.clone(),
     }))
@@ -475,7 +468,7 @@ async fn handle_evm_reserve(
 
 async fn handle_evm_active(
     pool: Option<&EthereumPoolApiState>,
-) -> Result<Json<ActiveEthereumReservationsResponse>, (StatusCode, String)> {
+) -> Result<Json<ActiveEthereumAssignmentsResponse>, (StatusCode, String)> {
     let Some(pool) = pool else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -483,40 +476,93 @@ async fn handle_evm_active(
         ));
     };
 
-    let reservations = load_active_ethereum_reservations(pool.chain, &pool.redis_url)
+    let assignments = load_active_ethereum_reservations(pool.chain, &pool.redis_url)
         .await
         .map_err(map_internal_error)?;
 
-    Ok(Json(ActiveEthereumReservationsResponse {
-        count: reservations.len(),
-        reservations,
+    Ok(Json(ActiveEthereumAssignmentsResponse {
+        count: assignments.len(),
+        assignments,
     }))
 }
 
-async fn handle_ethereum_reserve(
+async fn handle_evm_claim(
+    pool: Option<&EthereumPoolApiState>,
+    payload: ClaimRequest,
+) -> Result<Json<ClaimResponse>, (StatusCode, String)> {
+    let Some(pool) = pool else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "EVM address pool is not configured".into(),
+        ));
+    };
+    let detector = pool.detector.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "{} detector is not running in this process",
+            pool.chain.ticker()
+        ),
+    ))?;
+
+    let address = detector
+        .claim_for_user(&payment_user_id(&payload.user_id)?)
+        .await
+        .map_err(map_claim_error)?;
+
+    Ok(Json(ClaimResponse {
+        user_id: payload.user_id,
+        address,
+        chain: pool.chain.name().to_string(),
+        status: "scanning",
+    }))
+}
+
+async fn handle_ethereum_address(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ReserveEthereumAddressRequest>,
-) -> Result<Json<ReserveEthereumAddressResponse>, (StatusCode, String)> {
-    handle_evm_reserve(state.ethereum_pool.as_ref(), payload).await
+    Json(payload): Json<AddressRequest>,
+) -> Result<Json<EthereumAddressResponse>, (StatusCode, String)> {
+    handle_evm_address(state.ethereum_pool.as_ref(), payload).await
 }
 
 async fn handle_ethereum_active(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ActiveEthereumReservationsResponse>, (StatusCode, String)> {
+) -> Result<Json<ActiveEthereumAssignmentsResponse>, (StatusCode, String)> {
     handle_evm_active(state.ethereum_pool.as_ref()).await
 }
 
-async fn handle_base_reserve(
+async fn handle_ethereum_claim(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ReserveEthereumAddressRequest>,
-) -> Result<Json<ReserveEthereumAddressResponse>, (StatusCode, String)> {
-    handle_evm_reserve(state.base_pool.as_ref(), payload).await
+    Json(payload): Json<ClaimRequest>,
+) -> Result<Json<ClaimResponse>, (StatusCode, String)> {
+    handle_evm_claim(state.ethereum_pool.as_ref(), payload).await
+}
+
+async fn handle_base_address(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AddressRequest>,
+) -> Result<Json<EthereumAddressResponse>, (StatusCode, String)> {
+    handle_evm_address(state.base_pool.as_ref(), payload).await
 }
 
 async fn handle_base_active(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ActiveEthereumReservationsResponse>, (StatusCode, String)> {
+) -> Result<Json<ActiveEthereumAssignmentsResponse>, (StatusCode, String)> {
     handle_evm_active(state.base_pool.as_ref()).await
+}
+
+async fn handle_base_claim(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ClaimRequest>,
+) -> Result<Json<ClaimResponse>, (StatusCode, String)> {
+    handle_evm_claim(state.base_pool.as_ref(), payload).await
+}
+
+fn payment_user_id(raw: &str) -> Result<String, (StatusCode, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "user_id cannot be empty".into()));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
@@ -923,13 +969,14 @@ fn build_evm_chain_info(config: &EthereumConfig, gas_tank_address: String) -> Ch
 fn build_solana_pool_api_state(
     config: &SolanaConfig,
     wallets: SharedSolanaWallets,
+    detector: Option<Arc<SolanaDetector>>,
 ) -> Result<SolanaPoolApiState, DetectorError> {
     Ok(SolanaPoolApiState {
         wallets,
         wallet_pool_path: config.wallet_pool_file.clone(),
         redis_url: config.redis_url.clone(),
-        reservation_ttl_secs: config.reservation_ttl_secs,
         secure_deposit_address: config.secure_deposit_address.clone(),
+        detector,
     })
 }
 
@@ -937,15 +984,16 @@ fn build_ethereum_pool_api_state(
     config: &EthereumConfig,
     wallets: SharedEthereumWallets,
     gas_tank_address: String,
+    detector: Option<Arc<EthereumDetector>>,
 ) -> Result<EthereumPoolApiState, DetectorError> {
     Ok(EthereumPoolApiState {
         chain: config.chain,
         wallets,
         wallet_pool_path: config.wallet_pool_file.clone(),
         redis_url: config.redis_url.clone(),
-        reservation_ttl_secs: config.reservation_ttl_secs,
         gas_tank_address,
         ledger_address: config.ledger_address.clone(),
+        detector,
     })
 }
 
@@ -1035,12 +1083,24 @@ fn load_ethereum_last_scanned_block(path: &str) -> Option<u64> {
     }
 }
 
-fn map_reservation_error(error: DetectorError) -> (StatusCode, String) {
+fn map_assignment_error(error: DetectorError) -> (StatusCode, String) {
     let message = error.to_string();
-    if message.contains("No unreserved Solana wallet")
-        || message.contains("No unreserved Ethereum wallet")
-    {
+    if message.contains("user_id cannot be empty") {
+        (StatusCode::BAD_REQUEST, message)
+    } else if message.contains("MAX_POOL_SIZE") {
         (StatusCode::CONFLICT, message)
+    } else {
+        map_internal_error(error)
+    }
+}
+
+fn map_claim_error(error: DetectorError) -> (StatusCode, String) {
+    let message = error.to_string();
+    if message.contains("No Solana deposit address assigned")
+        || message.contains("No Ethereum deposit address assigned")
+        || message.contains("No Base deposit address assigned")
+    {
+        (StatusCode::NOT_FOUND, message)
     } else {
         map_internal_error(error)
     }
@@ -1145,22 +1205,25 @@ async fn main() {
                         load_wallet_pool(&config.wallet_pool_file)
                             .expect("Failed to load Solana wallet pool"),
                     );
-                    let pool_state = build_solana_pool_api_state(&config, wallets.clone())
-                        .expect("Failed to build Solana pool state");
                     let detector = Arc::new(
-                        SolanaDetector::new(config.clone(), tokens, wallets)
+                        SolanaDetector::new(config.clone(), tokens, wallets.clone())
                             .expect("Failed to create SOL detector"),
                     );
+                    let pool_state = build_solana_pool_api_state(
+                        &config,
+                        wallets,
+                        Some(detector.clone()),
+                    )
+                    .expect("Failed to build Solana pool state");
 
                     log::info!(
-                        "[SOL] Detector started - ledger: {} - gas tank: {} - managed wallets: {} - tokens: {} - default reservation TTL: {}s",
+                        "[SOL] Detector started - ledger: {} - gas tank: {} - managed wallets: {} - tokens: {} - permanent address assignments (no TTL)",
                         detector.ledger_address(),
                         detector
                             .gas_tank_address()
                             .unwrap_or_else(|| "<not configured>".to_string()),
                         detector.wallet_count(),
                         detector.token_count(),
-                        config.reservation_ttl_secs
                     );
                     for (symbol, mint, decimals) in detector.token_summary() {
                         log::info!(
@@ -1200,20 +1263,21 @@ async fn main() {
                     ),
                 );
                 let gas_tank_address = detector.gas_tank_address();
-                let pool_state =
-                    build_ethereum_pool_api_state(&config, wallets, gas_tank_address.clone())
-                        .unwrap_or_else(|e| {
-                            panic!("Failed to build {} pool state: {e}", evm_chain.name())
-                        });
+                let pool_state = build_ethereum_pool_api_state(
+                    &config,
+                    wallets,
+                    gas_tank_address.clone(),
+                    Some(detector.clone()),
+                )
+                .unwrap_or_else(|e| panic!("Failed to build {} pool state: {e}", evm_chain.name()));
 
                 log::info!(
-                    "[{}] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {} - default reservation TTL: {}s",
+                    "[{}] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {} - permanent address assignments (no TTL)",
                     ticker,
                     gas_tank_address,
                     detector.ledger_address(),
                     detector.wallet_count(),
                     detector.token_count(),
-                    config.reservation_ttl_secs
                 );
 
                 let detector_handle = detector.clone();
@@ -1248,12 +1312,15 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/derive", get(handle_derive))
-        .route("/solana/reserve", post(handle_solana_reserve))
+        .route("/solana/address", post(handle_solana_address))
         .route("/solana/active", get(handle_solana_active))
-        .route("/ethereum/reserve", post(handle_ethereum_reserve))
+        .route("/solana/claim", post(handle_solana_claim))
+        .route("/ethereum/address", post(handle_ethereum_address))
         .route("/ethereum/active", get(handle_ethereum_active))
-        .route("/base/reserve", post(handle_base_reserve))
+        .route("/ethereum/claim", post(handle_ethereum_claim))
+        .route("/base/address", post(handle_base_address))
         .route("/base/active", get(handle_base_active))
+        .route("/base/claim", post(handle_base_claim))
         .with_state(state);
 
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());
