@@ -17,7 +17,8 @@ use crate::env_utils::{chain_env_prefix, redact_url_credentials};
 use crate::error::DetectorError;
 use crate::ethereum_pool::{
     EthereumReservation, SharedEthereumWallets, find_ethereum_wallet, format_address,
-    load_active_ethereum_reservations, snapshot_ethereum_wallets,
+    load_active_ethereum_reservations, load_ethereum_assignment_for_user,
+    snapshot_ethereum_wallets,
 };
 use crate::etherscan::{EtherscanClient, EtherscanConfig};
 use crate::pricing::PriceFetcher;
@@ -349,6 +350,36 @@ impl EthereumDetector {
 
     pub fn token_count(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Manually trigger a scan + sweep + credit pass for the user with the
+    /// given `user_id`. Looks up the user's permanent assignment, runs a
+    /// full process cycle (block scan + pending sweep) and returns the
+    /// assigned address. The webhook (`payment_detected` then
+    /// `payment_credited`) is fired by the underlying pipeline.
+    pub async fn claim_for_user(&self, user_id: &str) -> Result<String, DetectorError> {
+        let assignment =
+            load_ethereum_assignment_for_user(self.config.chain, &self.config.redis_url, user_id)
+                .await?
+                .ok_or_else(|| {
+                    DetectorError::InvalidConfig(format!(
+                        "No {} deposit address assigned to user_id={user_id} - call /{}/address first",
+                        self.config.chain.name(),
+                        self.config.chain.name().to_ascii_lowercase()
+                    ))
+                })?;
+
+        let address = assignment.address.clone();
+        log::info!(
+            "[{}] /claim triggered for user_id={} address={}",
+            self.config.chain.ticker(),
+            user_id,
+            address
+        );
+
+        self.process_cycle().await?;
+
+        Ok(address)
     }
 
     pub async fn sweep_orphan_balances(&self) -> Result<(), DetectorError> {
