@@ -21,6 +21,7 @@ use crate::ethereum_pool::{
 };
 use crate::etherscan::{EtherscanClient, EtherscanConfig};
 use crate::pricing::PriceFetcher;
+use crate::recover::{RecoverResponse, RecoverStatus};
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, WebhookEvent};
 use crate::webhook::send_webhook;
@@ -1705,6 +1706,286 @@ impl EthereumDetector {
         })?;
         Ok(())
     }
+
+    /// On-demand TXID recovery for Ethereum mainnet / Base. The user
+    /// submits a tx hash claiming they paid but never got credited;
+    /// the detector fetches the transaction (and receipt for ERC-20
+    /// log decoding) from RPC, verifies the destination is the
+    /// address **currently reserved** for `user_id`, and runs the
+    /// same detect → enqueue → sweep → `payment_credited` pipeline
+    /// as the regular cycle. The detector's `credited_events` set +
+    /// the backend's DB unique index together prevent any double
+    /// credit. If the user's reservation has expired they must
+    /// re-reserve via `/<chain>/reserve` first.
+    pub async fn recover_txid(
+        &self,
+        tx_hash_str: &str,
+        user_id: &str,
+    ) -> Result<RecoverResponse, DetectorError> {
+        let tx_hash_str = tx_hash_str.trim();
+        let user_id = user_id.trim();
+        if tx_hash_str.is_empty() {
+            return Err(DetectorError::InvalidConfig("txid cannot be empty".into()));
+        }
+        if user_id.is_empty() {
+            return Err(DetectorError::InvalidConfig(
+                "user_id cannot be empty".into(),
+            ));
+        }
+        let chain = self.config.chain;
+        let canonical_txid = canonicalize_eth_txid(tx_hash_str);
+        let txid_owned = canonical_txid.clone();
+        let user_id_owned = user_id.to_string();
+        let mk = |status: RecoverStatus| {
+            RecoverResponse::new(chain, txid_owned.clone(), user_id_owned.clone(), status)
+        };
+
+        let tx_hash = match H256::from_str(tx_hash_str) {
+            Ok(h) => h,
+            Err(error) => {
+                log::info!(
+                    "[{}] /recover-txid: invalid tx hash '{}': {error}",
+                    chain.ticker(),
+                    tx_hash_str
+                );
+                return Ok(mk(RecoverStatus::TxNotFound));
+            }
+        };
+
+        // Look up the user's currently active reservation. Refusing
+        // here when the user has no reservation prevents anyone from
+        // claiming a stranger's TXID — the wallet may have been
+        // reassigned to a different user after TTL expiry.
+        let reservations =
+            load_active_ethereum_reservations(chain, &self.config.redis_url).await?;
+        let reservation = match reservations.into_iter().find(|r| r.user_id == user_id) {
+            Some(r) => r,
+            None => {
+                log::warn!(
+                    "[{}] /recover-txid: user_id={user_id} has no active reservation; ask them to re-reserve first",
+                    chain.ticker()
+                );
+                return Ok(mk(RecoverStatus::WrongUser));
+            }
+        };
+
+        let reservation_address = Address::from_str(&reservation.address).map_err(|e| {
+            DetectorError::InvalidConfig(format!(
+                "Invalid persisted EVM reservation address '{}': {e}",
+                reservation.address
+            ))
+        })?;
+
+        // Sanity check: the reserved address must still exist in our
+        // local wallet pool (we hold the keys).
+        {
+            let snapshot = snapshot_ethereum_wallets(&self.wallets);
+            if find_ethereum_wallet(&snapshot, reservation_address).is_none() {
+                log::warn!(
+                    "[{}] /recover-txid: reserved address {} not in pool — refusing recovery",
+                    chain.ticker(),
+                    reservation.address
+                );
+                return Ok(mk(RecoverStatus::AddressNotOwned));
+            }
+        }
+
+        log::info!(
+            "[{}] /recover-txid: txid={} user_id={} reserved_address={}",
+            chain.ticker(),
+            canonical_txid,
+            user_id,
+            reservation.address
+        );
+
+        let Some(tx) = self
+            .with_rpc_retry("eth_getTransactionByHash", || async {
+                self.provider
+                    .get_transaction(tx_hash)
+                    .await
+                    .map_err(|e| eth_rpc_error("eth_getTransactionByHash", e))
+            })
+            .await?
+        else {
+            return Ok(mk(RecoverStatus::TxNotFound));
+        };
+
+        let block_number = match tx.block_number {
+            Some(n) => n.as_u64(),
+            None => {
+                log::info!(
+                    "[{}] /recover-txid: txid={} not yet mined",
+                    chain.ticker(),
+                    canonical_txid
+                );
+                return Ok(mk(RecoverStatus::TxNotFound));
+            }
+        };
+
+        // Native ETH path: the tx itself credits the reserved address.
+        if let Some(to) = tx.to {
+            if to == reservation_address && !tx.value.is_zero() {
+                if is_native_gas_tank_top_up(tx.from, to, self.gas_tank_address) {
+                    log::info!(
+                        "[{}] /recover-txid: txid={} is a gas tank top-up, ignoring",
+                        chain.ticker(),
+                        canonical_txid
+                    );
+                    return Ok(mk(RecoverStatus::NoCreditAmount));
+                }
+                let event_id = format!("native:{:#x}:{}", tx_hash, format_address(to));
+
+                {
+                    let state = self.state.lock().unwrap();
+                    if state.credited_events.contains(&event_id) {
+                        return Ok(mk(RecoverStatus::AlreadyCredited));
+                    }
+                }
+
+                let detected = DetectedEthereumPayment {
+                    event_id: event_id.clone(),
+                    txid: format!("{:#x}", tx_hash),
+                    block_number,
+                    amount: tx.value,
+                    asset: "ETH".into(),
+                    asset_decimals: ETH_DECIMALS,
+                    token_contract: None,
+                    reservation: reservation.clone(),
+                };
+                let amount_coin = u256_to_units_f64(detected.amount, ETH_DECIMALS);
+                let current_block = self.current_block_number().await?;
+                self.emit_detected_and_enqueue(detected, current_block).await?;
+                self.process_credits(current_block).await?;
+                return Ok(self.recover_outcome_for_event_id(
+                    &event_id,
+                    &canonical_txid,
+                    "ETH".to_string(),
+                    amount_coin,
+                    user_id,
+                ));
+            }
+        }
+
+        // ERC-20 path: scan receipt logs for Transfer events targeted
+        // at the reserved address. We trust the configured token list
+        // (anything outside it is `NoCreditAmount` for our purposes).
+        let receipt = self
+            .with_rpc_retry("eth_getTransactionReceipt", || async {
+                self.provider
+                    .get_transaction_receipt(tx_hash)
+                    .await
+                    .map_err(|e| eth_rpc_error("eth_getTransactionReceipt", e))
+            })
+            .await?;
+        let Some(receipt) = receipt else {
+            return Ok(mk(RecoverStatus::TxNotFound));
+        };
+        if receipt.status.map(|status| status.as_u64()) == Some(0) {
+            log::info!(
+                "[{}] /recover-txid: txid={} reverted on-chain",
+                chain.ticker(),
+                canonical_txid
+            );
+            return Ok(mk(RecoverStatus::TxNotFound));
+        }
+        let transfer_topic = H256::from_slice(&keccak256("Transfer(address,address,uint256)"));
+        let reserved_topic = address_to_topic(reservation_address);
+
+        for log in &receipt.logs {
+            if log.topics.len() < 3 || log.data.0.len() != 32 {
+                continue;
+            }
+            if log.topics[0] != transfer_topic {
+                continue;
+            }
+            if log.topics[2] != reserved_topic {
+                continue;
+            }
+            let token = match self
+                .tokens
+                .iter()
+                .find(|token| token.contract == log.address)
+            {
+                Some(token) => token,
+                None => continue,
+            };
+            let amount = U256::from_big_endian(&log.data.0);
+            if amount.is_zero() {
+                continue;
+            }
+            let log_index = log.log_index.unwrap_or_default().as_u64();
+            let event_id = format!(
+                "erc20:{}:{:#x}:{}",
+                format_address(token.contract),
+                tx_hash,
+                log_index
+            );
+
+            {
+                let state = self.state.lock().unwrap();
+                if state.credited_events.contains(&event_id) {
+                    return Ok(mk(RecoverStatus::AlreadyCredited));
+                }
+            }
+
+            let detected = DetectedEthereumPayment {
+                event_id: event_id.clone(),
+                txid: format!("{:#x}", tx_hash),
+                block_number,
+                amount,
+                asset: token.symbol.clone(),
+                asset_decimals: token.decimals,
+                token_contract: Some(token.contract),
+                reservation: reservation.clone(),
+            };
+            let amount_coin = u256_to_units_f64(detected.amount, token.decimals);
+            let asset_for_response = token.symbol.clone();
+            let current_block = self.current_block_number().await?;
+            self.emit_detected_and_enqueue(detected, current_block).await?;
+            self.process_credits(current_block).await?;
+            return Ok(self.recover_outcome_for_event_id(
+                &event_id,
+                &canonical_txid,
+                asset_for_response,
+                amount_coin,
+                user_id,
+            ));
+        }
+
+        log::info!(
+            "[{}] /recover-txid: txid={} produced no positive credit to {} (for user_id={user_id})",
+            chain.ticker(),
+            canonical_txid,
+            reservation.address
+        );
+        Ok(mk(RecoverStatus::NoCreditAmount))
+    }
+
+    fn recover_outcome_for_event_id(
+        &self,
+        event_id: &str,
+        txid: &str,
+        asset: String,
+        amount_coin: f64,
+        user_id: &str,
+    ) -> RecoverResponse {
+        let credited = {
+            let state = self.state.lock().unwrap();
+            state.credited_events.contains(event_id)
+        };
+        let status = if credited {
+            RecoverStatus::Credited
+        } else {
+            RecoverStatus::PendingSweep
+        };
+        RecoverResponse::new(
+            self.config.chain,
+            txid.to_string(),
+            user_id.to_string(),
+            status,
+        )
+        .with_asset(asset, amount_coin)
+    }
 }
 
 fn build_ethereum_provider(config: &EthereumConfig) -> Result<Provider<Http>, DetectorError> {
@@ -1956,6 +2237,21 @@ fn is_native_gas_tank_top_up(from: Address, to: Address, gas_tank_address: Addre
 /// Normalize a tx hash returned by Etherscan to the same `0x{:x}` format used
 /// by the rest of the detector (otherwise idempotency event_ids and pending
 /// entry txids would diverge between native scan and internal scan).
+/// Lowercase + `0x`-prefix a user-supplied tx hash so the response we
+/// return matches the on-wire format the rest of the detector emits.
+/// Falls back to the raw input when the hex doesn't parse — the caller
+/// has already validated it via `H256::from_str` for everything that
+/// matters (state lookups, RPC calls), so this is purely cosmetic.
+fn canonicalize_eth_txid(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if let Ok(hash) = H256::from_str(stripped) {
+        format!("{:#x}", hash)
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn normalize_etherscan_hash(raw: &str) -> String {
     let trimmed = raw.trim();
     let stripped = trimmed.strip_prefix("0x").unwrap_or(trimmed);

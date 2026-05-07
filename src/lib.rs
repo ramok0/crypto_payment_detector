@@ -8,6 +8,7 @@ pub mod ethereum_pool;
 pub mod etherscan;
 pub mod persistence;
 pub mod pricing;
+pub mod recover;
 pub mod solana;
 pub mod solana_pool;
 pub mod solana_tokens;
@@ -29,6 +30,7 @@ pub use ethereum_pool::{
 };
 pub use etherscan::{EtherscanClient, EtherscanConfig, EtherscanInternalTx};
 pub use pricing::PriceFetcher;
+pub use recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 pub use solana::{SolanaConfig, SolanaDetector};
 pub use solana_pool::{
     ManagedSolanaWallet, SharedSolanaWallets, SolanaReservation, load_active_reservations,

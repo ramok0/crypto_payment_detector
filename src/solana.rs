@@ -25,6 +25,7 @@ use crate::solana_tokens::{
     SplTokenConfig, create_associated_token_account_idempotent_instruction,
     derive_associated_token_address, spl_transfer_checked_instruction,
 };
+use crate::recover::{RecoverResponse, RecoverStatus};
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, WebhookEvent};
 use crate::webhook::send_webhook;
@@ -1775,6 +1776,359 @@ impl SolanaDetector {
             DetectorError::InvalidConfig(format!("Failed to rename state file: {e}"))
         })?;
         Ok(())
+    }
+
+    /// On-demand TXID recovery. Called when a user submits a Solana
+    /// signature claiming they paid but never got credited (e.g. the
+    /// detector was offline, the webhook failed, or — most commonly —
+    /// the reservation TTL expired before the deposit confirmed and
+    /// the regular scan loop never picked it up).
+    ///
+    /// Verifies the destination of the transaction is the address
+    /// **currently reserved** for `user_id` (refuses cross-user TXID
+    /// stealing — if the user's reservation has expired they must
+    /// re-reserve via `/solana/reserve` first), checks the detector's
+    /// own `credited_signatures` set to short-circuit duplicates,
+    /// otherwise enqueues into pending state and runs a single
+    /// `process_credits` cycle so the sweep + `payment_credited`
+    /// webhook fire synchronously before returning. The backend's
+    /// DB unique index on the credited TXID gives the final layer of
+    /// double-credit protection.
+    pub async fn recover_txid(
+        &self,
+        signature: &str,
+        user_id: &str,
+    ) -> Result<RecoverResponse, DetectorError> {
+        let signature = signature.trim();
+        let user_id = user_id.trim();
+        if signature.is_empty() {
+            return Err(DetectorError::InvalidConfig(
+                "signature cannot be empty".into(),
+            ));
+        }
+        if user_id.is_empty() {
+            return Err(DetectorError::InvalidConfig(
+                "user_id cannot be empty".into(),
+            ));
+        }
+        let txid_owned = signature.to_string();
+        let user_id_owned = user_id.to_string();
+        let mk = |status: RecoverStatus| {
+            RecoverResponse::new(
+                Chain::Solana,
+                txid_owned.clone(),
+                user_id_owned.clone(),
+                status,
+            )
+        };
+
+        // Detector-side dedup: if we've already credited this signature
+        // in any prior cycle/recovery, do nothing. The backend either
+        // already has the balance, or its unique index swallowed the
+        // duplicate webhook and the user needs operator help.
+        {
+            let state = self.state.lock().unwrap();
+            if state.credited_signatures.contains(signature) {
+                log::info!(
+                    "[SOL] /recover-txid: {} already credited for user_id={user_id}",
+                    signature
+                );
+                return Ok(mk(RecoverStatus::AlreadyCredited));
+            }
+        }
+
+        // Look up the user's currently active reservation. Refusing
+        // here when the user has no active reservation prevents
+        // anyone from sliding a stranger's TXID through the recovery
+        // path — the wallet may now be reassigned to a different user.
+        let reservations = load_active_reservations(&self.config.redis_url).await?;
+        let reservation = match reservations.into_iter().find(|r| r.user_id == user_id) {
+            Some(r) => r,
+            None => {
+                log::warn!(
+                    "[SOL] /recover-txid: user_id={user_id} has no active Solana reservation; ask them to call /solana/reserve again"
+                );
+                return Ok(mk(RecoverStatus::WrongUser));
+            }
+        };
+
+        log::info!(
+            "[SOL] /recover-txid: signature={} user_id={} reserved_address={}",
+            signature, user_id, reservation.address
+        );
+
+        // Sanity check: the reserved address must still exist in our
+        // local wallet pool (we hold the keys). Defends against stale
+        // Redis state pointing to a wallet that's no longer loaded.
+        {
+            let snapshot = snapshot_wallets(&self.wallets);
+            if find_wallet(&snapshot, &reservation.address).is_none() {
+                log::warn!(
+                    "[SOL] /recover-txid: reserved address {} not in pool — refusing recovery",
+                    reservation.address
+                );
+                return Ok(mk(RecoverStatus::AddressNotOwned));
+            }
+        }
+
+        // Fetch the transaction from RPC. A "could not find" result
+        // surfaces as an `ApiError` with the RPC error message; map
+        // common shapes to TxNotFound and let other errors bubble up.
+        let tx = match self.get_transaction(signature).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                let message = error.to_string().to_ascii_lowercase();
+                if message.contains("not found")
+                    || message.contains("could not")
+                    || message.contains("-32004")
+                    || message.contains("invalid param")
+                {
+                    log::info!(
+                        "[SOL] /recover-txid: signature={} not found on chain ({})",
+                        signature, error
+                    );
+                    return Ok(mk(RecoverStatus::TxNotFound));
+                }
+                return Err(error);
+            }
+        };
+
+        // First try native SOL credit to the reserved owner address.
+        if let Some(amount_lamports) =
+            Self::extract_positive_lamports_to_address(&tx, &reservation.address)
+        {
+            let amount_coin = amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64;
+            self.enqueue_recovered_native(&reservation, signature, &tx, amount_lamports)
+                .await?;
+            self.run_recovery_credit_cycle().await?;
+            return Ok(self.recover_outcome_for_signature(
+                signature,
+                Chain::Solana.ticker().to_string(),
+                amount_coin,
+                user_id,
+            ));
+        }
+
+        // Otherwise scan each configured SPL token for a positive
+        // balance change on the owner / corresponding ATA.
+        let owner = match Pubkey::from_str(&reservation.address) {
+            Ok(owner) => owner,
+            Err(error) => {
+                log::warn!(
+                    "[SOL] /recover-txid: invalid reserved address '{}': {error}",
+                    reservation.address
+                );
+                return Ok(mk(RecoverStatus::AddressNotOwned));
+            }
+        };
+        let tokens = self.tokens.clone();
+        for token in &tokens {
+            let ata = self.ata_for_wallet(&owner, &token.mint);
+            let ata_string = ata.to_string();
+            let mint_string = token.mint.to_string();
+            let owner_string = owner.to_string();
+            if let Some(amount_base_units) = Self::extract_positive_token_amount(
+                &tx,
+                &owner_string,
+                &mint_string,
+                &ata_string,
+            ) {
+                let amount_coin =
+                    amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
+                self.enqueue_recovered_token(
+                    &reservation,
+                    signature,
+                    &tx,
+                    token,
+                    amount_base_units,
+                )
+                .await?;
+                self.run_recovery_credit_cycle().await?;
+                return Ok(self.recover_outcome_for_signature(
+                    signature,
+                    token.symbol.clone(),
+                    amount_coin,
+                    user_id,
+                ));
+            }
+        }
+
+        log::info!(
+            "[SOL] /recover-txid: signature={} produced no positive credit to {} (for user_id={user_id})",
+            signature, reservation.address
+        );
+        Ok(mk(RecoverStatus::NoCreditAmount))
+    }
+
+    async fn enqueue_recovered_native(
+        &self,
+        reservation: &SolanaReservation,
+        signature: &str,
+        tx: &RpcTransactionResult,
+        amount_lamports: u64,
+    ) -> Result<(), DetectorError> {
+        let detected = DetectedPayment {
+            chain: Chain::Solana,
+            ticker: Chain::Solana.ticker().to_string(),
+            txid: signature.to_string(),
+            address: reservation.address.clone(),
+            user_id: Some(reservation.user_id.clone()),
+            amount_sat: amount_lamports,
+            amount_coin: amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64,
+            confirmations: 1,
+            block_height: Some(tx.slot),
+            derivation_index: reservation.wallet_index,
+            memo: None,
+            swept_to_address: None,
+            swept_amount_sat: None,
+            swept_amount_coin: None,
+            sweep_txid: None,
+            fiat_amount: None,
+            fiat_currency: None,
+            coin_price: None,
+            asset: None,
+            asset_decimals: None,
+            amount_base_units: None,
+            swept_amount_base_units: None,
+            token_contract: None,
+        };
+
+        send_webhook(
+            &self.webhook_client,
+            &self.config.webhook_url,
+            &self.config.webhook_hmac_secret,
+            &WebhookEvent::PaymentDetected(detected),
+        )
+        .await?;
+
+        {
+            let mut state = self.state.lock().unwrap();
+            let already_pending = state.pending.iter().any(|p| p.signature == signature);
+            let already_credited = state.credited_signatures.contains(signature);
+            if !already_pending && !already_credited {
+                state.pending.push(SolanaPendingPayment {
+                    signature: signature.to_string(),
+                    slot: tx.slot,
+                    amount_base_units: amount_lamports,
+                    address: reservation.address.clone(),
+                    user_id: reservation.user_id.clone(),
+                    wallet_index: reservation.wallet_index,
+                    asset: None,
+                    asset_decimals: None,
+                    token_mint: None,
+                });
+            }
+        }
+
+        // Best-effort cursor advance so the regular scan loop doesn't
+        // re-emit a `payment_detected` for the same signature.
+        let _ = self.update_last_processed_signature(&reservation.address, signature);
+        Ok(())
+    }
+
+    async fn enqueue_recovered_token(
+        &self,
+        reservation: &SolanaReservation,
+        signature: &str,
+        tx: &RpcTransactionResult,
+        token: &SplTokenConfig,
+        amount_base_units: u64,
+    ) -> Result<(), DetectorError> {
+        let mint_string = token.mint.to_string();
+        let amount_coin =
+            amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
+        let detected = DetectedPayment {
+            chain: Chain::Solana,
+            ticker: token.symbol.clone(),
+            txid: signature.to_string(),
+            address: reservation.address.clone(),
+            user_id: Some(reservation.user_id.clone()),
+            amount_sat: amount_base_units,
+            amount_coin,
+            confirmations: 1,
+            block_height: Some(tx.slot),
+            derivation_index: reservation.wallet_index,
+            memo: None,
+            swept_to_address: None,
+            swept_amount_sat: None,
+            swept_amount_coin: None,
+            sweep_txid: None,
+            fiat_amount: None,
+            fiat_currency: None,
+            coin_price: None,
+            asset: Some(token.symbol.clone()),
+            asset_decimals: Some(token.decimals),
+            amount_base_units: Some(amount_base_units.to_string()),
+            swept_amount_base_units: None,
+            token_contract: Some(mint_string.clone()),
+        };
+
+        send_webhook(
+            &self.webhook_client,
+            &self.config.webhook_url,
+            &self.config.webhook_hmac_secret,
+            &WebhookEvent::PaymentDetected(detected),
+        )
+        .await?;
+
+        {
+            let mut state = self.state.lock().unwrap();
+            let already_pending = state.pending.iter().any(|p| p.signature == signature);
+            let already_credited = state.credited_signatures.contains(signature);
+            if !already_pending && !already_credited {
+                state.pending.push(SolanaPendingPayment {
+                    signature: signature.to_string(),
+                    slot: tx.slot,
+                    amount_base_units,
+                    address: reservation.address.clone(),
+                    user_id: reservation.user_id.clone(),
+                    wallet_index: reservation.wallet_index,
+                    asset: Some(token.symbol.clone()),
+                    asset_decimals: Some(token.decimals),
+                    token_mint: Some(mint_string),
+                });
+            }
+        }
+
+        let owner = Pubkey::from_str(&reservation.address).map_err(|e| {
+            DetectorError::InvalidConfig(format!(
+                "Invalid reserved Solana address '{}': {e}",
+                reservation.address
+            ))
+        })?;
+        let ata_string = self.ata_for_wallet(&owner, &token.mint).to_string();
+        let _ = self.update_last_processed_signature(&ata_string, signature);
+        Ok(())
+    }
+
+    async fn run_recovery_credit_cycle(&self) -> Result<(), DetectorError> {
+        let current_slot = self.get_current_slot().await?;
+        self.process_credits(current_slot).await
+    }
+
+    fn recover_outcome_for_signature(
+        &self,
+        signature: &str,
+        asset: String,
+        amount_coin: f64,
+        user_id: &str,
+    ) -> RecoverResponse {
+        let credited = {
+            let state = self.state.lock().unwrap();
+            state.credited_signatures.contains(signature)
+        };
+        let status = if credited {
+            RecoverStatus::Credited
+        } else {
+            RecoverStatus::PendingSweep
+        };
+        RecoverResponse::new(
+            Chain::Solana,
+            signature.to_string(),
+            user_id.to_string(),
+            status,
+        )
+        .with_asset(asset, amount_coin)
     }
 }
 

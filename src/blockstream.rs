@@ -10,6 +10,7 @@ use crate::derivation::derive_address;
 use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
+use crate::recover::{RecoverResponse, RecoverStatus};
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, DetectorConfig, WebhookEvent};
 use crate::webhook::send_webhook;
@@ -885,6 +886,280 @@ impl ChainDetector {
 
         Ok(())
     }
+
+    /// On-demand TXID recovery for BTC / LTC. The user submits a tx
+    /// hash claiming they paid but never got credited; the detector
+    /// fetches the transaction from an Esplora-compatible explorer,
+    /// reverse-derives each output address against our xpub, and
+    /// requires the matching derivation index to equal `user_id`
+    /// (refuses cross-user TXID submissions).
+    ///
+    /// `max_derivation_index` bounds the reverse-derivation scan and
+    /// must match the value passed to `run_block_scan_loop` — set
+    /// from `MAX_DERIVATION_INDEX` env at the API binary level.
+    pub async fn recover_txid(
+        &self,
+        txid: &str,
+        user_id: u32,
+        max_derivation_index: u32,
+    ) -> Result<RecoverResponse, DetectorError> {
+        let txid = txid.trim();
+        let chain = self.config.chain;
+        let txid_owned = txid.to_string();
+        let user_id_str = user_id.to_string();
+        let mk = |status: RecoverStatus| {
+            RecoverResponse::new(chain, txid_owned.clone(), user_id_str.clone(), status)
+        };
+        if txid.is_empty() {
+            return Err(DetectorError::InvalidConfig("txid cannot be empty".into()));
+        }
+        if user_id > max_derivation_index {
+            log::warn!(
+                "[{}] /recover-txid: user_id {user_id} exceeds MAX_DERIVATION_INDEX={max_derivation_index}",
+                chain.ticker()
+            );
+            return Ok(mk(RecoverStatus::WrongUser));
+        }
+
+        // Detector-side dedup: already credited via the regular block
+        // scan or a previous recovery. Backend's unique DB index will
+        // also catch duplicates if a webhook somehow re-fires.
+        {
+            let state = self.state.lock().unwrap();
+            if state.notified_confirmed.contains(txid) {
+                log::info!(
+                    "[{}] /recover-txid: txid={txid} already credited (user_id={user_id})",
+                    chain.ticker()
+                );
+                return Ok(mk(RecoverStatus::AlreadyCredited));
+            }
+            if state.pending.iter().any(|p| p.payment.txid == txid) {
+                log::info!(
+                    "[{}] /recover-txid: txid={txid} already pending sweep (user_id={user_id})",
+                    chain.ticker()
+                );
+                return Ok(mk(RecoverStatus::PendingSweep));
+            }
+        }
+
+        // The address we expect to credit. If the supplied user_id
+        // doesn't yield the same address as one of the tx outputs,
+        // the recovery is rejected.
+        let expected_address = derive_address(&self.config.xpub, user_id, chain).map_err(|e| {
+            DetectorError::InvalidConfig(format!(
+                "Failed to derive xpub address for user_id={user_id}: {e}"
+            ))
+        })?;
+
+        let tx = match self.fetch_esplora_tx(txid).await? {
+            Some(tx) => tx,
+            None => {
+                log::info!(
+                    "[{}] /recover-txid: txid={txid} not found on chain (user_id={user_id})",
+                    chain.ticker()
+                );
+                return Ok(mk(RecoverStatus::TxNotFound));
+            }
+        };
+        if !tx.status.confirmed {
+            log::info!(
+                "[{}] /recover-txid: txid={txid} not yet confirmed (user_id={user_id})",
+                chain.ticker()
+            );
+            return Ok(mk(RecoverStatus::TxNotFound));
+        }
+        let block_height = tx.status.block_height.unwrap_or(0);
+
+        // Sum positive outputs whose address matches `expected_address`.
+        // Multiple outputs to the same address in one tx are rare but
+        // possible (CoinJoin, batched payouts) — credit the total.
+        let mut amount_sat: u64 = 0;
+        let mut matched_other_user = false;
+        for vout in &tx.vout {
+            let Some(address) = vout.scriptpubkey_address.as_deref() else {
+                continue;
+            };
+            if address == expected_address {
+                amount_sat = amount_sat.saturating_add(vout.value);
+                continue;
+            }
+            // Side-effect: detect that the tx targets *some* address
+            // we own (different user). Used only to refine the error
+            // returned to the caller.
+            if !matched_other_user
+                && let Some(found_index) =
+                    self.reverse_derive_address(address, max_derivation_index)?
+                && found_index != user_id
+            {
+                matched_other_user = true;
+            }
+        }
+
+        if amount_sat == 0 {
+            if matched_other_user {
+                log::warn!(
+                    "[{}] /recover-txid: txid={txid} credits a different user, not user_id={user_id}",
+                    chain.ticker()
+                );
+                return Ok(mk(RecoverStatus::WrongUser));
+            }
+            log::info!(
+                "[{}] /recover-txid: txid={txid} has no output to {expected_address} (user_id={user_id})",
+                chain.ticker()
+            );
+            return Ok(mk(RecoverStatus::AddressNotOwned));
+        }
+
+        let amount_coin = amount_sat as f64 / chain.sats_per_unit() as f64;
+        let tip_height = self.get_chain_tip().await?;
+        let confirmations = tip_height.saturating_sub(block_height) + 1;
+
+        let detected = DetectedPayment {
+            chain,
+            ticker: chain.ticker().to_string(),
+            txid: txid.to_string(),
+            address: expected_address.clone(),
+            user_id: None,
+            amount_sat,
+            amount_coin,
+            confirmations,
+            block_height: Some(block_height),
+            derivation_index: user_id,
+            memo: None,
+            swept_to_address: None,
+            swept_amount_sat: None,
+            swept_amount_coin: None,
+            sweep_txid: None,
+            fiat_amount: None,
+            fiat_currency: None,
+            coin_price: None,
+            asset: None,
+            asset_decimals: None,
+            amount_base_units: None,
+            swept_amount_base_units: None,
+            token_contract: None,
+        };
+
+        // First send a `payment_detected` so the backend records the
+        // event. Idempotent on the backend side via the same key the
+        // regular scan loop would have produced.
+        send_webhook(
+            &self.webhook_client,
+            &self.config.webhook_url,
+            &self.config.webhook_hmac_secret,
+            &WebhookEvent::PaymentDetected(detected.clone()),
+        )
+        .await?;
+
+        // Enqueue and run the confirmation/sweep cycle synchronously so
+        // an already-confirmed tx fires `payment_credited` immediately
+        // rather than waiting for the next poll tick.
+        self.enqueue_or_confirm(vec![detected]);
+        self.process_confirmed(tip_height).await?;
+
+        let credited = {
+            let state = self.state.lock().unwrap();
+            state.notified_confirmed.contains(txid)
+        };
+        let status = if credited {
+            RecoverStatus::Credited
+        } else {
+            RecoverStatus::PendingSweep
+        };
+        Ok(RecoverResponse::new(
+            chain,
+            txid.to_string(),
+            user_id_str,
+            status,
+        )
+        .with_asset(chain.ticker().to_string(), amount_coin))
+    }
+
+    /// Fetch a transaction by id from the first available
+    /// Esplora-compatible explorer. Returns `Ok(None)` for 404 (tx not
+    /// found yet / never existed) and an error for transport failures.
+    /// Blockchair-only configurations cause an error because the
+    /// transaction-by-id schema is different and not used elsewhere.
+    async fn fetch_esplora_tx(
+        &self,
+        txid: &str,
+    ) -> Result<Option<EsploraTx>, DetectorError> {
+        let base_url = match self.esplora_base_url() {
+            Some(url) => url,
+            None => {
+                return Err(DetectorError::ApiError(
+                    "Recovery requires an Esplora-compatible explorer (none configured)".into(),
+                ));
+            }
+        };
+        let url = format!(
+            "{}/tx/{}",
+            base_url.trim_end_matches('/'),
+            txid
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| DetectorError::ApiError(format!("Esplora /tx fetch failed: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(DetectorError::ApiError(format!(
+                "Esplora /tx returned status {status}"
+            )));
+        }
+        let parsed: EsploraTx = resp
+            .json()
+            .await
+            .map_err(|e| DetectorError::ApiError(format!("Esplora /tx parse failed: {e}")))?;
+        Ok(Some(parsed))
+    }
+
+    /// Reverse-derive a BTC/LTC address against our xpub by trying
+    /// every index in `0..=max_derivation_index`. Returns the matching
+    /// index when found, otherwise `Ok(None)`. Used only to produce
+    /// better error messages — not in the credit path.
+    fn reverse_derive_address(
+        &self,
+        address: &str,
+        max_derivation_index: u32,
+    ) -> Result<Option<u32>, DetectorError> {
+        for index in 0..=max_derivation_index {
+            let derived = derive_address(&self.config.xpub, index, self.config.chain)?;
+            if derived == address {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EsploraTx {
+    #[serde(default)]
+    vout: Vec<EsploraVout>,
+    status: EsploraTxStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct EsploraVout {
+    #[serde(default)]
+    scriptpubkey_address: Option<String>,
+    #[serde(default)]
+    value: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EsploraTxStatus {
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    block_height: Option<u64>,
 }
 
 impl PaymentDetector for ChainDetector {

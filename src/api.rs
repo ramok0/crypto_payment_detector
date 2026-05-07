@@ -12,6 +12,7 @@ use crypto_payment_detector::env_utils::{
     chain_env_bool, chain_env_prefix, chain_env_var, env_bool, proxy_env_var,
 };
 use crypto_payment_detector::persistence::load_state;
+use crypto_payment_detector::recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
@@ -29,6 +30,10 @@ struct AppState {
     solana_pool: Option<SolanaPoolApiState>,
     ethereum_pool: Option<EthereumPoolApiState>,
     base_pool: Option<EthereumPoolApiState>,
+    /// Per-chain BTC/LTC detector handles. Used by `/recover-txid` to
+    /// look up an old TXID against the configured xpub and enqueue
+    /// the missed payment for sweep + webhook synchronously.
+    bitcoin_detectors: HashMap<Chain, BitcoinRecoveryState>,
 }
 
 #[derive(Clone)]
@@ -38,6 +43,10 @@ struct SolanaPoolApiState {
     redis_url: String,
     reservation_ttl_secs: u64,
     secure_deposit_address: String,
+    /// Live detector handle used by `/solana/recover-txid` to fetch a
+    /// historical signature, verify ownership against the active
+    /// reservation, and emit the credit webhook synchronously.
+    detector: Option<Arc<SolanaDetector>>,
 }
 
 #[derive(Clone)]
@@ -49,6 +58,14 @@ struct EthereumPoolApiState {
     reservation_ttl_secs: u64,
     gas_tank_address: String,
     ledger_address: String,
+    /// Live detector handle used by `/<chain>/recover-txid`.
+    detector: Option<Arc<EthereumDetector>>,
+}
+
+#[derive(Clone)]
+struct BitcoinRecoveryState {
+    detector: Arc<ChainDetector>,
+    max_derivation_index: u32,
 }
 
 #[derive(Clone)]
@@ -519,6 +536,130 @@ async fn handle_base_active(
     handle_evm_active(state.base_pool.as_ref()).await
 }
 
+fn validate_recover_user_id(raw: &str) -> Result<String, (StatusCode, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "user_id cannot be empty".into()));
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn handle_solana_recover(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, (StatusCode, String)> {
+    let Some(solana_pool) = state.solana_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Solana address pool is not configured".into(),
+        ));
+    };
+    let detector = solana_pool.detector.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Solana detector is not running in this process".to_string(),
+    ))?;
+
+    let user_id = validate_recover_user_id(&payload.user_id)?;
+    let response = detector
+        .recover_txid(payload.txid.trim(), &user_id)
+        .await
+        .map_err(map_internal_error)?;
+    Ok(Json(response))
+}
+
+async fn handle_evm_recover(
+    pool: Option<&EthereumPoolApiState>,
+    payload: RecoverRequest,
+) -> Result<Json<RecoverResponse>, (StatusCode, String)> {
+    let Some(pool) = pool else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "EVM address pool is not configured".into(),
+        ));
+    };
+    let detector = pool.detector.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "{} detector is not running in this process",
+            pool.chain.ticker()
+        ),
+    ))?;
+
+    let user_id = validate_recover_user_id(&payload.user_id)?;
+    let response = detector
+        .recover_txid(payload.txid.trim(), &user_id)
+        .await
+        .map_err(map_internal_error)?;
+    Ok(Json(response))
+}
+
+async fn handle_ethereum_recover(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, (StatusCode, String)> {
+    handle_evm_recover(state.ethereum_pool.as_ref(), payload).await
+}
+
+async fn handle_base_recover(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, (StatusCode, String)> {
+    handle_evm_recover(state.base_pool.as_ref(), payload).await
+}
+
+async fn handle_bitcoin_recover(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, (StatusCode, String)> {
+    handle_btc_recover(&state, Chain::Bitcoin, payload).await
+}
+
+async fn handle_litecoin_recover(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, (StatusCode, String)> {
+    handle_btc_recover(&state, Chain::Litecoin, payload).await
+}
+
+async fn handle_btc_recover(
+    state: &AppState,
+    chain: Chain,
+    payload: RecoverRequest,
+) -> Result<Json<RecoverResponse>, (StatusCode, String)> {
+    let recovery = state.bitcoin_detectors.get(&chain).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "{} detector is not configured (set {}_XPUB to enable)",
+            chain.ticker(),
+            chain.ticker(),
+        ),
+    ))?;
+
+    let user_id_str = validate_recover_user_id(&payload.user_id)?;
+    let user_id_u32: u32 = user_id_str.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} recovery: user_id must be a non-negative xpub derivation index",
+                chain.ticker()
+            ),
+        )
+    })?;
+
+    let response = recovery
+        .detector
+        .recover_txid(payload.txid.trim(), user_id_u32, recovery.max_derivation_index)
+        .await
+        .map_err(map_internal_error)?;
+    if matches!(response.status, RecoverStatus::WrongUser) {
+        log::warn!(
+            "[{}] /recover-txid rejected for user_id={user_id_u32}: address ownership mismatch",
+            chain.ticker()
+        );
+    }
+    Ok(Json(response))
+}
+
 fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
     let state_file_default = match chain {
         Chain::Bitcoin => "btc_detector_state.json",
@@ -923,6 +1064,7 @@ fn build_evm_chain_info(config: &EthereumConfig, gas_tank_address: String) -> Ch
 fn build_solana_pool_api_state(
     config: &SolanaConfig,
     wallets: SharedSolanaWallets,
+    detector: Option<Arc<SolanaDetector>>,
 ) -> Result<SolanaPoolApiState, DetectorError> {
     Ok(SolanaPoolApiState {
         wallets,
@@ -930,6 +1072,7 @@ fn build_solana_pool_api_state(
         redis_url: config.redis_url.clone(),
         reservation_ttl_secs: config.reservation_ttl_secs,
         secure_deposit_address: config.secure_deposit_address.clone(),
+        detector,
     })
 }
 
@@ -937,6 +1080,7 @@ fn build_ethereum_pool_api_state(
     config: &EthereumConfig,
     wallets: SharedEthereumWallets,
     gas_tank_address: String,
+    detector: Option<Arc<EthereumDetector>>,
 ) -> Result<EthereumPoolApiState, DetectorError> {
     Ok(EthereumPoolApiState {
         chain: config.chain,
@@ -946,6 +1090,7 @@ fn build_ethereum_pool_api_state(
         reservation_ttl_secs: config.reservation_ttl_secs,
         gas_tank_address,
         ledger_address: config.ledger_address.clone(),
+        detector,
     })
 }
 
@@ -1091,6 +1236,7 @@ async fn main() {
 
     let mut chain_infos = Vec::new();
     let mut detector_handles = Vec::new();
+    let mut bitcoin_detectors: HashMap<Chain, BitcoinRecoveryState> = HashMap::new();
     let mut solana_pool = None;
     let mut ethereum_pool = None;
     let mut base_pool = None;
@@ -1125,6 +1271,13 @@ async fn main() {
                         run_detector(detector_handle, max_index).await;
                     }));
 
+                    bitcoin_detectors.insert(
+                        *chain,
+                        BitcoinRecoveryState {
+                            detector: detector.clone(),
+                            max_derivation_index: max_index,
+                        },
+                    );
                     chain_infos.push(info);
                 } else {
                     let xpub_var = match chain {
@@ -1145,12 +1298,16 @@ async fn main() {
                         load_wallet_pool(&config.wallet_pool_file)
                             .expect("Failed to load Solana wallet pool"),
                     );
-                    let pool_state = build_solana_pool_api_state(&config, wallets.clone())
-                        .expect("Failed to build Solana pool state");
                     let detector = Arc::new(
-                        SolanaDetector::new(config.clone(), tokens, wallets)
+                        SolanaDetector::new(config.clone(), tokens, wallets.clone())
                             .expect("Failed to create SOL detector"),
                     );
+                    let pool_state = build_solana_pool_api_state(
+                        &config,
+                        wallets,
+                        Some(detector.clone()),
+                    )
+                    .expect("Failed to build Solana pool state");
 
                     log::info!(
                         "[SOL] Detector started - ledger: {} - gas tank: {} - managed wallets: {} - tokens: {} - default reservation TTL: {}s",
@@ -1200,11 +1357,15 @@ async fn main() {
                     ),
                 );
                 let gas_tank_address = detector.gas_tank_address();
-                let pool_state =
-                    build_ethereum_pool_api_state(&config, wallets, gas_tank_address.clone())
-                        .unwrap_or_else(|e| {
-                            panic!("Failed to build {} pool state: {e}", evm_chain.name())
-                        });
+                let pool_state = build_ethereum_pool_api_state(
+                    &config,
+                    wallets,
+                    gas_tank_address.clone(),
+                    Some(detector.clone()),
+                )
+                .unwrap_or_else(|e| {
+                    panic!("Failed to build {} pool state: {e}", evm_chain.name())
+                });
 
                 log::info!(
                     "[{}] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {} - default reservation TTL: {}s",
@@ -1243,6 +1404,7 @@ async fn main() {
         solana_pool,
         ethereum_pool,
         base_pool,
+        bitcoin_detectors,
     });
 
     let app = Router::new()
@@ -1250,10 +1412,15 @@ async fn main() {
         .route("/derive", get(handle_derive))
         .route("/solana/reserve", post(handle_solana_reserve))
         .route("/solana/active", get(handle_solana_active))
+        .route("/solana/recover-txid", post(handle_solana_recover))
         .route("/ethereum/reserve", post(handle_ethereum_reserve))
         .route("/ethereum/active", get(handle_ethereum_active))
+        .route("/ethereum/recover-txid", post(handle_ethereum_recover))
         .route("/base/reserve", post(handle_base_reserve))
         .route("/base/active", get(handle_base_active))
+        .route("/base/recover-txid", post(handle_base_recover))
+        .route("/bitcoin/recover-txid", post(handle_bitcoin_recover))
+        .route("/litecoin/recover-txid", post(handle_litecoin_recover))
         .with_state(state);
 
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());
