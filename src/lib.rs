@@ -23,18 +23,20 @@ pub use ethereum::{
     Erc20TokenConfig, EthereumConfig, EthereumDetector, default_erc20_tokens, parse_erc20_tokens,
 };
 pub use ethereum_pool::{
-    EthereumReservation, ManagedEthereumWallet, SharedEthereumWallets,
-    ethereum_reservation_store_url_from_env, ethereum_reservations_use_memory,
-    load_active_ethereum_reservations, load_ethereum_wallet_pool, reserve_ethereum_wallet_for_user,
-    shared_ethereum_wallets,
+    EthereumAssignment, EthereumReservation, ManagedEthereumWallet, SharedEthereumWallets,
+    assign_ethereum_wallet_for_user, ethereum_reservation_store_url_from_env,
+    ethereum_reservations_use_memory, load_active_ethereum_assignments,
+    load_active_ethereum_reservations, load_ethereum_assignment_for_user, load_ethereum_wallet_pool,
+    reserve_ethereum_wallet_for_user, shared_ethereum_wallets,
 };
 pub use etherscan::{EtherscanClient, EtherscanConfig, EtherscanInternalTx};
 pub use pricing::PriceFetcher;
 pub use recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 pub use solana::{SolanaConfig, SolanaDetector};
 pub use solana_pool::{
-    ManagedSolanaWallet, SharedSolanaWallets, SolanaReservation, load_active_reservations,
-    load_wallet_pool, reserve_wallet_for_user, shared_wallets,
+    ManagedSolanaWallet, SharedSolanaWallets, SolanaAssignment, SolanaReservation,
+    assign_wallet_for_user, load_active_assignments, load_active_reservations,
+    load_assignment_for_user, load_wallet_pool, reserve_wallet_for_user, shared_wallets,
 };
 pub use solana_tokens::{SplTokenConfig, default_spl_tokens, parse_spl_tokens};
 pub use trait_def::PaymentDetector;

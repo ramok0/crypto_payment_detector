@@ -17,7 +17,8 @@ use crate::env_utils::{chain_env_prefix, redact_url_credentials};
 use crate::error::DetectorError;
 use crate::ethereum_pool::{
     EthereumReservation, SharedEthereumWallets, find_ethereum_wallet, format_address,
-    load_active_ethereum_reservations, snapshot_ethereum_wallets,
+    load_active_ethereum_reservations, load_ethereum_assignment_for_user,
+    snapshot_ethereum_wallets,
 };
 use crate::etherscan::{EtherscanClient, EtherscanConfig};
 use crate::pricing::PriceFetcher;
@@ -350,6 +351,36 @@ impl EthereumDetector {
 
     pub fn token_count(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Manually trigger a scan + sweep + credit pass for the user with the
+    /// given `user_id`. Looks up the user's permanent assignment, runs a
+    /// full process cycle (block scan + pending sweep) and returns the
+    /// assigned address. The webhook (`payment_detected` then
+    /// `payment_credited`) is fired by the underlying pipeline.
+    pub async fn claim_for_user(&self, user_id: &str) -> Result<String, DetectorError> {
+        let assignment =
+            load_ethereum_assignment_for_user(self.config.chain, &self.config.redis_url, user_id)
+                .await?
+                .ok_or_else(|| {
+                    DetectorError::InvalidConfig(format!(
+                        "No {} deposit address assigned to user_id={user_id} - call /{}/address first",
+                        self.config.chain.name(),
+                        self.config.chain.name().to_ascii_lowercase()
+                    ))
+                })?;
+
+        let address = assignment.address.clone();
+        log::info!(
+            "[{}] /claim triggered for user_id={} address={}",
+            self.config.chain.ticker(),
+            user_id,
+            address
+        );
+
+        self.process_cycle().await?;
+
+        Ok(address)
     }
 
     pub async fn sweep_orphan_balances(&self) -> Result<(), DetectorError> {
@@ -1752,17 +1783,21 @@ impl EthereumDetector {
             }
         };
 
-        // Look up the user's currently active reservation. Refusing
-        // here when the user has no reservation prevents anyone from
-        // claiming a stranger's TXID — the wallet may have been
-        // reassigned to a different user after TTL expiry.
-        let reservations =
-            load_active_ethereum_reservations(chain, &self.config.redis_url).await?;
-        let reservation = match reservations.into_iter().find(|r| r.user_id == user_id) {
-            Some(r) => r,
+        // Look up the user's permanent assignment. Refusing here when
+        // the user has no assignment prevents anyone from claiming a
+        // stranger's TXID — the assignment table is the authoritative
+        // user_id ↔ address binding.
+        let reservation = match load_ethereum_assignment_for_user(
+            chain,
+            &self.config.redis_url,
+            user_id,
+        )
+        .await?
+        {
+            Some(a) => a,
             None => {
                 log::warn!(
-                    "[{}] /recover-txid: user_id={user_id} has no active reservation; ask them to re-reserve first",
+                    "[{}] /recover-txid: user_id={user_id} has no address assignment; ask them to call /<chain>/address first",
                     chain.ticker()
                 );
                 return Ok(mk(RecoverStatus::WrongUser));
@@ -1771,7 +1806,7 @@ impl EthereumDetector {
 
         let reservation_address = Address::from_str(&reservation.address).map_err(|e| {
             DetectorError::InvalidConfig(format!(
-                "Invalid persisted EVM reservation address '{}': {e}",
+                "Invalid persisted EVM assignment address '{}': {e}",
                 reservation.address
             ))
         })?;

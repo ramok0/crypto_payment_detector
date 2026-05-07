@@ -19,13 +19,19 @@ const IN_MEMORY_RESERVATION_URL: &str = "memory://evm-reservations";
 const DEFAULT_ETHEREUM_WALLET_POOL_SIZE: usize = 10;
 const MAX_ETHEREUM_WALLET_POOL_SIZE: usize = 10_000;
 
+/// Sentinel `expires_at_unix` value meaning "no expiration".
+pub const NEVER_EXPIRES: i64 = 0;
+
 /// Redis key namespace per EVM chain. Distinct prefixes prevent two detectors
 /// (e.g. Ethereum + Base) from colliding on the same address space when both
-/// chains run in the same process and share a Redis instance.
+/// chains run in the same process and share a Redis instance. The new
+/// "assignment:" prefix replaces the old "reservation:" prefix that used a
+/// Redis TTL to expire stale entries — assignments are now permanent and the
+/// user explicitly triggers a /claim to credit their balance.
 fn reservation_key_prefix(chain: Chain) -> &'static str {
     match chain {
-        Chain::Ethereum => "ethereum:reservation:",
-        Chain::Base => "base:reservation:",
+        Chain::Ethereum => "ethereum:assignment:",
+        Chain::Base => "base:assignment:",
         _ => panic!("reservation_key_prefix called with non-EVM chain {chain:?}"),
     }
 }
@@ -51,14 +57,28 @@ pub struct ManagedEthereumWallet {
     pub wallet: Arc<LocalWallet>,
 }
 
+/// Permanent assignment of a managed EVM wallet to a single user.
+///
+/// Replaces the previous TTL-based reservation: the assignment never
+/// expires, and the user explicitly triggers a /claim to scan + sweep +
+/// credit funds received at `address`. The `expires_at_unix` field is kept
+/// for wire-format compatibility and is set to the sentinel value 0 to
+/// indicate "no expiration".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EthereumReservation {
     pub user_id: String,
     pub address: String,
     pub wallet_index: u32,
     pub reserved_at_unix: i64,
+    /// Sentinel value `0` indicates the assignment never expires.
+    #[serde(default)]
     pub expires_at_unix: i64,
 }
+
+/// Public alias matching the new domain language. Internally identical to
+/// [`EthereumReservation`] for source-compatibility with the existing
+/// detector loop.
+pub type EthereumAssignment = EthereumReservation;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -401,7 +421,7 @@ pub async fn load_active_ethereum_reservations(
             Ok(reservation) => reservations.push(reservation),
             Err(e) => {
                 log::warn!(
-                    "[{}] Failed to parse reservation '{}': {}",
+                    "[{}] Failed to parse assignment '{}': {}",
                     chain.ticker(),
                     key,
                     e
@@ -414,25 +434,49 @@ pub async fn load_active_ethereum_reservations(
     Ok(reservations)
 }
 
-pub async fn reserve_ethereum_wallet_for_user(
+/// Domain-aliased wrapper around [`load_active_ethereum_reservations`]
+/// using the new "assignment" terminology.
+pub async fn load_active_ethereum_assignments(
+    chain: Chain,
+    redis_url: &str,
+) -> Result<Vec<EthereumAssignment>, DetectorError> {
+    load_active_ethereum_reservations(chain, redis_url).await
+}
+
+/// Look up the permanent EVM assignment for a single `user_id` on `chain`,
+/// if any.
+pub async fn load_ethereum_assignment_for_user(
+    chain: Chain,
+    redis_url: &str,
+    user_id: &str,
+) -> Result<Option<EthereumAssignment>, DetectorError> {
+    let user_id = user_id.trim();
+    if user_id.is_empty() {
+        return Ok(None);
+    }
+    let assignments = load_active_ethereum_assignments(chain, redis_url).await?;
+    Ok(assignments.into_iter().find(|a| a.user_id == user_id))
+}
+
+/// Get-or-create the permanent EVM deposit address for `user_id` on
+/// `chain`. Replaces the previous TTL-based reservation flow: returns the
+/// same address every call, with no expiration.
+pub async fn assign_ethereum_wallet_for_user(
     chain: Chain,
     redis_url: &str,
     wallets: &SharedEthereumWallets,
     pool_path: &str,
     user_id: &str,
-    ttl_secs: u64,
-) -> Result<EthereumReservation, DetectorError> {
+) -> Result<EthereumAssignment, DetectorError> {
     if user_id.trim().is_empty() {
         return Err(DetectorError::InvalidConfig(format!(
-            "user_id cannot be empty when reserving a {} wallet",
+            "user_id cannot be empty when assigning a {} wallet",
             chain.name()
         )));
     }
 
     if should_use_in_memory_reservations(chain, redis_url) {
-        return reserve_ethereum_wallet_for_user_in_memory(
-            chain, wallets, pool_path, user_id, ttl_secs,
-        );
+        return assign_ethereum_wallet_for_user_in_memory(chain, wallets, pool_path, user_id);
     }
 
     let client = redis::Client::open(redis_url)
@@ -443,37 +487,10 @@ pub async fn reserve_ethereum_wallet_for_user(
         .map_err(redis_error)?;
 
     let now = unix_timestamp();
-    let ttl_secs_i64 = i64::try_from(ttl_secs).map_err(|_| {
-        DetectorError::InvalidConfig("Reservation TTL is too large to store".into())
-    })?;
-    let new_expires = now.saturating_add(ttl_secs_i64);
 
-    let existing = load_active_ethereum_reservations(chain, redis_url).await?;
-    if let Some(existing_reservation) = existing.into_iter().find(|r| r.user_id == user_id.trim()) {
-        if new_expires > existing_reservation.expires_at_unix {
-            let updated = EthereumReservation {
-                expires_at_unix: new_expires,
-                ..existing_reservation.clone()
-            };
-            let payload = serde_json::to_string(&updated)?;
-            let _: Option<String> = redis::cmd("SET")
-                .arg(reservation_key(chain, &updated.address))
-                .arg(payload)
-                .arg("EX")
-                .arg(ttl_secs)
-                .query_async(&mut connection)
-                .await
-                .map_err(redis_error)?;
-            log::info!(
-                "[{}] Extended reservation for user_id={} address={} to {}s",
-                chain.ticker(),
-                user_id,
-                updated.address,
-                ttl_secs
-            );
-            return Ok(updated);
-        }
-        return Ok(existing_reservation);
+    let existing = load_active_ethereum_assignments(chain, redis_url).await?;
+    if let Some(existing_assignment) = existing.into_iter().find(|a| a.user_id == user_id.trim()) {
+        return Ok(existing_assignment);
     }
 
     let candidates: Vec<(String, u32)> = {
@@ -484,58 +501,74 @@ pub async fn reserve_ethereum_wallet_for_user(
     };
 
     for (address, index) in candidates {
-        let reservation = EthereumReservation {
+        let assignment = EthereumAssignment {
             user_id: user_id.trim().to_string(),
             address: address.clone(),
             wallet_index: index,
             reserved_at_unix: now,
-            expires_at_unix: new_expires,
+            expires_at_unix: NEVER_EXPIRES,
         };
 
-        let payload = serde_json::to_string(&reservation)?;
+        let payload = serde_json::to_string(&assignment)?;
         let response: Option<String> = redis::cmd("SET")
             .arg(reservation_key(chain, &address))
             .arg(payload)
-            .arg("EX")
-            .arg(ttl_secs)
             .arg("NX")
             .query_async(&mut connection)
             .await
             .map_err(redis_error)?;
 
         if response.is_some() {
-            return Ok(reservation);
+            log::info!(
+                "[{}] Assigned wallet {} (index {}) to user_id={} (no TTL)",
+                chain.ticker(),
+                address,
+                index,
+                user_id
+            );
+            return Ok(assignment);
         }
     }
 
-    // Pool exhausted — generate, persist, then reserve.
+    // Pool exhausted — generate, persist, then assign.
     let new_wallet = grow_ethereum_pool(chain, wallets, pool_path)?;
-    let reservation = EthereumReservation {
+    let assignment = EthereumAssignment {
         user_id: user_id.trim().to_string(),
         address: new_wallet.address.clone(),
         wallet_index: new_wallet.index,
         reserved_at_unix: now,
-        expires_at_unix: new_expires,
+        expires_at_unix: NEVER_EXPIRES,
     };
-    let payload = serde_json::to_string(&reservation)?;
+    let payload = serde_json::to_string(&assignment)?;
     let response: Option<String> = redis::cmd("SET")
         .arg(reservation_key(chain, &new_wallet.address))
         .arg(payload)
-        .arg("EX")
-        .arg(ttl_secs)
         .arg("NX")
         .query_async(&mut connection)
         .await
         .map_err(redis_error)?;
 
     if response.is_some() {
-        Ok(reservation)
+        Ok(assignment)
     } else {
         Err(DetectorError::ApiError(format!(
-            "Failed to register reservation for newly generated {} wallet",
+            "Failed to register assignment for newly generated {} wallet",
             chain.name()
         )))
     }
+}
+
+/// Backwards-compatible alias used by older callers. The `_ttl_secs`
+/// argument is ignored — the new system never expires assignments.
+pub async fn reserve_ethereum_wallet_for_user(
+    chain: Chain,
+    redis_url: &str,
+    wallets: &SharedEthereumWallets,
+    pool_path: &str,
+    user_id: &str,
+    _ttl_secs: u64,
+) -> Result<EthereumReservation, DetectorError> {
+    assign_ethereum_wallet_for_user(chain, redis_url, wallets, pool_path, user_id).await
 }
 
 fn grow_ethereum_pool(
@@ -628,10 +661,8 @@ fn env_bool(name: &str) -> bool {
 fn load_active_ethereum_reservations_from_memory(
     chain: Chain,
 ) -> Result<Vec<EthereumReservation>, DetectorError> {
-    let now = unix_timestamp();
     let prefix = reservation_key_prefix(chain);
-    let mut store = lock_in_memory_reservations();
-    store.retain(|_, reservation| reservation.expires_at_unix > now);
+    let store = lock_in_memory_reservations();
 
     let mut reservations = store
         .iter()
@@ -642,48 +673,27 @@ fn load_active_ethereum_reservations_from_memory(
     Ok(reservations)
 }
 
-fn reserve_ethereum_wallet_for_user_in_memory(
+fn assign_ethereum_wallet_for_user_in_memory(
     chain: Chain,
     wallets: &SharedEthereumWallets,
     pool_path: &str,
     user_id: &str,
-    ttl_secs: u64,
-) -> Result<EthereumReservation, DetectorError> {
+) -> Result<EthereumAssignment, DetectorError> {
     let user_id = user_id.trim();
     let now = unix_timestamp();
     let prefix = reservation_key_prefix(chain);
-    let ttl_secs_i64 = i64::try_from(ttl_secs).map_err(|_| {
-        DetectorError::InvalidConfig("Reservation TTL is too large to store".into())
-    })?;
-    let new_expires = now.saturating_add(ttl_secs_i64);
 
     {
         let mut store = lock_in_memory_reservations();
-        store.retain(|_, reservation| reservation.expires_at_unix > now);
 
         // Match `user_id` only within this chain's namespace so a Base
-        // reservation doesn't collide with an Ethereum one for the same user.
-        if let Some((key, existing)) = store
+        // assignment doesn't collide with an Ethereum one for the same user.
+        if let Some(existing) = store
             .iter()
             .filter(|(key, _)| key.starts_with(prefix))
             .find(|(_, reservation)| reservation.user_id == user_id)
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(_, v)| v.clone())
         {
-            if new_expires > existing.expires_at_unix {
-                let updated = EthereumReservation {
-                    expires_at_unix: new_expires,
-                    ..existing
-                };
-                store.insert(key, updated.clone());
-                log::info!(
-                    "[{}] Extended in-memory reservation for user_id={} address={} to {}s",
-                    chain.ticker(),
-                    user_id,
-                    updated.address,
-                    ttl_secs
-                );
-                return Ok(updated);
-            }
             return Ok(existing);
         }
 
@@ -699,33 +709,33 @@ fn reserve_ethereum_wallet_for_user_in_memory(
             if store.contains_key(&key) {
                 continue;
             }
-            let reservation = EthereumReservation {
+            let assignment = EthereumAssignment {
                 user_id: user_id.to_string(),
                 address,
                 wallet_index: index,
                 reserved_at_unix: now,
-                expires_at_unix: new_expires,
+                expires_at_unix: NEVER_EXPIRES,
             };
-            store.insert(key, reservation.clone());
-            return Ok(reservation);
+            store.insert(key, assignment.clone());
+            return Ok(assignment);
         }
     }
 
     // Pool exhausted — grow it. (We re-acquire the in-memory lock after the grow.)
     let new_wallet = grow_ethereum_pool(chain, wallets, pool_path)?;
     let mut store = lock_in_memory_reservations();
-    let reservation = EthereumReservation {
+    let assignment = EthereumAssignment {
         user_id: user_id.to_string(),
         address: new_wallet.address.clone(),
         wallet_index: new_wallet.index,
         reserved_at_unix: now,
-        expires_at_unix: new_expires,
+        expires_at_unix: NEVER_EXPIRES,
     };
     store.insert(
         reservation_key(chain, &new_wallet.address),
-        reservation.clone(),
+        assignment.clone(),
     );
-    Ok(reservation)
+    Ok(assignment)
 }
 
 fn lock_in_memory_reservations()
