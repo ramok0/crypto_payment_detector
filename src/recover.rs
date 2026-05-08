@@ -19,10 +19,11 @@ pub enum RecoverStatus {
     /// Detector already processed this TX in a previous cycle/recovery.
     /// The backend may or may not hold the balance — caller should check.
     AlreadyCredited,
-    /// Deposit was found but is queued in pending; sweep deferred (e.g.
-    /// gas too expensive) — the regular cycle will retry. Webhook for
-    /// `payment_detected` was fired but `payment_credited` will arrive
-    /// later. From the user's perspective, the credit will land soon.
+    /// Deposit was found but is queued in pending and has not yet reached
+    /// `min_confirmations`. Webhook for `payment_detected` was fired;
+    /// `payment_credited` will arrive once the confirmation threshold is
+    /// met (the credit no longer waits for a successful sweep — funds on
+    /// our managed wallet are sufficient to credit the user).
     PendingSweep,
     /// The destination address is not in our wallet pool / not derived
     /// from our xpub. The TX is not for us.

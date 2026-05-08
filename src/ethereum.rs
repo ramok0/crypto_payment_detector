@@ -899,9 +899,6 @@ impl EthereumDetector {
             if confirmations < self.config.min_confirmations {
                 continue;
             }
-            if self.is_credited_event(&entry.event_id) {
-                continue;
-            }
             if entry.token_contract.is_none() && self.is_pending_gas_tank_top_up(&entry).await? {
                 log::info!("[{}] Ignoring previously queued gas tank top-up {} for {}", self.config.chain.ticker(),
                     entry.txid,
@@ -931,33 +928,52 @@ impl EthereumDetector {
                 self.sweep_native_from_address(&entry.address).await?
             };
 
-            if sweep.deferred {
-                log::info!("[{}] Sweep deferred for {} (will retry next cycle)", self.config.chain.ticker(),
+            let already_credited = self.is_credited_event(&entry.event_id);
+
+            if !already_credited {
+                let sweep_for_webhook = if sweep.deferred { None } else { Some(&sweep) };
+                let mut credited_payment =
+                    self.pending_to_webhook(&entry, current_block, sweep_for_webhook, amount);
+                self.enrich_fiat(&mut credited_payment).await;
+
+                send_webhook(
+                    &self.webhook_client,
+                    &self.config.webhook_url,
+                    &self.config.webhook_hmac_secret,
+                    &WebhookEvent::PaymentCredited(credited_payment),
+                )
+                .await?;
+
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.credited_events.insert(entry.event_id.clone());
+                }
+                self.persist_state()?;
+
+                if sweep.deferred {
+                    log::info!(
+                        "[{}] Credited {} immediately (funds on managed wallet); sweep deferred and will retry next cycle",
+                        self.config.chain.ticker(),
+                        entry.event_id
+                    );
+                }
+            } else if sweep.deferred {
+                log::info!(
+                    "[{}] Sweep retry deferred for already-credited {} (will retry next cycle)",
+                    self.config.chain.ticker(),
                     entry.event_id
                 );
-                continue;
             }
 
-            let mut credited_payment =
-                self.pending_to_webhook(&entry, current_block, Some(&sweep), amount);
-            self.enrich_fiat(&mut credited_payment).await;
-
-            send_webhook(
-                &self.webhook_client,
-                &self.config.webhook_url,
-                &self.config.webhook_hmac_secret,
-                &WebhookEvent::PaymentCredited(credited_payment),
-            )
-            .await?;
-
-            {
-                let mut state = self.state.lock().unwrap();
-                state.credited_events.insert(entry.event_id.clone());
-                state
-                    .pending
-                    .retain(|pending| pending.event_id != entry.event_id);
+            if !sweep.deferred {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state
+                        .pending
+                        .retain(|pending| pending.event_id != entry.event_id);
+                }
+                self.persist_state()?;
             }
-            self.persist_state()?;
         }
 
         Ok(())

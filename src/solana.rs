@@ -908,15 +908,27 @@ impl SolanaDetector {
                 continue;
             }
 
-            let credited_payment_opt: Option<DetectedPayment> = match entry.asset.as_deref() {
+            let already_credited = {
+                let state = self.state.lock().unwrap();
+                state.credited_signatures.contains(&entry.signature)
+            };
+
+            let payment_and_deferred: Option<(DetectedPayment, bool)> = match entry.asset.as_deref() {
                 None => {
                     let sweep_result = self.sweep_native_sol_from_address(&entry.address).await?;
-                    if sweep_result.deferred {
-                        log::info!(
-                            "[SOL] Native sweep deferred for {} (signature {}); will retry next cycle",
-                            entry.address, entry.signature
-                        );
-                        continue;
+                    let was_deferred = sweep_result.deferred;
+                    if was_deferred {
+                        if already_credited {
+                            log::info!(
+                                "[SOL] Native sweep retry deferred for already-credited {} (signature {})",
+                                entry.address, entry.signature
+                            );
+                        } else {
+                            log::info!(
+                                "[SOL] Crediting {} immediately (funds on managed wallet); native sweep deferred and will retry next cycle (signature {})",
+                                entry.address, entry.signature
+                            );
+                        }
                     }
                     let amount_coin =
                         entry.amount_base_units as f64 / Chain::Solana.sats_per_unit() as f64;
@@ -932,13 +944,25 @@ impl SolanaDetector {
                         block_height: Some(entry.slot),
                         derivation_index: entry.wallet_index,
                         memo: None,
-                        swept_to_address: Some(self.sol_native_sweep_destination().to_string()),
-                        swept_amount_sat: Some(sweep_result.amount_base_units),
-                        swept_amount_coin: Some(
-                            sweep_result.amount_base_units as f64
-                                / Chain::Solana.sats_per_unit() as f64,
-                        ),
-                        sweep_txid: sweep_result.txid.clone(),
+                        swept_to_address: if was_deferred {
+                            None
+                        } else {
+                            Some(self.sol_native_sweep_destination().to_string())
+                        },
+                        swept_amount_sat: if was_deferred {
+                            None
+                        } else {
+                            Some(sweep_result.amount_base_units)
+                        },
+                        swept_amount_coin: if was_deferred {
+                            None
+                        } else {
+                            Some(
+                                sweep_result.amount_base_units as f64
+                                    / Chain::Solana.sats_per_unit() as f64,
+                            )
+                        },
+                        sweep_txid: if was_deferred { None } else { sweep_result.txid.clone() },
                         fiat_amount: None,
                         fiat_currency: None,
                         coin_price: None,
@@ -953,7 +977,7 @@ impl SolanaDetector {
                         payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
                         payment.fiat_amount = Some(payment.amount_coin * price);
                     }
-                    Some(payment)
+                    Some((payment, was_deferred))
                 }
                 Some(symbol) => {
                     let mint_str = entry.token_mint.as_deref().ok_or_else(|| {
@@ -983,12 +1007,19 @@ impl SolanaDetector {
                             entry.amount_base_units,
                         )
                         .await?;
-                    if sweep_result.deferred {
-                        log::info!(
-                            "[SOL] {} sweep deferred for {} (signature {}); will retry next cycle",
-                            symbol, entry.address, entry.signature
-                        );
-                        continue;
+                    let was_deferred = sweep_result.deferred;
+                    if was_deferred {
+                        if already_credited {
+                            log::info!(
+                                "[SOL] {} sweep retry deferred for already-credited {} (signature {})",
+                                symbol, entry.address, entry.signature
+                            );
+                        } else {
+                            log::info!(
+                                "[SOL] Crediting {} {} immediately (funds on managed wallet); sweep deferred and will retry next cycle (signature {})",
+                                entry.address, symbol, entry.signature
+                            );
+                        }
                     }
 
                     let amount_coin =
@@ -1007,17 +1038,29 @@ impl SolanaDetector {
                         block_height: Some(entry.slot),
                         derivation_index: entry.wallet_index,
                         memo: None,
-                        swept_to_address: Some(self.config.secure_deposit_address.clone()),
-                        swept_amount_sat: Some(sweep_result.amount_base_units),
-                        swept_amount_coin: Some(swept_coin),
-                        sweep_txid: sweep_result.txid.clone(),
+                        swept_to_address: if was_deferred {
+                            None
+                        } else {
+                            Some(self.config.secure_deposit_address.clone())
+                        },
+                        swept_amount_sat: if was_deferred {
+                            None
+                        } else {
+                            Some(sweep_result.amount_base_units)
+                        },
+                        swept_amount_coin: if was_deferred { None } else { Some(swept_coin) },
+                        sweep_txid: if was_deferred { None } else { sweep_result.txid.clone() },
                         fiat_amount: None,
                         fiat_currency: None,
                         coin_price: None,
                         asset: Some(symbol.to_string()),
                         asset_decimals: Some(decimals),
                         amount_base_units: Some(entry.amount_base_units.to_string()),
-                        swept_amount_base_units: Some(sweep_result.amount_base_units.to_string()),
+                        swept_amount_base_units: if was_deferred {
+                            None
+                        } else {
+                            Some(sweep_result.amount_base_units.to_string())
+                        },
                         token_contract: Some(mint_str.to_string()),
                     };
 
@@ -1030,30 +1073,39 @@ impl SolanaDetector {
                         }
                     }
 
-                    Some(payment)
+                    Some((payment, was_deferred))
                 }
             };
 
-            let Some(credited_payment) = credited_payment_opt else {
+            let Some((credited_payment, was_deferred)) = payment_and_deferred else {
                 continue;
             };
-            send_webhook(
-                &self.webhook_client,
-                &self.config.webhook_url,
-                &self.config.webhook_hmac_secret,
-                &WebhookEvent::PaymentCredited(credited_payment),
-            )
-            .await?;
 
-            {
-                let mut state = self.state.lock().unwrap();
-                state.credited_signatures.insert(entry.signature.clone());
-                state
-                    .pending
-                    .retain(|pending| pending.signature != entry.signature);
+            if !already_credited {
+                send_webhook(
+                    &self.webhook_client,
+                    &self.config.webhook_url,
+                    &self.config.webhook_hmac_secret,
+                    &WebhookEvent::PaymentCredited(credited_payment),
+                )
+                .await?;
+
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.credited_signatures.insert(entry.signature.clone());
+                }
+                self.persist_state()?;
             }
 
-            self.persist_state()?;
+            if !was_deferred {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state
+                        .pending
+                        .retain(|pending| pending.signature != entry.signature);
+                }
+                self.persist_state()?;
+            }
         }
 
         Ok(())

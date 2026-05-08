@@ -3,7 +3,8 @@
     "allow": [
       "Bash(cargo test *)",
       "Bash(cargo build *)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(cargo check *)"
     ]
   }
 }

@@ -797,6 +797,9 @@ impl ChainDetector {
         let min_conf = self.config.min_confirmations;
         let ticker = self.config.chain.ticker();
 
+        // Pull every confirmed entry — including ones already credited —
+        // so we can keep retrying a deferred sweep without re-firing the
+        // webhook.
         let ready: Vec<PendingPayment> = {
             let state = self.state.lock().unwrap();
             state
@@ -804,84 +807,97 @@ impl ChainDetector {
                 .iter()
                 .filter(|p| {
                     let confs = tip_height.saturating_sub(p.block_height) + 1;
-                    confs >= min_conf && !state.notified_confirmed.contains(&p.payment.txid)
+                    confs >= min_conf
                 })
                 .cloned()
                 .collect()
         };
 
-        let mut deferred_txids: HashSet<String> = HashSet::new();
+        let mut to_remove: HashSet<String> = HashSet::new();
         for pending in &ready {
             let confs = tip_height.saturating_sub(pending.block_height) + 1;
             let mut enriched = pending.payment.clone();
             enriched.confirmations = confs;
 
-            if let Some(result) = self
+            let sweep_outcome = self
                 .maybe_sweep(pending.payment.derivation_index, &pending.payment.address)
-                .await
-            {
-                if result.deferred {
-                    log::info!(
-                        "[{}] Sweep deferred for txid {} - keeping in pending until next cycle",
-                        ticker,
-                        pending.payment.txid
+                .await;
+            let sweep_deferred = matches!(&sweep_outcome, Some(r) if r.deferred);
+
+            if let Some(result) = &sweep_outcome {
+                if !result.deferred {
+                    if let Some(destination) = self.sweep_destination() {
+                        enriched.swept_to_address = Some(destination.to_string());
+                    }
+                    enriched.swept_amount_sat = Some(result.amount_sat);
+                    enriched.swept_amount_coin = Some(
+                        result.amount_sat as f64 / self.config.chain.sats_per_unit() as f64,
                     );
-                    deferred_txids.insert(pending.payment.txid.clone());
-                    continue;
-                }
-                if let Some(destination) = self.sweep_destination() {
-                    enriched.swept_to_address = Some(destination.to_string());
-                }
-                enriched.swept_amount_sat = Some(result.amount_sat);
-                enriched.swept_amount_coin =
-                    Some(result.amount_sat as f64 / self.config.chain.sats_per_unit() as f64);
-                enriched.sweep_txid = result.txid.clone();
-            }
-
-            match self.price_fetcher.get_price().await {
-                Ok(price) => {
-                    enriched.coin_price = Some(price);
-                    enriched.fiat_currency = Some(self.price_fetcher.currency().to_string());
-                    let coin =
-                        enriched.amount_sat as f64 / self.config.chain.sats_per_unit() as f64;
-                    enriched.fiat_amount = Some(coin * price);
-                }
-                Err(e) => {
-                    log::warn!("[{}] Failed to fetch price: {e}", ticker);
+                    enriched.sweep_txid = result.txid.clone();
                 }
             }
 
-            let event = WebhookEvent::PaymentCredited(enriched.clone());
-            send_webhook(
-                &self.webhook_client,
-                &self.config.webhook_url,
-                &self.config.webhook_hmac_secret,
-                &event,
-            )
-            .await?;
+            let already_notified = {
+                let state = self.state.lock().unwrap();
+                state.notified_confirmed.contains(&pending.payment.txid)
+            };
 
-            let mut state = self.state.lock().unwrap();
-            state
-                .notified_confirmed
-                .insert(pending.payment.txid.clone());
-            log::info!(
-                "[{}] Payment confirmed ({} confs): txid={} address={} amount={} sats fiat={:?} {}",
-                ticker,
-                confs,
-                pending.payment.txid,
-                pending.payment.address,
-                pending.payment.amount_sat,
-                enriched.fiat_amount,
-                self.price_fetcher.currency(),
-            );
+            if !already_notified {
+                match self.price_fetcher.get_price().await {
+                    Ok(price) => {
+                        enriched.coin_price = Some(price);
+                        enriched.fiat_currency = Some(self.price_fetcher.currency().to_string());
+                        let coin =
+                            enriched.amount_sat as f64 / self.config.chain.sats_per_unit() as f64;
+                        enriched.fiat_amount = Some(coin * price);
+                    }
+                    Err(e) => {
+                        log::warn!("[{}] Failed to fetch price: {e}", ticker);
+                    }
+                }
+
+                let event = WebhookEvent::PaymentCredited(enriched.clone());
+                send_webhook(
+                    &self.webhook_client,
+                    &self.config.webhook_url,
+                    &self.config.webhook_hmac_secret,
+                    &event,
+                )
+                .await?;
+
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state
+                        .notified_confirmed
+                        .insert(pending.payment.txid.clone());
+                }
+                log::info!(
+                    "[{}] Payment confirmed ({} confs): txid={} address={} amount={} sats fiat={:?} {}{}",
+                    ticker,
+                    confs,
+                    pending.payment.txid,
+                    pending.payment.address,
+                    pending.payment.amount_sat,
+                    enriched.fiat_amount,
+                    self.price_fetcher.currency(),
+                    if sweep_deferred { " (sweep deferred)" } else { "" },
+                );
+            }
+
+            if sweep_deferred {
+                log::info!(
+                    "[{}] Sweep deferred for txid {} - keeping in pending until next cycle",
+                    ticker,
+                    pending.payment.txid
+                );
+            } else {
+                to_remove.insert(pending.payment.txid.clone());
+            }
         }
 
-        if !ready.is_empty() {
+        if !to_remove.is_empty() {
             let mut state = self.state.lock().unwrap();
-            let confirmed = state.notified_confirmed.clone();
-            state
-                .pending
-                .retain(|p| !confirmed.contains(&p.payment.txid));
+            state.pending.retain(|p| !to_remove.contains(&p.payment.txid));
         }
 
         Ok(())
