@@ -18,10 +18,11 @@ use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
     EthereumReservation, EtherscanConfig, PaymentDetector, RetryConfig, SharedEthereumWallets,
     SharedSolanaWallets, SolanaConfig, SolanaDetector, SolanaReservation,
-    assign_ethereum_wallet_for_user, assign_wallet_for_user,
-    ethereum_reservation_store_url_from_env, load_active_ethereum_reservations,
-    load_active_reservations, load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens,
-    parse_spl_tokens, shared_ethereum_wallets, shared_wallets,
+    assign_ethereum_wallet_for_user, assign_wallet_for_user, delete_all_assignments,
+    delete_all_ethereum_assignments, ethereum_reservation_store_url_from_env,
+    load_active_ethereum_reservations, load_active_reservations, load_ethereum_wallet_pool,
+    load_wallet_pool, parse_erc20_tokens, parse_spl_tokens, shared_ethereum_wallets,
+    shared_wallets,
 };
 
 #[derive(Clone)]
@@ -204,6 +205,14 @@ struct EthereumAddressResponse {
 struct ActiveEthereumAssignmentsResponse {
     count: usize,
     assignments: Vec<EthereumReservation>,
+}
+
+#[derive(Serialize)]
+struct CancelAllReservationsResponse {
+    solana_cancelled: usize,
+    ethereum_cancelled: usize,
+    base_cancelled: usize,
+    total_cancelled: usize,
 }
 
 #[derive(Serialize)]
@@ -570,6 +579,53 @@ async fn handle_base_claim(
     Json(payload): Json<ClaimRequest>,
 ) -> Result<Json<ClaimResponse>, (StatusCode, String)> {
     handle_evm_claim(state.base_pool.as_ref(), payload).await
+}
+
+/// Admin endpoint: release every active assignment across Solana, Ethereum
+/// and Base. Returns per-chain and total counts of records removed. Pools
+/// that aren't configured in this process contribute 0 and don't error.
+async fn handle_admin_cancel_all_reservations(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CancelAllReservationsResponse>, (StatusCode, String)> {
+    let solana_cancelled = if let Some(pool) = state.solana_pool.as_ref() {
+        delete_all_assignments(&pool.redis_url)
+            .await
+            .map_err(map_internal_error)?
+    } else {
+        0
+    };
+
+    let ethereum_cancelled = if let Some(pool) = state.ethereum_pool.as_ref() {
+        delete_all_ethereum_assignments(pool.chain, &pool.redis_url)
+            .await
+            .map_err(map_internal_error)?
+    } else {
+        0
+    };
+
+    let base_cancelled = if let Some(pool) = state.base_pool.as_ref() {
+        delete_all_ethereum_assignments(pool.chain, &pool.redis_url)
+            .await
+            .map_err(map_internal_error)?
+    } else {
+        0
+    };
+
+    let total_cancelled = solana_cancelled + ethereum_cancelled + base_cancelled;
+    log::warn!(
+        "[ADMIN] Cancel-all reservations triggered: SOL={} ETH={} BASE={} (total={})",
+        solana_cancelled,
+        ethereum_cancelled,
+        base_cancelled,
+        total_cancelled
+    );
+
+    Ok(Json(CancelAllReservationsResponse {
+        solana_cancelled,
+        ethereum_cancelled,
+        base_cancelled,
+        total_cancelled,
+    }))
 }
 
 fn payment_user_id(raw: &str) -> Result<String, (StatusCode, String)> {
@@ -1466,6 +1522,10 @@ async fn main() {
         .route("/base/recover-txid", post(handle_base_recover))
         .route("/bitcoin/recover-txid", post(handle_bitcoin_recover))
         .route("/litecoin/recover-txid", post(handle_litecoin_recover))
+        .route(
+            "/admin/reservations/cancel-all",
+            post(handle_admin_cancel_all_reservations),
+        )
         .with_state(state);
 
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());

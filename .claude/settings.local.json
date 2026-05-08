@@ -4,7 +4,10 @@
       "Bash(cargo test *)",
       "Bash(cargo build *)",
       "Bash(python -c ' *)",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "Bash(ls \"/c/Users/Admin/Desktop/\" 2>/dev/null | grep -iE \"bot|telegram|next|react|vue\")",
+      "Bash(grep -viE \"\\\\.\\(lnk|txt|exe|dmp|url|rar|torrent\\)$\")",
+      "Bash(ls \"/c/Users/Admin/Desktop/\" 2>/dev/null | grep -iE \"site|web|panel|interface|ui|control\")"
     ]
   }
 }

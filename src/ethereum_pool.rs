@@ -558,6 +558,61 @@ pub async fn assign_ethereum_wallet_for_user(
     }
 }
 
+/// Delete every `<chain>:assignment:*` entry (Redis or in-memory). Returns
+/// the number of records removed. Used by the admin "cancel all
+/// reservations" endpoint to release every managed wallet on `chain` so the
+/// detector stops scanning them.
+pub async fn delete_all_ethereum_assignments(
+    chain: Chain,
+    redis_url: &str,
+) -> Result<usize, DetectorError> {
+    if should_use_in_memory_reservations(chain, redis_url) {
+        let prefix = reservation_key_prefix(chain);
+        let mut store = lock_in_memory_reservations();
+        let to_remove: Vec<String> = store
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect();
+        for key in &to_remove {
+            store.remove(key);
+        }
+        let removed = to_remove.len();
+        log::info!(
+            "[{}] Cancelled {} in-memory assignment(s)",
+            chain.ticker(),
+            removed
+        );
+        return Ok(removed);
+    }
+
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(redis_error)?;
+
+    let keys = scan_reservation_keys(chain, &mut connection).await?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
+
+    let deleted: usize = redis::cmd("DEL")
+        .arg(&keys)
+        .query_async(&mut connection)
+        .await
+        .map_err(redis_error)?;
+
+    log::info!(
+        "[{}] Cancelled {} assignment(s) (scanned {} key(s))",
+        chain.ticker(),
+        deleted,
+        keys.len()
+    );
+    Ok(deleted)
+}
+
 /// Backwards-compatible alias used by older callers. The `_ttl_secs`
 /// argument is ignored — the new system never expires assignments.
 pub async fn reserve_ethereum_wallet_for_user(

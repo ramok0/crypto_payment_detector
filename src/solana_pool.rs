@@ -405,6 +405,36 @@ pub async fn assign_wallet_for_user(
     }
 }
 
+/// Delete every `solana:assignment:*` key from Redis. Returns the number of
+/// keys removed. Used by the admin "cancel all reservations" endpoint to
+/// release every managed wallet so the detector stops scanning them.
+pub async fn delete_all_assignments(redis_url: &str) -> Result<usize, DetectorError> {
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(redis_error)?;
+
+    let keys = scan_reservation_keys(&mut connection).await?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
+
+    let deleted: usize = redis::cmd("DEL")
+        .arg(&keys)
+        .query_async(&mut connection)
+        .await
+        .map_err(redis_error)?;
+
+    log::info!(
+        "[SOL] Cancelled {} assignment(s) (scanned {} key(s))",
+        deleted,
+        keys.len()
+    );
+    Ok(deleted)
+}
+
 /// Backwards-compatible alias used by older callers (and the API binary
 /// during the transition). The `_ttl_secs` argument is ignored — the new
 /// system never expires assignments.
