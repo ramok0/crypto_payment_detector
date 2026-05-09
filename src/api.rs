@@ -712,10 +712,12 @@ async fn handle_solana_recover(
 
 #[derive(Serialize)]
 struct SolanaWebhookResponse {
-    /// Number of addresses extracted from the Helius payload that we
-    /// recognised and scanned. Useful for debugging webhook configuration
-    /// drift.
-    scanned: usize,
+    /// Number of candidate addresses the webhook handler queued for
+    /// background scanning. The actual scan runs in a `tokio::spawn`
+    /// task so the HTTP response stays under Helius's delivery timeout
+    /// (~10s). `0` means the payload had no Solana-looking addresses
+    /// (typically: a Helius "Test Webhook" synthetic body).
+    accepted: usize,
 }
 
 #[derive(Serialize)]
@@ -859,29 +861,59 @@ async fn handle_solana_webhook_status(
 /// Handler for `POST /solana/webhook`. Intended target of a Helius webhook
 /// (raw or enhanced). When `HELIUS_WEBHOOK_ENABLED` is unset the route is
 /// still registered but rejects every request — this keeps the optional
-/// integration symmetrical with the other Solana endpoints.
+/// integration symmetrical with the other Solana endpoints. Accepts the
+/// body as a raw `Bytes` so a malformed/test payload still produces a
+/// useful log line instead of a 422 from the JSON extractor.
 async fn handle_solana_webhook(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Json(payload): Json<serde_json::Value>,
+    body: axum::body::Bytes,
 ) -> Result<Json<SolanaWebhookResponse>, (StatusCode, String)> {
+    let body_len = body.len();
+    // Try to capture the original client IP — Traefik puts it in
+    // X-Forwarded-For. Useful to confirm Helius is the actual sender.
+    let source_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let auth_present = headers.contains_key(axum::http::header::AUTHORIZATION);
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    log::info!(
+        "[HELIUS] Webhook POST received: source={} ua=\"{}\" body_bytes={} auth_header={}",
+        source_ip,
+        user_agent,
+        body_len,
+        if auth_present { "present" } else { "missing" }
+    );
+
     let Some(solana_pool) = state.solana_pool.as_ref() else {
+        log::warn!("[HELIUS] Webhook rejected: Solana pool not configured in this process");
         return Err((
             StatusCode::BAD_REQUEST,
             "Solana address pool is not configured".into(),
         ));
     };
     let Some(helius) = solana_pool.helius.as_ref() else {
+        log::warn!(
+            "[HELIUS] Webhook rejected: HELIUS_WEBHOOK_ENABLED is not true (integration disabled)"
+        );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "Helius webhook integration is disabled (HELIUS_WEBHOOK_ENABLED is not true)"
                 .into(),
         ));
     };
-    let detector = solana_pool.detector.clone().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Solana detector is not running in this process".to_string(),
-    ))?;
+    let detector = solana_pool.detector.clone().ok_or_else(|| {
+        log::warn!("[HELIUS] Webhook rejected: Solana detector handle missing in this process");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Solana detector is not running in this process".to_string(),
+        )
+    })?;
 
     if let Some(expected) = helius.auth_header() {
         let received = headers
@@ -889,30 +921,88 @@ async fn handle_solana_webhook(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !verify_auth_header(expected, received) {
-            log::warn!("[HELIUS] Rejected webhook with mismatched Authorization header");
+            log::warn!(
+                "[HELIUS] Webhook rejected: Authorization header mismatch (source={})",
+                source_ip
+            );
             return Err((StatusCode::UNAUTHORIZED, "invalid Authorization header".into()));
         }
     }
 
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            // Helius's "Test Webhook" button sometimes sends an empty body
+            // or a non-JSON payload. Don't 500 — answer 200 so the dashboard
+            // shows green, and log enough to debug.
+            let preview: String = String::from_utf8_lossy(&body).chars().take(200).collect();
+            log::warn!(
+                "[HELIUS] Webhook body is not valid JSON ({} bytes, error={}): {:?}",
+                body_len,
+                error,
+                preview
+            );
+            return Ok(Json(SolanaWebhookResponse { accepted: 0 }));
+        }
+    };
+
     let candidates = collect_candidate_addresses(&payload);
     if candidates.is_empty() {
-        log::debug!("[HELIUS] Webhook payload contained no recognisable addresses");
-        return Ok(Json(SolanaWebhookResponse { scanned: 0 }));
-    }
-
-    let scanned = detector
-        .process_address_set_now(&candidates)
-        .await
-        .map_err(map_internal_error)?;
-
-    if !scanned.is_empty() {
+        // Most likely cause: Helius sent its synthetic test payload
+        // (sample addresses unrelated to our pool). Log at INFO so the
+        // operator can confirm reachability when clicking "Test Webhook".
         log::info!(
-            "[HELIUS] Webhook triggered scan of {} managed address(es)",
-            scanned.len()
+            "[HELIUS] Webhook payload parsed but contained no recognisable Solana addresses (probably a test payload). source={} body_bytes={}",
+            source_ip,
+            body_len
         );
+        return Ok(Json(SolanaWebhookResponse { accepted: 0 }));
     }
+
+    let candidate_count = candidates.len();
+    log::info!(
+        "[HELIUS] Webhook payload contains {} candidate address(es) — dispatching background scan and ack'ing 200",
+        candidate_count
+    );
+
+    // Hand the actual scan off to a background task. The scan path can
+    // take 5-15s on a real deposit (Redis SCAN of all assignments,
+    // multiple RPC calls per matched address, sweep + outbound webhook
+    // emission), which exceeds Helius's webhook delivery timeout
+    // (~10s). Returning 200 immediately is the documented pattern for
+    // long-running webhook handlers; correctness still holds because
+    // (a) the polling loop is the safety net, and (b) sweep/credit
+    // dedup via `state.credited_signatures` prevents double-credits if
+    // Helius retries before our background task finishes.
+    let detector_for_task = detector.clone();
+    tokio::spawn(async move {
+        match detector_for_task
+            .process_address_set_now(&candidates)
+            .await
+        {
+            Ok(scanned) if scanned.is_empty() => {
+                log::info!(
+                    "[HELIUS] background scan: {} candidate(s) had no matching active assignment (orphan/external — polling will recover if relevant)",
+                    candidate_count
+                );
+            }
+            Ok(scanned) => {
+                log::info!(
+                    "[HELIUS] background scan completed for {} managed address(es): {}",
+                    scanned.len(),
+                    scanned.join(", ")
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "[HELIUS] background scan failed (polling will retry): {error}"
+                );
+            }
+        }
+    });
+
     Ok(Json(SolanaWebhookResponse {
-        scanned: scanned.len(),
+        accepted: candidate_count,
     }))
 }
 
