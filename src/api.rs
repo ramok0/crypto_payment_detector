@@ -718,6 +718,144 @@ struct SolanaWebhookResponse {
     scanned: usize,
 }
 
+#[derive(Serialize)]
+struct SolanaWebhookStatusResponse {
+    /// Whether the integration is enabled at all (i.e. whether
+    /// `HELIUS_WEBHOOK_ENABLED=true` was set at boot).
+    enabled: bool,
+    /// Current watch mode — `"WholePool"` or `"AssignedOnly"`. Computed
+    /// dynamically from the projected address count vs
+    /// `HELIUS_MAX_WATCH_ADDRESSES`.
+    mode: Option<String>,
+    /// Number of addresses we expect to be on the webhook (owners + ATAs
+    /// for the relevant set per the current mode).
+    expected_address_count: Option<usize>,
+    /// Number of addresses Helius reports on the webhook right now.
+    /// `None` if the GET to Helius failed.
+    actual_address_count: Option<usize>,
+    /// Helius URL configured on the webhook (sanity check that
+    /// `HELIUS_WEBHOOK_ID` points at the right webhook).
+    webhook_url: Option<String>,
+    /// `"enhanced"` / `"raw"` — the webhook's configured type.
+    webhook_type: Option<String>,
+    /// Whether expected and actual address counts match. `false` flags
+    /// drift (e.g. a sync failed silently).
+    in_sync: Option<bool>,
+    /// Human-readable diagnostic when something is off.
+    note: Option<String>,
+}
+
+/// Handler for `GET /solana/webhook/status`. Operator-facing diagnostic:
+/// reports whether the Helius integration is enabled, what mode it's in,
+/// and whether the address list registered on Helius matches what the
+/// detector expects. Safe to call from inside the Docker network — it
+/// does no work beyond a single Helius GET.
+async fn handle_solana_webhook_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<SolanaWebhookStatusResponse> {
+    let Some(solana_pool) = state.solana_pool.as_ref() else {
+        return Json(SolanaWebhookStatusResponse {
+            enabled: false,
+            mode: None,
+            expected_address_count: None,
+            actual_address_count: None,
+            webhook_url: None,
+            webhook_type: None,
+            in_sync: None,
+            note: Some("Solana address pool is not configured".to_string()),
+        });
+    };
+    let Some(helius) = solana_pool.helius.as_ref() else {
+        return Json(SolanaWebhookStatusResponse {
+            enabled: false,
+            mode: None,
+            expected_address_count: None,
+            actual_address_count: None,
+            webhook_url: None,
+            webhook_type: None,
+            in_sync: None,
+            note: Some(
+                "Helius integration disabled (HELIUS_WEBHOOK_ENABLED is not true)"
+                    .to_string(),
+            ),
+        });
+    };
+    let Some(detector) = solana_pool.detector.as_ref() else {
+        return Json(SolanaWebhookStatusResponse {
+            enabled: true,
+            mode: None,
+            expected_address_count: None,
+            actual_address_count: None,
+            webhook_url: None,
+            webhook_type: None,
+            in_sync: None,
+            note: Some("Detector handle missing in this process".to_string()),
+        });
+    };
+
+    let mode = helius_watch_mode(detector.as_ref());
+    let expected = match mode {
+        HeliusWatchMode::WholePool => detector.webhook_address_set().len(),
+        HeliusWatchMode::AssignedOnly => {
+            // Cheap projection: count of (owner + ATAs) per active assignment.
+            match load_active_reservations(&solana_pool.redis_url).await {
+                Ok(assignments) => {
+                    assignments.len() * (1 + detector.token_count())
+                }
+                Err(_) => 0,
+            }
+        }
+    };
+
+    match helius.get_webhook().await {
+        Ok(value) => {
+            let actual_addresses = value
+                .get("accountAddresses")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let webhook_url = value
+                .get("webhookURL")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let webhook_type = value
+                .get("webhookType")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let in_sync = expected == actual_addresses;
+            Json(SolanaWebhookStatusResponse {
+                enabled: true,
+                mode: Some(format!("{mode:?}")),
+                expected_address_count: Some(expected),
+                actual_address_count: Some(actual_addresses),
+                webhook_url,
+                webhook_type,
+                in_sync: Some(in_sync),
+                note: if in_sync {
+                    None
+                } else {
+                    Some(format!(
+                        "Drift: expected {} addresses (mode={:?}) but Helius reports {}. \
+                         Restart the API to trigger a fresh sync, or POST to \
+                         /admin/reservations/cancel-all to reset.",
+                        expected, mode, actual_addresses
+                    ))
+                },
+            })
+        }
+        Err(error) => Json(SolanaWebhookStatusResponse {
+            enabled: true,
+            mode: Some(format!("{mode:?}")),
+            expected_address_count: Some(expected),
+            actual_address_count: None,
+            webhook_url: None,
+            webhook_type: None,
+            in_sync: None,
+            note: Some(format!("Helius GET failed: {error}")),
+        }),
+    }
+}
+
 /// Handler for `POST /solana/webhook`. Intended target of a Helius webhook
 /// (raw or enhanced). When `HELIUS_WEBHOOK_ENABLED` is unset the route is
 /// still registered but rejects every request — this keeps the optional
@@ -1753,6 +1891,7 @@ async fn main() {
         .route("/solana/claim", post(handle_solana_claim))
         .route("/solana/recover-txid", post(handle_solana_recover))
         .route("/solana/webhook", post(handle_solana_webhook))
+        .route("/solana/webhook/status", get(handle_solana_webhook_status))
         .route("/ethereum/address", post(handle_ethereum_address))
         .route("/ethereum/active", get(handle_ethereum_active))
         .route("/ethereum/claim", post(handle_ethereum_claim))

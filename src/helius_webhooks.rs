@@ -123,9 +123,12 @@ impl HeliusWebhookClient {
         )
     }
 
-    /// Fetch the current webhook config. Returns the raw JSON so we can
-    /// preserve fields we don't recognise when issuing a PUT (Helius adds
-    /// fields over time and overwriting them with `null` is a footgun).
+    /// Fetch the current webhook config. Returns the raw JSON the
+    /// `Edit Webhook` endpoint sent us — note that the GET response
+    /// includes read-only metadata (`webhookID`, `project`, `wallet`,
+    /// `createdAt`, ...) which the PUT endpoint **rejects with 400**.
+    /// Always run the result through [`Self::sanitize_for_put`] before
+    /// PUTing it back.
     pub async fn get_webhook(&self) -> Result<Value, DetectorError> {
         let url = self.webhook_url();
         let response = self
@@ -270,12 +273,39 @@ impl HeliusWebhookClient {
         Ok(())
     }
 
+    /// Build a PUT-safe body from a raw GET response. Helius's
+    /// `Edit Webhook` endpoint validates the input strictly and returns
+    /// 400 with `"property X should not exist"` when it sees any read-only
+    /// field (`webhookID`, `project`, `wallet`, `createdAt`, ...). We
+    /// whitelist the documented writable fields and drop everything else.
+    fn sanitize_for_put(body: &Value) -> Value {
+        const WRITABLE_FIELDS: &[&str] = &[
+            "webhookURL",
+            "transactionTypes",
+            "accountAddresses",
+            "webhookType",
+            "authHeader",
+            "txnStatus",
+            "encoding",
+        ];
+        let mut out = serde_json::Map::new();
+        if let Some(obj) = body.as_object() {
+            for field in WRITABLE_FIELDS {
+                if let Some(value) = obj.get(*field) {
+                    out.insert((*field).to_string(), value.clone());
+                }
+            }
+        }
+        Value::Object(out)
+    }
+
     async fn put_webhook(&self, body: &Value) -> Result<(), DetectorError> {
         let url = self.webhook_url();
+        let sanitized = Self::sanitize_for_put(body);
         let response = self
             .http
             .put(&url)
-            .json(body)
+            .json(&sanitized)
             .send()
             .await
             .map_err(|e| DetectorError::ApiError(format!("Helius PUT webhook failed: {e}")))?;
@@ -410,5 +440,39 @@ mod tests {
         assert!(verify_auth_header("secret", "secret"));
         assert!(!verify_auth_header("secret", "Secret"));
         assert!(!verify_auth_header("secret", "secre"));
+    }
+
+    #[test]
+    fn sanitize_strips_read_only_fields() {
+        // What Helius actually returns from GET /v0/webhooks/:id — the
+        // shape that triggered the 400 in production.
+        let raw_get = serde_json::json!({
+            "webhookID": "abc-123",
+            "wallet": "wal-456",
+            "project": "proj-789",
+            "createdAt": "2026-05-09T00:00:00Z",
+            "webhookURL": "https://example.com/webhook",
+            "transactionTypes": ["Any"],
+            "accountAddresses": ["AAA", "BBB"],
+            "webhookType": "enhanced",
+            "authHeader": "secret",
+            "txnStatus": "all",
+            "encoding": "jsonParsed"
+        });
+        let sanitized = HeliusWebhookClient::sanitize_for_put(&raw_get);
+        let obj = sanitized.as_object().unwrap();
+        // Read-only metadata is gone
+        assert!(!obj.contains_key("webhookID"));
+        assert!(!obj.contains_key("wallet"));
+        assert!(!obj.contains_key("project"));
+        assert!(!obj.contains_key("createdAt"));
+        // Writable fields are preserved untouched
+        assert_eq!(obj.get("webhookURL").unwrap(), "https://example.com/webhook");
+        assert_eq!(
+            obj.get("accountAddresses").unwrap(),
+            &serde_json::json!(["AAA", "BBB"])
+        );
+        assert_eq!(obj.get("webhookType").unwrap(), "enhanced");
+        assert_eq!(obj.get("authHeader").unwrap(), "secret");
     }
 }
