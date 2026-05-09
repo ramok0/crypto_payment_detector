@@ -462,6 +462,101 @@ impl SolanaDetector {
         Ok(address)
     }
 
+    /// For each assignment in Redis whose owner address or any of its
+    /// monitored SPL token ATAs is contained in `candidate_addresses`, run
+    /// `process_reservation` (native + token scans) immediately, then run
+    /// `process_credits` once. Used by the `/solana/webhook` route to react
+    /// to a Helius push without waiting for the next polling cycle.
+    /// Returns the list of owner addresses that were scanned.
+    pub async fn process_address_set_now(
+        &self,
+        candidate_addresses: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>, DetectorError> {
+        if candidate_addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let assignments = load_active_reservations(&self.config.redis_url).await?;
+        let mut to_scan: Vec<SolanaReservation> = Vec::new();
+        for assignment in &assignments {
+            if candidate_addresses.contains(&assignment.address) {
+                to_scan.push(assignment.clone());
+                continue;
+            }
+            // Also match if the candidate set contains any ATA derived
+            // from this owner for one of our monitored mints.
+            let owner = match Pubkey::from_str(&assignment.address) {
+                Ok(pk) => pk,
+                Err(_) => continue,
+            };
+            for token in &self.tokens {
+                let ata = self.ata_for_wallet(&owner, &token.mint).to_string();
+                if candidate_addresses.contains(&ata) {
+                    to_scan.push(assignment.clone());
+                    break;
+                }
+            }
+        }
+
+        if to_scan.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let current_slot = self.get_current_slot().await?;
+        let spot_price = self.price_fetcher.get_price().await.ok();
+
+        let mut scanned = Vec::with_capacity(to_scan.len());
+        for assignment in to_scan {
+            let address = assignment.address.clone();
+            if let Err(error) = self
+                .process_reservation(&assignment, current_slot, spot_price)
+                .await
+            {
+                // Don't abort the whole webhook on one address failing —
+                // the polling fallback will pick it up. Just log and skip.
+                log::warn!(
+                    "[SOL] Webhook-triggered scan failed for {address}: {error}"
+                );
+                continue;
+            }
+            scanned.push(address);
+        }
+
+        self.process_credits(current_slot).await?;
+        Ok(scanned)
+    }
+
+    /// Returns the full set of addresses that should be watched on the
+    /// Helius webhook for the current wallet pool: every owner address
+    /// plus every ATA derived from each owner for each configured SPL
+    /// token. Used to bootstrap and reconcile the webhook config.
+    pub fn webhook_address_set(&self) -> Vec<String> {
+        let wallets = snapshot_wallets(&self.wallets);
+        let mut out = Vec::with_capacity(wallets.len() * (1 + self.tokens.len()));
+        for wallet in &wallets {
+            out.push(wallet.address.clone());
+            if let Ok(owner) = Pubkey::from_str(&wallet.address) {
+                for token in &self.tokens {
+                    out.push(self.ata_for_wallet(&owner, &token.mint).to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns the addresses to register on the Helius webhook for a
+    /// single newly assigned wallet: the owner address plus its ATA for
+    /// each configured SPL token.
+    pub fn webhook_addresses_for_wallet(&self, wallet_address: &str) -> Vec<String> {
+        let mut out = vec![wallet_address.to_string()];
+        if let Ok(owner) = Pubkey::from_str(wallet_address) {
+            for token in &self.tokens {
+                out.push(self.ata_for_wallet(&owner, &token.mint).to_string());
+            }
+        }
+        out
+    }
+
     async fn process_cycle(&self) -> Result<(), DetectorError> {
         let reservations = load_active_reservations(&self.config.redis_url).await?;
         let current_slot = self.get_current_slot().await?;

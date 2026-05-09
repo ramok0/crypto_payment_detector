@@ -7,7 +7,9 @@
       "Bash(cargo check *)",
       "Bash(ls \"/c/Users/Admin/Desktop/\" 2>/dev/null | grep -iE \"bot|telegram|next|react|vue\")",
       "Bash(grep -viE \"\\\\.\\(lnk|txt|exe|dmp|url|rar|torrent\\)$\")",
-      "Bash(ls \"/c/Users/Admin/Desktop/\" 2>/dev/null | grep -iE \"site|web|panel|interface|ui|control\")"
+      "Bash(ls \"/c/Users/Admin/Desktop/\" 2>/dev/null | grep -iE \"site|web|panel|interface|ui|control\")",
+      "Bash(cd \"/c/Users/Admin/Desktop/bitcoin_payment_detector\" && grep -n \"No UTXOs\\\\|fetch_utxos\\\\|utxos.is_empty\\\\|/address/.*utxo\" src/bitcoin_sweep.rs | head -20)",
+      "Bash(curl -s \"https://blockstream.info/api/address/bc1qysz2e42y2ntx8ef95ajmramk3e6wcn04emv3q6/utxo\")"
     ]
   }
 }

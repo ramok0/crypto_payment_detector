@@ -14,6 +14,9 @@ use crypto_payment_detector::env_utils::{
 use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 use crypto_payment_detector::types::Chain;
+use crypto_payment_detector::helius_webhooks::{
+    HeliusWebhookClient, HeliusWebhookConfig, collect_candidate_addresses, verify_auth_header,
+};
 use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
     EthereumReservation, EtherscanConfig, PaymentDetector, RetryConfig, SharedEthereumWallets,
@@ -51,6 +54,10 @@ struct SolanaPoolApiState {
     /// without a co-located detector (rare; primarily for tests and
     /// read-only deployments).
     detector: Option<Arc<SolanaDetector>>,
+    /// Optional Helius webhook integration. `None` when
+    /// `HELIUS_WEBHOOK_ENABLED` is unset or falsy — in that case the API
+    /// behaves exactly as before (polling is the only detection path).
+    helius: Option<Arc<HeliusWebhookClient>>,
 }
 
 #[derive(Clone)]
@@ -402,6 +409,22 @@ async fn handle_solana_address(
     .await
     .map_err(map_assignment_error)?;
 
+    // Best-effort: register the new address (and its ATAs) on the Helius
+    // webhook so future deposits trigger an instant push. A failure here
+    // must not block the assignment — the polling fallback will still
+    // catch the deposit, just with the usual cycle latency.
+    if let (Some(helius), Some(detector)) =
+        (solana_pool.helius.as_ref(), solana_pool.detector.as_ref())
+    {
+        let addresses = detector.webhook_addresses_for_wallet(&assignment.address);
+        if let Err(error) = helius.add_addresses(&addresses).await {
+            log::warn!(
+                "[HELIUS] Failed to register {} on webhook (will rely on polling): {error}",
+                assignment.address
+            );
+        }
+    }
+
     Ok(Json(SolanaAddressResponse {
         user_id: assignment.user_id,
         address: assignment.address,
@@ -588,9 +611,37 @@ async fn handle_admin_cancel_all_reservations(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CancelAllReservationsResponse>, (StatusCode, String)> {
     let solana_cancelled = if let Some(pool) = state.solana_pool.as_ref() {
-        delete_all_assignments(&pool.redis_url)
+        let count = delete_all_assignments(&pool.redis_url)
             .await
-            .map_err(map_internal_error)?
+            .map_err(map_internal_error)?;
+        // After clearing assignments, behave according to the watch
+        // mode:
+        // - WholePool: keep the webhook untouched. The pool wallets
+        //   still belong to us and incoming deposits should still be
+        //   recoverable via the orphan sweep.
+        // - AssignedOnly: clear the webhook list so we don't keep
+        //   receiving pushes for now-released wallets.
+        // Best-effort either way — a failure here is logged and ignored.
+        if let (Some(helius), Some(detector)) =
+            (pool.helius.as_ref(), pool.detector.as_ref())
+        {
+            match helius_watch_mode(detector.as_ref()) {
+                HeliusWatchMode::WholePool => {
+                    log::info!(
+                        "[HELIUS] cancel-all: keeping {} pool address(es) on webhook (WholePool mode)",
+                        detector.webhook_address_set().len()
+                    );
+                }
+                HeliusWatchMode::AssignedOnly => {
+                    if let Err(error) = helius.replace_addresses(Vec::new()).await {
+                        log::warn!(
+                            "[HELIUS] Failed to clear webhook address list after cancel-all: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        count
     } else {
         0
     };
@@ -657,6 +708,74 @@ async fn handle_solana_recover(
         .await
         .map_err(map_internal_error)?;
     Ok(Json(response))
+}
+
+#[derive(Serialize)]
+struct SolanaWebhookResponse {
+    /// Number of addresses extracted from the Helius payload that we
+    /// recognised and scanned. Useful for debugging webhook configuration
+    /// drift.
+    scanned: usize,
+}
+
+/// Handler for `POST /solana/webhook`. Intended target of a Helius webhook
+/// (raw or enhanced). When `HELIUS_WEBHOOK_ENABLED` is unset the route is
+/// still registered but rejects every request — this keeps the optional
+/// integration symmetrical with the other Solana endpoints.
+async fn handle_solana_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<SolanaWebhookResponse>, (StatusCode, String)> {
+    let Some(solana_pool) = state.solana_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Solana address pool is not configured".into(),
+        ));
+    };
+    let Some(helius) = solana_pool.helius.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Helius webhook integration is disabled (HELIUS_WEBHOOK_ENABLED is not true)"
+                .into(),
+        ));
+    };
+    let detector = solana_pool.detector.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Solana detector is not running in this process".to_string(),
+    ))?;
+
+    if let Some(expected) = helius.auth_header() {
+        let received = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !verify_auth_header(expected, received) {
+            log::warn!("[HELIUS] Rejected webhook with mismatched Authorization header");
+            return Err((StatusCode::UNAUTHORIZED, "invalid Authorization header".into()));
+        }
+    }
+
+    let candidates = collect_candidate_addresses(&payload);
+    if candidates.is_empty() {
+        log::debug!("[HELIUS] Webhook payload contained no recognisable addresses");
+        return Ok(Json(SolanaWebhookResponse { scanned: 0 }));
+    }
+
+    let scanned = detector
+        .process_address_set_now(&candidates)
+        .await
+        .map_err(map_internal_error)?;
+
+    if !scanned.is_empty() {
+        log::info!(
+            "[HELIUS] Webhook triggered scan of {} managed address(es)",
+            scanned.len()
+        );
+    }
+    Ok(Json(SolanaWebhookResponse {
+        scanned: scanned.len(),
+    }))
 }
 
 async fn handle_evm_recover(
@@ -1157,6 +1276,7 @@ fn build_solana_pool_api_state(
     config: &SolanaConfig,
     wallets: SharedSolanaWallets,
     detector: Option<Arc<SolanaDetector>>,
+    helius: Option<Arc<HeliusWebhookClient>>,
 ) -> Result<SolanaPoolApiState, DetectorError> {
     Ok(SolanaPoolApiState {
         wallets,
@@ -1164,7 +1284,117 @@ fn build_solana_pool_api_state(
         redis_url: config.redis_url.clone(),
         secure_deposit_address: config.secure_deposit_address.clone(),
         detector,
+        helius,
     })
+}
+
+/// Build the Helius webhook client from env vars. Returns `Ok(None)` when
+/// `HELIUS_WEBHOOK_ENABLED` is unset or falsy — the API then runs in the
+/// original polling-only mode and `/solana/webhook` returns 503 to any
+/// caller. Panics only on misconfiguration (enabled flag set but a
+/// required value is missing or invalid).
+fn build_helius_client() -> Option<Arc<HeliusWebhookClient>> {
+    match HeliusWebhookConfig::from_env() {
+        Ok(None) => None,
+        Ok(Some(config)) => match HeliusWebhookClient::new(config) {
+            Ok(client) => {
+                log::info!(
+                    "[HELIUS] Webhook integration enabled — /solana/webhook will accept Helius pushes"
+                );
+                Some(Arc::new(client))
+            }
+            Err(error) => {
+                log::error!("[HELIUS] Failed to build webhook client: {error}");
+                None
+            }
+        },
+        Err(error) => panic!("Invalid Helius webhook configuration: {error}"),
+    }
+}
+
+const DEFAULT_HELIUS_MAX_WATCH_ADDRESSES: usize = 50_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeliusWatchMode {
+    /// Register every wallet in the pool (owner + ATAs for each
+    /// configured SPL token) on the Helius webhook. Cheaper to operate
+    /// (no per-assignment PATCH, no race between assignment and first
+    /// deposit) and also catches deposits to wallets whose assignment
+    /// has been released — the webhook still fires, the handler simply
+    /// finds no active assignment and skips, while the polling/orphan
+    /// sweep recovers the funds. Used by default while the projected
+    /// address count stays under `HELIUS_MAX_WATCH_ADDRESSES`.
+    WholePool,
+    /// Register only the wallets currently assigned to a user, plus
+    /// their ATAs. Used as a fallback when watching the whole pool
+    /// would push the webhook past the configured limit. Restores the
+    /// previous behaviour: addresses are added on `/solana/address` and
+    /// cleared on `/admin/reservations/cancel-all`.
+    AssignedOnly,
+}
+
+fn helius_max_watch_addresses() -> usize {
+    std::env::var("HELIUS_MAX_WATCH_ADDRESSES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_HELIUS_MAX_WATCH_ADDRESSES)
+}
+
+fn helius_watch_mode(detector: &SolanaDetector) -> HeliusWatchMode {
+    let limit = helius_max_watch_addresses();
+    let projected = detector.webhook_address_set().len();
+    if projected <= limit {
+        HeliusWatchMode::WholePool
+    } else {
+        HeliusWatchMode::AssignedOnly
+    }
+}
+
+/// Best-effort: push the right set of addresses onto the Helius webhook
+/// at startup. In `WholePool` mode that's every wallet (owner + ATAs); in
+/// `AssignedOnly` mode it's only currently active assignments. Drift from
+/// either side (someone edited the webhook in the dashboard, a new wallet
+/// was generated since the last run) converges on the next call. Logged
+/// failures do not abort startup — polling fallback still works.
+async fn sync_helius_webhook_addresses(
+    detector: &SolanaDetector,
+    helius: &HeliusWebhookClient,
+    redis_url: &str,
+) {
+    let mode = helius_watch_mode(detector);
+    let addresses = match mode {
+        HeliusWatchMode::WholePool => detector.webhook_address_set(),
+        HeliusWatchMode::AssignedOnly => {
+            match load_active_reservations(redis_url).await {
+                Ok(assignments) => {
+                    let mut out = Vec::with_capacity(assignments.len() * 4);
+                    for assignment in assignments {
+                        out.extend(detector.webhook_addresses_for_wallet(&assignment.address));
+                    }
+                    out
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[HELIUS] Failed to load assignments for startup sync: {error}"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    let count = addresses.len();
+    match helius.replace_addresses(addresses).await {
+        Ok(()) => log::info!(
+            "[HELIUS] Startup sync OK — mode={:?}, {} address(es) registered (threshold: {})",
+            mode,
+            count,
+            helius_max_watch_addresses(),
+        ),
+        Err(error) => log::warn!(
+            "[HELIUS] Startup sync failed (will rely on per-assignment add): {error}"
+        ),
+    }
 }
 
 fn build_ethereum_pool_api_state(
@@ -1404,10 +1634,20 @@ async fn main() {
                         SolanaDetector::new(config.clone(), tokens, wallets.clone())
                             .expect("Failed to create SOL detector"),
                     );
+                    let helius_client = build_helius_client();
+                    if let Some(client) = helius_client.as_ref() {
+                        sync_helius_webhook_addresses(
+                            detector.as_ref(),
+                            client.as_ref(),
+                            &config.redis_url,
+                        )
+                        .await;
+                    }
                     let pool_state = build_solana_pool_api_state(
                         &config,
                         wallets,
                         Some(detector.clone()),
+                        helius_client,
                     )
                     .expect("Failed to build Solana pool state");
 
@@ -1512,6 +1752,7 @@ async fn main() {
         .route("/solana/active", get(handle_solana_active))
         .route("/solana/claim", post(handle_solana_claim))
         .route("/solana/recover-txid", post(handle_solana_recover))
+        .route("/solana/webhook", post(handle_solana_webhook))
         .route("/ethereum/address", post(handle_ethereum_address))
         .route("/ethereum/active", get(handle_ethereum_active))
         .route("/ethereum/claim", post(handle_ethereum_claim))

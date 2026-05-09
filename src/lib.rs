@@ -6,6 +6,7 @@ pub mod error;
 pub mod ethereum;
 pub mod ethereum_pool;
 pub mod etherscan;
+pub mod helius_webhooks;
 pub mod persistence;
 pub mod pricing;
 pub mod recover;
@@ -31,6 +32,9 @@ pub use ethereum_pool::{
     reserve_ethereum_wallet_for_user, shared_ethereum_wallets,
 };
 pub use etherscan::{EtherscanClient, EtherscanConfig, EtherscanInternalTx};
+pub use helius_webhooks::{
+    HeliusWebhookClient, HeliusWebhookConfig, collect_candidate_addresses, verify_auth_header,
+};
 pub use pricing::PriceFetcher;
 pub use recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 pub use solana::{SolanaConfig, SolanaDetector};
