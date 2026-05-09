@@ -558,7 +558,14 @@ impl SolanaDetector {
     }
 
     async fn process_cycle(&self) -> Result<(), DetectorError> {
+        let cycle_start = std::time::Instant::now();
         let reservations = load_active_reservations(&self.config.redis_url).await?;
+        let reservations_loaded_at = cycle_start.elapsed();
+        log::info!(
+            "[SOL] process_cycle: starting scan of {} reservation(s) ({} SPL token(s) per wallet)",
+            reservations.len(),
+            self.tokens.len()
+        );
         let current_slot = self.get_current_slot().await?;
         let spot_price = match self.price_fetcher.get_price().await {
             Ok(price) => Some(price),
@@ -576,6 +583,7 @@ impl SolanaDetector {
         // Pending payments would otherwise stay un-credited indefinitely
         // because the cycle never reaches the credit step. Each failure is
         // logged at WARN; the next cycle retries the same reservations.
+        let scan_start = std::time::Instant::now();
         let mut failed_scans: usize = 0;
         for reservation in &reservations {
             if let Err(error) = self
@@ -589,6 +597,7 @@ impl SolanaDetector {
                 );
             }
         }
+        let scan_elapsed = scan_start.elapsed();
         if failed_scans > 0 {
             log::warn!(
                 "[SOL] process_cycle: {}/{} reservation scan(s) failed this cycle - proceeding to process_credits anyway",
@@ -600,12 +609,36 @@ impl SolanaDetector {
         // Don't propagate process_credits errors either - just log and let
         // the next cycle (or the Helius webhook path) retry. Returning Err
         // here would skip gas tank maintenance for no good reason.
+        let credits_start = std::time::Instant::now();
         if let Err(error) = self.process_credits(current_slot).await {
             log::warn!(
                 "[SOL] process_cycle: process_credits errored (will retry next cycle): {error}"
             );
         }
+        let credits_elapsed = credits_start.elapsed();
+
         self.maybe_maintain_gas_tank().await?;
+        let total_elapsed = cycle_start.elapsed();
+
+        // One concise summary line so the operator can spot slow cycles
+        // without grepping. Per-address RTT = scan_elapsed / reservations,
+        // useful for sanity-checking against the configured RPC.
+        let avg_per_addr_ms = if reservations.is_empty() {
+            0.0
+        } else {
+            scan_elapsed.as_secs_f64() * 1000.0 / reservations.len() as f64
+        };
+        log::info!(
+            "[SOL] process_cycle: done in {:.2}s (load_reservations={:.2}s, scan_loop={:.2}s for {} addr {:.0}ms/addr avg, process_credits={:.2}s, failed_scans={})",
+            total_elapsed.as_secs_f64(),
+            reservations_loaded_at.as_secs_f64(),
+            scan_elapsed.as_secs_f64(),
+            reservations.len(),
+            avg_per_addr_ms,
+            credits_elapsed.as_secs_f64(),
+            failed_scans,
+        );
+
         Ok(())
     }
 

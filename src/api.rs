@@ -1862,6 +1862,37 @@ async fn main() {
                         SolanaDetector::new(config.clone(), tokens, wallets.clone())
                             .expect("Failed to create SOL detector"),
                     );
+
+                    // Reconcile per-user indices and drop any duplicate
+                    // assignments left by the historical race in
+                    // `assign_wallet_for_user` (concurrent calls for the
+                    // same user_id used to create multiple
+                    // `solana:assignment:*` entries, leading to deposit
+                    // addresses that "changed" between page loads).
+                    // Idempotent — safe to run every boot.
+                    match crypto_payment_detector::consolidate_assignments(
+                        &config.redis_url,
+                    )
+                    .await
+                    {
+                        Ok((indexed, dropped)) => {
+                            if dropped > 0 {
+                                log::warn!(
+                                    "[SOL] Boot consolidation: indexed {indexed} user(s), DROPPED {dropped} duplicate assignment(s) (orphan sweep will recover any funds left on dropped wallets)"
+                                );
+                            } else {
+                                log::info!(
+                                    "[SOL] Boot consolidation: indexed {indexed} user(s) (no duplicates)"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "[SOL] Boot consolidation failed (will continue, lookups may be slower): {error}"
+                            );
+                        }
+                    }
+
                     let helius_client = build_helius_client();
                     if let Some(client) = helius_client.as_ref() {
                         sync_helius_webhook_addresses(

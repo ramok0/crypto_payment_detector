@@ -40,9 +40,9 @@ pub use recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 pub use solana::{SolanaConfig, SolanaDetector};
 pub use solana_pool::{
     ManagedSolanaWallet, SharedSolanaWallets, SolanaAssignment, SolanaReservation,
-    assign_wallet_for_user, delete_all_assignments, load_active_assignments,
-    load_active_reservations, load_assignment_for_user, load_wallet_pool, reserve_wallet_for_user,
-    shared_wallets,
+    assign_wallet_for_user, consolidate_assignments, delete_all_assignments,
+    load_active_assignments, load_active_reservations, load_assignment_for_user, load_wallet_pool,
+    reserve_wallet_for_user, shared_wallets,
 };
 pub use solana_tokens::{SplTokenConfig, default_spl_tokens, parse_spl_tokens};
 pub use trait_def::PaymentDetector;

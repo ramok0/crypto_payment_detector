@@ -13,6 +13,17 @@ use crate::error::DetectorError;
 // wallet for the lifetime of the deposit address — the user explicitly
 // triggers a /claim to credit their balance.
 const ASSIGNMENT_KEY_PREFIX: &str = "solana:assignment:";
+/// Per-user index mapping `user_id -> address`. Authoritative source of
+/// truth for "which wallet does this user own?" — every read goes
+/// through this key, so concurrent calls for the same user always see
+/// the same address.
+const USER_INDEX_KEY_PREFIX: &str = "solana:user_assignment:";
+/// Per-user advisory lock used to serialise concurrent
+/// `assign_wallet_for_user` calls for the same `user_id`. Prevents the
+/// race that historically created multiple assignments per user. TTL'd
+/// in case a holder crashes mid-assignment.
+const USER_LOCK_KEY_PREFIX: &str = "solana:user_assignment_lock:";
+const USER_LOCK_TTL_SECS: u64 = 30;
 const DEFAULT_SOLANA_MAX_POOL_SIZE: usize = 10_000;
 
 pub type SharedSolanaWallets = Arc<RwLock<Vec<ManagedSolanaWallet>>>;
@@ -273,6 +284,12 @@ pub async fn load_active_assignments(
 }
 
 /// Look up the permanent assignment for a single `user_id` if any.
+/// Prefers the per-user index (`solana:user_assignment:<user_id>`) for
+/// O(1) lookup; falls back to a full scan only when the index is missing
+/// (legacy data from before the index existed). When the scan finds
+/// multiple assignments for the user — historical race-condition damage
+/// — the earliest one (smallest `reserved_at_unix`) is returned, matching
+/// the consolidation logic at startup.
 pub async fn load_assignment_for_user(
     redis_url: &str,
     user_id: &str,
@@ -281,24 +298,56 @@ pub async fn load_assignment_for_user(
     if user_id.is_empty() {
         return Ok(None);
     }
-    let assignments = load_active_assignments(redis_url).await?;
-    Ok(assignments.into_iter().find(|a| a.user_id == user_id))
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(redis_error)?;
+
+    // Fast path: per-user index
+    if let Some(address) = redis_get_string(&mut connection, &user_index_key(user_id)).await? {
+        if let Some(assignment) = read_assignment_payload(&mut connection, &address).await? {
+            return Ok(Some(assignment));
+        }
+        // Stale pointer: the assignment payload was deleted. Drop the
+        // index and fall through to the scan path below.
+        log::warn!(
+            "[SOL] Stale user_index for user_id={user_id} pointed at {address}; scanning to recover"
+        );
+        let _: i64 = redis::cmd("DEL")
+            .arg(user_index_key(user_id))
+            .query_async(&mut connection)
+            .await
+            .map_err(redis_error)?;
+    }
+
+    // Slow path: scan + return the earliest assignment for this user
+    let mut matches: Vec<SolanaAssignment> = load_active_assignments(redis_url)
+        .await?
+        .into_iter()
+        .filter(|a| a.user_id == user_id)
+        .collect();
+    matches.sort_by_key(|a| a.reserved_at_unix);
+    Ok(matches.into_iter().next())
 }
 
 /// Get-or-create the permanent Solana deposit address for `user_id`.
 ///
-/// If the user already has an assignment, returns it unchanged. Otherwise
-/// picks the first unassigned wallet from the in-memory pool, persists the
-/// assignment to Redis without TTL, and returns it. Grows the pool by one
-/// random wallet when no free wallet is available (subject to
-/// `SOLANA_MAX_POOL_SIZE`).
+/// Concurrency-safe: uses a per-user advisory lock
+/// (`solana:user_assignment_lock:<user_id>`, TTL 30 s) so two parallel
+/// callers for the same user can't both assign different wallets. Once
+/// the wallet is claimed, the per-user index
+/// (`solana:user_assignment:<user_id>`) is written so every subsequent
+/// `load_assignment_for_user` call returns the same address in O(1).
 pub async fn assign_wallet_for_user(
     redis_url: &str,
     wallets: &SharedSolanaWallets,
     pool_path: &str,
     user_id: &str,
 ) -> Result<SolanaAssignment, DetectorError> {
-    if user_id.trim().is_empty() {
+    let user_id = user_id.trim().to_string();
+    if user_id.is_empty() {
         return Err(DetectorError::InvalidConfig(
             "user_id cannot be empty when assigning a Solana wallet".into(),
         ));
@@ -312,14 +361,107 @@ pub async fn assign_wallet_for_user(
         .map_err(redis_error)?;
 
     let now = unix_timestamp();
+    let user_idx = user_index_key(&user_id);
+    let lock_key = user_lock_key(&user_id);
 
-    let existing = load_active_assignments(redis_url).await?;
-    if let Some(existing_assignment) =
-        existing.into_iter().find(|a| a.user_id == user_id.trim())
-    {
-        return Ok(existing_assignment);
+    // Fast path: index already populated.
+    if let Some(addr) = redis_get_string(&mut connection, &user_idx).await? {
+        if let Some(assignment) = read_assignment_payload(&mut connection, &addr).await? {
+            return Ok(assignment);
+        }
+        log::warn!(
+            "[SOL] user_idx for user_id={user_id} pointed at {addr} but payload is missing; reassigning"
+        );
+        let _: i64 = redis::cmd("DEL")
+            .arg(&user_idx)
+            .query_async(&mut connection)
+            .await
+            .map_err(redis_error)?;
     }
 
+    // Acquire per-user lock (SET NX EX). Retry briefly so concurrent
+    // callers all converge on the winning assignment instead of erroring.
+    let mut acquired = false;
+    for _ in 0..30 {
+        let response: Option<String> = redis::cmd("SET")
+            .arg(&lock_key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(USER_LOCK_TTL_SECS)
+            .query_async(&mut connection)
+            .await
+            .map_err(redis_error)?;
+        if response.is_some() {
+            acquired = true;
+            break;
+        }
+        // Lock held by a peer. Maybe they finished — re-read the index.
+        if let Some(addr) = redis_get_string(&mut connection, &user_idx).await? {
+            if let Some(assignment) = read_assignment_payload(&mut connection, &addr).await? {
+                return Ok(assignment);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !acquired {
+        return Err(DetectorError::ApiError(format!(
+            "Failed to acquire assignment lock for user_id={user_id} after 3s; another caller may be stuck"
+        )));
+    }
+
+    // We hold the lock. Re-check the index in case the previous holder
+    // finished between our failed SET NX and the retry.
+    if let Some(addr) = redis_get_string(&mut connection, &user_idx).await? {
+        if let Some(assignment) = read_assignment_payload(&mut connection, &addr).await? {
+            release_user_lock(&mut connection, &lock_key).await;
+            return Ok(assignment);
+        }
+    }
+
+    // Find an unassigned wallet from the pool.
+    let result = claim_first_unassigned_wallet(
+        &mut connection,
+        wallets,
+        pool_path,
+        &user_id,
+        now,
+    )
+    .await;
+
+    match result {
+        Ok(assignment) => {
+            // Publish the index so future calls (and concurrent waiters
+            // who lost the lock) find this assignment in O(1).
+            let _: () = redis::cmd("SET")
+                .arg(&user_idx)
+                .arg(&assignment.address)
+                .query_async(&mut connection)
+                .await
+                .map_err(redis_error)?;
+            log::info!(
+                "[SOL] Assigned wallet {} (index {}) to user_id={} (no TTL, indexed)",
+                assignment.address,
+                assignment.wallet_index,
+                user_id
+            );
+            release_user_lock(&mut connection, &lock_key).await;
+            Ok(assignment)
+        }
+        Err(error) => {
+            release_user_lock(&mut connection, &lock_key).await;
+            Err(error)
+        }
+    }
+}
+
+async fn claim_first_unassigned_wallet(
+    connection: &mut redis::aio::MultiplexedConnection,
+    wallets: &SharedSolanaWallets,
+    pool_path: &str,
+    user_id: &str,
+    now: i64,
+) -> Result<SolanaAssignment, DetectorError> {
     let candidates: Vec<(String, u32)> = {
         let pool = wallets.read().unwrap_or_else(|p| p.into_inner());
         pool.iter()
@@ -329,7 +471,7 @@ pub async fn assign_wallet_for_user(
 
     for (address, index) in candidates {
         let assignment = SolanaAssignment {
-            user_id: user_id.trim().to_string(),
+            user_id: user_id.to_string(),
             address: address.clone(),
             wallet_index: index,
             reserved_at_unix: now,
@@ -341,22 +483,16 @@ pub async fn assign_wallet_for_user(
             .arg(reservation_key(&address))
             .arg(payload)
             .arg("NX")
-            .query_async(&mut connection)
+            .query_async(connection)
             .await
             .map_err(redis_error)?;
 
         if response.is_some() {
-            log::info!(
-                "[SOL] Assigned wallet {} (index {}) to user_id={} (no TTL)",
-                address,
-                index,
-                user_id
-            );
             return Ok(assignment);
         }
     }
 
-    // Pool exhausted — generate a new wallet, persist it, then assign it.
+    // Pool exhausted — auto-grow.
     let max_pool_size = solana_max_pool_size();
     let new_wallet = {
         let mut pool = wallets.write().unwrap_or_else(|p| p.into_inner());
@@ -381,7 +517,7 @@ pub async fn assign_wallet_for_user(
     );
 
     let assignment = SolanaAssignment {
-        user_id: user_id.trim().to_string(),
+        user_id: user_id.to_string(),
         address: new_wallet.address.clone(),
         wallet_index: new_wallet.index,
         reserved_at_unix: now,
@@ -392,7 +528,7 @@ pub async fn assign_wallet_for_user(
         .arg(reservation_key(&new_wallet.address))
         .arg(payload)
         .arg("NX")
-        .query_async(&mut connection)
+        .query_async(connection)
         .await
         .map_err(redis_error)?;
 
@@ -402,6 +538,51 @@ pub async fn assign_wallet_for_user(
         Err(DetectorError::ApiError(
             "Failed to register assignment for newly generated Solana wallet".into(),
         ))
+    }
+}
+
+async fn redis_get_string(
+    connection: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+) -> Result<Option<String>, DetectorError> {
+    redis::cmd("GET")
+        .arg(key)
+        .query_async(connection)
+        .await
+        .map_err(redis_error)
+}
+
+async fn read_assignment_payload(
+    connection: &mut redis::aio::MultiplexedConnection,
+    address: &str,
+) -> Result<Option<SolanaAssignment>, DetectorError> {
+    let Some(raw) = redis_get_string(connection, &reservation_key(address)).await? else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<SolanaAssignment>(&raw) {
+        Ok(a) => Ok(Some(a)),
+        Err(error) => {
+            log::warn!(
+                "[SOL] Failed to parse assignment payload for {address}: {error}"
+            );
+            Ok(None)
+        }
+    }
+}
+
+async fn release_user_lock(
+    connection: &mut redis::aio::MultiplexedConnection,
+    lock_key: &str,
+) {
+    let result: Result<i64, redis::RedisError> = redis::cmd("DEL")
+        .arg(lock_key)
+        .query_async(connection)
+        .await;
+    if let Err(error) = result {
+        log::warn!(
+            "[SOL] Failed to release per-user assignment lock {lock_key}: {error} (will TTL out in <{}s)",
+            USER_LOCK_TTL_SECS
+        );
     }
 }
 
@@ -416,23 +597,125 @@ pub async fn delete_all_assignments(redis_url: &str) -> Result<usize, DetectorEr
         .await
         .map_err(redis_error)?;
 
-    let keys = scan_reservation_keys(&mut connection).await?;
-    if keys.is_empty() {
+    let assignment_keys = scan_reservation_keys(&mut connection).await?;
+    let user_idx_keys = scan_keys_by_prefix(&mut connection, USER_INDEX_KEY_PREFIX).await?;
+    let lock_keys = scan_keys_by_prefix(&mut connection, USER_LOCK_KEY_PREFIX).await?;
+
+    let mut all_keys = Vec::with_capacity(
+        assignment_keys.len() + user_idx_keys.len() + lock_keys.len(),
+    );
+    all_keys.extend(assignment_keys.iter().cloned());
+    all_keys.extend(user_idx_keys.iter().cloned());
+    all_keys.extend(lock_keys.iter().cloned());
+    if all_keys.is_empty() {
         return Ok(0);
     }
 
     let deleted: usize = redis::cmd("DEL")
-        .arg(&keys)
+        .arg(&all_keys)
         .query_async(&mut connection)
         .await
         .map_err(redis_error)?;
 
     log::info!(
-        "[SOL] Cancelled {} assignment(s) (scanned {} key(s))",
-        deleted,
-        keys.len()
+        "[SOL] Cancelled {} assignment(s) ({} primary, {} user_idx, {} locks deleted)",
+        assignment_keys.len(),
+        assignment_keys.len(),
+        user_idx_keys.len(),
+        lock_keys.len()
     );
-    Ok(deleted)
+    let _ = deleted; // total reflects all key types; expose primary count
+    Ok(assignment_keys.len())
+}
+
+/// Reconcile per-user indices with the actual `solana:assignment:*`
+/// payloads. Two failure modes this targets:
+///
+/// 1. **Race-created duplicates** — historically, concurrent
+///    `assign_wallet_for_user` calls for the same `user_id` could leave
+///    the user with multiple `solana:assignment:*` entries. This
+///    function picks the canonical one (smallest `reserved_at_unix`,
+///    address sort as tiebreaker), writes the per-user index to point
+///    at it, and **deletes the duplicate assignment payloads** so the
+///    detector stops scanning them. Funds that may sit on a deleted
+///    duplicate are recovered automatically by the existing orphan
+///    sweep at startup.
+///
+/// 2. **Missing index** — assignments created before the user_index key
+///    existed have no `solana:user_assignment:*` entry. This function
+///    publishes the index for them so future O(1) lookups work.
+///
+/// Returns `(users_indexed, duplicates_dropped)`. Safe to run every
+/// startup; idempotent once converged.
+pub async fn consolidate_assignments(
+    redis_url: &str,
+) -> Result<(usize, usize), DetectorError> {
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(redis_error)?;
+
+    let assignments = load_active_reservations(redis_url).await?;
+    if assignments.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Group by user_id
+    let mut by_user: std::collections::HashMap<String, Vec<SolanaAssignment>> =
+        std::collections::HashMap::new();
+    for assignment in assignments {
+        by_user
+            .entry(assignment.user_id.clone())
+            .or_default()
+            .push(assignment);
+    }
+
+    let mut indexed: usize = 0;
+    let mut dropped: usize = 0;
+    for (user_id, mut group) in by_user {
+        // Canonical = smallest reserved_at_unix, then smallest address
+        group.sort_by(|a, b| {
+            a.reserved_at_unix
+                .cmp(&b.reserved_at_unix)
+                .then(a.address.cmp(&b.address))
+        });
+        let canonical = group.remove(0);
+
+        // Drop the duplicates (everything after canonical)
+        for dupe in &group {
+            log::warn!(
+                "[SOL] consolidate: dropping duplicate assignment {} for user_id={} (canonical={}, reserved_at={})",
+                dupe.address,
+                user_id,
+                canonical.address,
+                dupe.reserved_at_unix
+            );
+            let _: i64 = redis::cmd("DEL")
+                .arg(reservation_key(&dupe.address))
+                .query_async(&mut connection)
+                .await
+                .map_err(redis_error)?;
+            dropped += 1;
+        }
+
+        // Publish (or refresh) the per-user index pointing at canonical
+        let _: () = redis::cmd("SET")
+            .arg(user_index_key(&user_id))
+            .arg(&canonical.address)
+            .query_async(&mut connection)
+            .await
+            .map_err(redis_error)?;
+        indexed += 1;
+    }
+
+    log::info!(
+        "[SOL] consolidate: indexed {} user(s), dropped {} duplicate assignment(s) (any funds on dropped addresses will be recovered by the orphan sweep)",
+        indexed,
+        dropped
+    );
+    Ok((indexed, dropped))
 }
 
 /// Backwards-compatible alias used by older callers (and the API binary
@@ -450,6 +733,14 @@ pub async fn reserve_wallet_for_user(
 
 pub fn reservation_key(address: &str) -> String {
     format!("{ASSIGNMENT_KEY_PREFIX}{address}")
+}
+
+pub fn user_index_key(user_id: &str) -> String {
+    format!("{USER_INDEX_KEY_PREFIX}{user_id}")
+}
+
+pub fn user_lock_key(user_id: &str) -> String {
+    format!("{USER_LOCK_KEY_PREFIX}{user_id}")
 }
 
 fn parse_private_key_bytes(
@@ -500,6 +791,13 @@ fn parse_private_key_string(value: &str, index: u32) -> Result<Vec<u8>, Detector
 async fn scan_reservation_keys(
     connection: &mut redis::aio::MultiplexedConnection,
 ) -> Result<Vec<String>, DetectorError> {
+    scan_keys_by_prefix(connection, ASSIGNMENT_KEY_PREFIX).await
+}
+
+async fn scan_keys_by_prefix(
+    connection: &mut redis::aio::MultiplexedConnection,
+    prefix: &str,
+) -> Result<Vec<String>, DetectorError> {
     let mut cursor: u64 = 0;
     let mut keys = Vec::new();
 
@@ -507,7 +805,7 @@ async fn scan_reservation_keys(
         let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg(format!("{ASSIGNMENT_KEY_PREFIX}*"))
+            .arg(format!("{prefix}*"))
             .arg("COUNT")
             .arg(256)
             .query_async(connection)
