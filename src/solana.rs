@@ -570,12 +570,41 @@ impl SolanaDetector {
             }
         };
 
+        // Catch per-reservation errors so a single rate-limited 429 (or any
+        // other transient RPC failure) doesn't abort the whole cycle and
+        // — critically — doesn't prevent `process_credits` from running.
+        // Pending payments would otherwise stay un-credited indefinitely
+        // because the cycle never reaches the credit step. Each failure is
+        // logged at WARN; the next cycle retries the same reservations.
+        let mut failed_scans: usize = 0;
         for reservation in &reservations {
-            self.process_reservation(reservation, current_slot, spot_price)
-                .await?;
+            if let Err(error) = self
+                .process_reservation(reservation, current_slot, spot_price)
+                .await
+            {
+                failed_scans += 1;
+                log::warn!(
+                    "[SOL] process_cycle: scan failed for {} (will retry next cycle): {error}",
+                    reservation.address
+                );
+            }
+        }
+        if failed_scans > 0 {
+            log::warn!(
+                "[SOL] process_cycle: {}/{} reservation scan(s) failed this cycle - proceeding to process_credits anyway",
+                failed_scans,
+                reservations.len()
+            );
         }
 
-        self.process_credits(current_slot).await?;
+        // Don't propagate process_credits errors either - just log and let
+        // the next cycle (or the Helius webhook path) retry. Returning Err
+        // here would skip gas tank maintenance for no good reason.
+        if let Err(error) = self.process_credits(current_slot).await {
+            log::warn!(
+                "[SOL] process_cycle: process_credits errored (will retry next cycle): {error}"
+            );
+        }
         self.maybe_maintain_gas_tank().await?;
         Ok(())
     }
@@ -997,10 +1026,34 @@ impl SolanaDetector {
             state.pending.clone()
         };
 
+        // Process each pending entry independently. A failure on one
+        // (e.g. RPC 429 during sweep, transient blockhash fetch error)
+        // must NOT skip the rest — otherwise a single stuck entry blocks
+        // every subsequent credit forever. Errors are logged WARN and
+        // the entry stays in `pending` so the next cycle retries it.
         for entry in pending {
+            let signature = entry.signature.clone();
+            let address = entry.address.clone();
+            if let Err(error) = self.process_credit_entry(entry, current_slot).await {
+                log::warn!(
+                    "[SOL] process_credits: failed to credit signature {} (address {}, will retry next cycle): {error}",
+                    signature,
+                    address
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_credit_entry(
+        &self,
+        entry: SolanaPendingPayment,
+        current_slot: u64,
+    ) -> Result<(), DetectorError> {
+        {
             let confirmations = current_slot.saturating_sub(entry.slot) + 1;
             if confirmations < self.config.min_confirmations {
-                continue;
+                return Ok(());
             }
 
             let already_credited = {
@@ -1173,7 +1226,7 @@ impl SolanaDetector {
             };
 
             let Some((credited_payment, was_deferred)) = payment_and_deferred else {
-                continue;
+                return Ok(());
             };
 
             if !already_credited {
