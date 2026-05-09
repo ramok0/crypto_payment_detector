@@ -462,6 +462,38 @@ impl SolanaDetector {
         Ok(address)
     }
 
+    /// Cheap retry tick for pending-but-not-yet-credited payments.
+    ///
+    /// Unlike `process_cycle`, this does **not** scan any address — it
+    /// only iterates the in-memory `pending` queue and retries the sweep
+    /// + credit step. Useful as a fast-cadence loop (e.g. every 30 s)
+    /// alongside the slow full-scan loop (e.g. every 30 min):
+    ///
+    /// - A Helius webhook normally adds an entry to `pending` and credits
+    ///   it within a single push. Most deposits are done in <10 s.
+    /// - When the credit step inside the Helius handler fails (RPC 429
+    ///   on `getLatestBlockhash`, fee guard deferred, transient sweep
+    ///   error), the pending entry stays. Without this loop it would
+    ///   wait for either another Helius push from any user OR the
+    ///   30-minute polling cycle to retry — both unbounded in the worst
+    ///   case.
+    ///
+    /// When the pending queue is empty this is a no-op (one cheap mutex
+    /// read, no RPC calls). Returns the number of entries that were
+    /// queued for processing.
+    pub async fn confirm_pending_payments(&self) -> Result<usize, DetectorError> {
+        let pending_count = {
+            let state = self.state.lock().unwrap();
+            state.pending.len()
+        };
+        if pending_count == 0 {
+            return Ok(0);
+        }
+        let current_slot = self.get_current_slot().await?;
+        self.process_credits(current_slot).await?;
+        Ok(pending_count)
+    }
+
     /// For each assignment in Redis whose owner address or any of its
     /// monitored SPL token ATAs is contained in `candidate_addresses`, run
     /// `process_reservation` (native + token scans) immediately, then run

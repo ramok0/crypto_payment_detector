@@ -395,6 +395,35 @@ async fn run_solana_detector(detector: Arc<SolanaDetector>) {
     }
 }
 
+/// Fast-cadence loop that retries pending-but-not-yet-credited Solana
+/// payments (no address scan; just iterates the in-memory pending queue).
+/// Cheap when nothing is pending. Runs alongside `run_solana_detector`.
+async fn run_solana_pending_confirmation_loop(detector: Arc<SolanaDetector>) {
+    let interval_secs = std::env::var("SOL_PENDING_POLL_INTERVAL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30);
+    let interval = std::time::Duration::from_secs(interval_secs);
+    log::info!(
+        "[SOL] Pending-confirmation loop running every {interval_secs}s (override via SOL_PENDING_POLL_INTERVAL)"
+    );
+    loop {
+        tokio::time::sleep(interval).await;
+        let started = std::time::Instant::now();
+        match detector.confirm_pending_payments().await {
+            Ok(0) => {}
+            Ok(count) => log::info!(
+                "[SOL] Pending-confirmation tick: processed {count} entry(ies) in {:.2}s",
+                started.elapsed().as_secs_f64()
+            ),
+            Err(error) => log::warn!(
+                "[SOL] Pending-confirmation tick failed (will retry next interval): {error}"
+            ),
+        }
+    }
+}
+
 async fn run_ethereum_detector(detector: Arc<EthereumDetector>, ticker: &'static str) {
     if let Err(error) = detector.sweep_orphan_balances().await {
         log::warn!("[{ticker}] Startup orphan sweep failed: {error}");
@@ -517,6 +546,10 @@ async fn main() {
                 let detector_handle = detector.clone();
                 handles.push(tokio::spawn(async move {
                     run_solana_detector(detector_handle).await;
+                }));
+                let pending_handle = detector.clone();
+                handles.push(tokio::spawn(async move {
+                    run_solana_pending_confirmation_loop(pending_handle).await;
                 }));
             }
             Chain::Ethereum | Chain::Base => {
