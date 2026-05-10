@@ -24,8 +24,8 @@ use crypto_payment_detector::{
     assign_ethereum_wallet_for_user, assign_wallet_for_user, delete_all_assignments,
     delete_all_ethereum_assignments, ethereum_reservation_store_url_from_env,
     load_active_ethereum_reservations, load_active_reservations, load_ethereum_wallet_pool,
-    load_wallet_pool, parse_erc20_tokens, parse_spl_tokens, shared_ethereum_wallets,
-    shared_wallets,
+    load_wallet_pool, parse_erc20_tokens, parse_spl_tokens, rotate_assignment,
+    shared_ethereum_wallets, shared_wallets,
 };
 
 #[derive(Clone)]
@@ -430,6 +430,70 @@ async fn handle_solana_address(
         address: assignment.address,
         wallet_index: assignment.wallet_index,
         assigned_at_unix: assignment.reserved_at_unix,
+        sweep_destination_address: solana_pool.secure_deposit_address.clone(),
+    }))
+}
+
+/// Rotate the user's Solana deposit address to a brand-new wallet from
+/// the pool. The previous address is preserved in Redis as `dormant`, so
+/// late deposits still credit the original user — the slot is simply not
+/// returned by `/solana/address` any more. The autoshop backend
+/// rate-limits this to once per day per user; the detector itself does
+/// not enforce a cooldown.
+#[derive(Serialize)]
+struct SolanaRotateResponse {
+    user_id: String,
+    new_address: String,
+    new_wallet_index: u32,
+    new_assigned_at_unix: i64,
+    previous_address: String,
+    previous_wallet_index: u32,
+    sweep_destination_address: String,
+}
+
+async fn handle_solana_rotate(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AddressRequest>,
+) -> Result<Json<SolanaRotateResponse>, (StatusCode, String)> {
+    let Some(solana_pool) = state.solana_pool.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Solana address pool is not configured".into(),
+        ));
+    };
+
+    let (old, fresh) = rotate_assignment(
+        &solana_pool.redis_url,
+        &solana_pool.wallets,
+        &solana_pool.wallet_pool_path,
+        &payload.user_id,
+    )
+    .await
+    .map_err(map_assignment_error)?;
+
+    // Register the new address on Helius. The OLD address stays watched
+    // because we never remove it from the webhook list — leaving it
+    // there is exactly what we want, since late deposits to the dormant
+    // address still need to fire the detection path.
+    if let (Some(helius), Some(detector)) =
+        (solana_pool.helius.as_ref(), solana_pool.detector.as_ref())
+    {
+        let addresses = detector.webhook_addresses_for_wallet(&fresh.address);
+        if let Err(error) = helius.add_addresses(&addresses).await {
+            log::warn!(
+                "[HELIUS] Failed to register rotated address {} on webhook (will rely on polling): {error}",
+                fresh.address
+            );
+        }
+    }
+
+    Ok(Json(SolanaRotateResponse {
+        user_id: fresh.user_id.clone(),
+        new_address: fresh.address.clone(),
+        new_wallet_index: fresh.wallet_index,
+        new_assigned_at_unix: fresh.reserved_at_unix,
+        previous_address: old.address,
+        previous_wallet_index: old.wallet_index,
         sweep_destination_address: solana_pool.secure_deposit_address.clone(),
     }))
 }
@@ -1289,6 +1353,15 @@ fn build_solana_config() -> SolanaConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.10),
+        core_api_url: std::env::var("CORE_API_INTERNAL_URL")
+            .or_else(|_| std::env::var("BACKEND_API_INTERNAL_URL"))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        internal_service_token: std::env::var("INTERNAL_SERVICE_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     }
 }
 
@@ -2043,6 +2116,7 @@ async fn main() {
         .route("/health", get(handle_health))
         .route("/derive", get(handle_derive))
         .route("/solana/address", post(handle_solana_address))
+        .route("/solana/rotate", post(handle_solana_rotate))
         .route("/solana/active", get(handle_solana_active))
         .route("/solana/claim", post(handle_solana_claim))
         .route("/solana/recover-txid", post(handle_solana_recover))

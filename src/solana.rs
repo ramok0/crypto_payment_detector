@@ -19,7 +19,8 @@ use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
 use crate::solana_pool::{
     ManagedSolanaWallet, SharedSolanaWallets, SolanaReservation, find_wallet,
-    load_active_reservations, load_assignment_for_user, snapshot_wallets,
+    load_active_reservations, load_assignment_for_address, load_assignment_for_user,
+    snapshot_wallets,
 };
 use crate::solana_tokens::{
     SplTokenConfig, create_associated_token_account_idempotent_instruction,
@@ -51,6 +52,12 @@ pub struct SolanaConfig {
     pub gas_tank_target_usd: f64,
     pub gas_tank_check_interval_secs: u64,
     pub max_fee_ratio: f64,
+    /// Internal URL of the autoshop backend, used to commit scheduled-SOL
+    /// payment status updates. Feature is disabled when either this or
+    /// `internal_service_token` is empty.
+    pub core_api_url: Option<String>,
+    /// Shared secret for the backend's `x-internal-service-token` header.
+    pub internal_service_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,10 +87,35 @@ struct SolanaState {
     addresses: HashMap<String, SolanaAddressState>,
     #[serde(default)]
     pending: Vec<SolanaPendingPayment>,
+    /// Legacy, signature-only credit ledger. Kept readable for state-file
+    /// backward compatibility but no longer written to and not consulted
+    /// by dedup checks: it conflated `(signature)` with `(signature,
+    /// address, asset)` and silently dropped the second deposit when a
+    /// single tx (e.g. Binance batch sends) credited two of our managed
+    /// addresses. New credits go to `credited_payments` below, keyed by
+    /// the composite tuple.
     #[serde(default)]
     credited_signatures: HashSet<String>,
+    /// Per-deposit credit ledger keyed by `payment_key(sig, addr, asset)`.
+    /// Multiple distinct entries can exist for the same signature when a
+    /// transaction deposits to several of our addresses.
+    #[serde(default)]
+    credited_payments: HashSet<String>,
     #[serde(default)]
     gas_tank_last_maintenance_unix: Option<i64>,
+}
+
+/// Composite key uniquely identifying a single deposit. Two deposits in
+/// the same Solana transaction (e.g. a Binance batch send hitting two of
+/// our managed wallets) collide on `signature` but differ on `address` —
+/// keying the dedup ledgers on the full tuple keeps both visible.
+///
+/// `asset == None` is the native SOL channel; tokens pass their SPL
+/// symbol. We pin the native sentinel to "SOL" so a tx containing both
+/// native and token transfers to the same address still produces two
+/// distinct keys.
+fn payment_key(signature: &str, address: &str, asset: Option<&str>) -> String {
+    format!("{}|{}|{}", signature, address, asset.unwrap_or("SOL"))
 }
 
 #[derive(Debug, Clone)]
@@ -741,6 +773,29 @@ impl SolanaDetector {
             return Ok(());
         }
 
+        // Check for an admin-scheduled outbound payment. If one exists and is
+        // not yet expired, divert the excess sweep to that destination
+        // instead of the ledger. We process a single payment per maintenance
+        // tick to keep the logic predictable; multi-payment queues fulfill
+        // one payment at a time, oldest first.
+        match self.try_fulfill_scheduled_payment(
+            gas_tank_pubkey,
+            balance,
+            target_lamports,
+            sol_usd,
+        )
+        .await
+        {
+            ScheduledOutcome::Sent => return Ok(()),
+            ScheduledOutcome::WaitingForFunds => {
+                // A payment is scheduled but the gas tank doesn't yet hold
+                // enough lamports to cover both the buffer and the requested
+                // amount. Skip the ledger sweep so funds keep accumulating.
+                return Ok(());
+            }
+            ScheduledOutcome::None => {}
+        }
+
         let recent_blockhash = self.get_latest_blockhash().await?;
         let gas_tank = self
             .gas_tank_keypair
@@ -780,6 +835,189 @@ impl SolanaDetector {
         );
 
         Ok(())
+    }
+
+    /// Drains pending scheduled SOL payments from Redis. Tries the oldest
+    /// payment first; only one is sent per maintenance tick. Returns
+    /// `Sent` when a payment fired (or terminally failed and was reported),
+    /// `WaitingForFunds` when a pending payment exists but the balance is
+    /// not yet sufficient (caller must skip the ledger sweep), or `None`
+    /// when no pending payments exist (caller proceeds with normal sweep).
+    async fn try_fulfill_scheduled_payment(
+        &self,
+        gas_tank_pubkey: Pubkey,
+        balance: u64,
+        target_lamports: u64,
+        sol_usd: f64,
+    ) -> ScheduledOutcome {
+        let (Some(core_api_url), Some(internal_token)) = (
+            self.config.core_api_url.as_deref(),
+            self.config.internal_service_token.as_deref(),
+        ) else {
+            return ScheduledOutcome::None;
+        };
+
+        let pending = match crate::solana_scheduled::load_pending_scheduled_payments(
+            &self.config.redis_url,
+        )
+        .await
+        {
+            Ok(list) => list,
+            Err(error) => {
+                log::warn!(
+                    "[SOL][SCHED] Failed to load pending scheduled payments: {error}"
+                );
+                return ScheduledOutcome::None;
+            }
+        };
+        if pending.is_empty() {
+            return ScheduledOutcome::None;
+        }
+
+        let now_unix = unix_timestamp();
+        let candidate = pending
+            .into_iter()
+            .find(|payment| payment.expires_at_unix > now_unix);
+        let Some(payment) = candidate else {
+            // All pending payments are past their expiry. The backend's
+            // list endpoint will mark them expired the next time an admin
+            // looks at them; nothing to do here.
+            return ScheduledOutcome::None;
+        };
+
+        let amount_lamports = match payment_amount_lamports(&payment, sol_usd, &self.sol_eur_fetcher).await {
+            Ok(value) => value,
+            Err(reason) => {
+                log::warn!(
+                    "[SOL][SCHED] Payment {} has invalid amount/currency ({}); marking failed",
+                    payment.id,
+                    reason
+                );
+                crate::solana_scheduled::notify_payment_failed(
+                    &self.webhook_client,
+                    core_api_url,
+                    internal_token,
+                    payment.id,
+                    &reason,
+                )
+                .await;
+                return ScheduledOutcome::Sent;
+            }
+        };
+        if amount_lamports == 0 {
+            crate::solana_scheduled::notify_payment_failed(
+                &self.webhook_client,
+                core_api_url,
+                internal_token,
+                payment.id,
+                "Resolved amount is zero lamports",
+            )
+            .await;
+            return ScheduledOutcome::Sent;
+        }
+
+        let destination = match Pubkey::from_str(&payment.destination_address) {
+            Ok(pubkey) => pubkey,
+            Err(error) => {
+                let reason = format!("Invalid destination address: {error}");
+                log::warn!(
+                    "[SOL][SCHED] Payment {} has invalid destination '{}'; marking failed",
+                    payment.id,
+                    payment.destination_address
+                );
+                crate::solana_scheduled::notify_payment_failed(
+                    &self.webhook_client,
+                    core_api_url,
+                    internal_token,
+                    payment.id,
+                    &reason,
+                )
+                .await;
+                return ScheduledOutcome::Sent;
+            }
+        };
+
+        let recent_blockhash = match self.get_latest_blockhash().await {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("[SOL][SCHED] Failed to fetch blockhash: {error}");
+                return ScheduledOutcome::WaitingForFunds;
+            }
+        };
+        let Some(gas_tank) = self.gas_tank_keypair.as_ref() else {
+            return ScheduledOutcome::None;
+        };
+        let fee = match self
+            .estimate_native_transfer_fee(gas_tank.as_ref(), &destination, recent_blockhash)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("[SOL][SCHED] Failed to estimate fee: {error}");
+                return ScheduledOutcome::WaitingForFunds;
+            }
+        };
+
+        // Keep the gas-tank fee buffer intact: only fire when the balance
+        // covers the requested amount AND the buffer AND the network fee.
+        let required = target_lamports.saturating_add(amount_lamports).saturating_add(fee);
+        if balance < required {
+            log::info!(
+                "[SOL][SCHED] Payment {} waiting: balance {} < required {} (target_buffer={} amount={} fee={})",
+                payment.id,
+                balance,
+                required,
+                target_lamports,
+                amount_lamports,
+                fee
+            );
+            return ScheduledOutcome::WaitingForFunds;
+        }
+
+        let tx = Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &gas_tank_pubkey,
+                &destination,
+                amount_lamports,
+            )],
+            Some(&gas_tank_pubkey),
+            &[gas_tank.as_ref()],
+            recent_blockhash,
+        );
+
+        let txid = match self.send_solana_transaction(&tx).await {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!(
+                    "[SOL][SCHED] Failed to send scheduled payment {}: {error}",
+                    payment.id
+                );
+                // Treat as waiting; the next tick will retry.
+                return ScheduledOutcome::WaitingForFunds;
+            }
+        };
+
+        log::warn!(
+            "[SOL][SCHED] Sent scheduled payment {}: {} lamports ({:.9} SOL) to {} (tx={})",
+            payment.id,
+            amount_lamports,
+            amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64,
+            destination,
+            txid
+        );
+
+        let lamports_i64 = amount_lamports.min(i64::MAX as u64) as i64;
+        crate::solana_scheduled::notify_payment_sent(
+            &self.webhook_client,
+            core_api_url,
+            internal_token,
+            payment.id,
+            &txid,
+            lamports_i64,
+        )
+        .await;
+
+        ScheduledOutcome::Sent
     }
 
     async fn estimate_native_transfer_fee(
@@ -885,6 +1123,7 @@ impl SolanaDetector {
             }
 
             let confirmations = current_slot.saturating_sub(tx.slot) + 1;
+            let dedup_key = payment_key(&sig.signature, &reservation.address, None);
             let detected = DetectedPayment {
                 chain: Chain::Solana,
                 ticker: Chain::Solana.ticker().to_string(),
@@ -904,6 +1143,11 @@ impl SolanaDetector {
                 fiat_amount: None,
                 fiat_currency: None,
                 coin_price: None,
+                // Composite event_id makes the backend's idempotency lock
+                // per-(sig, addr, asset) instead of per-sig: two deposits
+                // in the same tx will produce two distinct credit rows.
+                event_id: Some(dedup_key.clone()),
+                log_index: None,
                 asset: None,
                 asset_decimals: None,
                 amount_base_units: None,
@@ -922,8 +1166,12 @@ impl SolanaDetector {
 
             {
                 let mut state = self.state.lock().unwrap();
-                let already_pending = state.pending.iter().any(|p| p.signature == sig.signature);
-                let already_credited = state.credited_signatures.contains(&sig.signature);
+                let already_pending = state.pending.iter().any(|p| {
+                    p.signature == sig.signature
+                        && p.address == reservation.address
+                        && p.asset.is_none()
+                });
+                let already_credited = state.credited_payments.contains(&dedup_key);
 
                 if !already_pending && !already_credited {
                     state.pending.push(SolanaPendingPayment {
@@ -1025,6 +1273,11 @@ impl SolanaDetector {
             }
 
             let confirmations = current_slot.saturating_sub(tx.slot) + 1;
+            let dedup_key = payment_key(
+                &sig.signature,
+                &reservation.address,
+                Some(token.symbol.as_str()),
+            );
             let detected = DetectedPayment {
                 chain: Chain::Solana,
                 ticker: token.symbol.clone(),
@@ -1044,6 +1297,8 @@ impl SolanaDetector {
                 fiat_amount: None,
                 fiat_currency: None,
                 coin_price: None,
+                event_id: Some(dedup_key.clone()),
+                log_index: None,
                 asset: Some(token.symbol.clone()),
                 asset_decimals: Some(token.decimals),
                 amount_base_units: Some(amount_base_units.to_string()),
@@ -1061,8 +1316,12 @@ impl SolanaDetector {
 
             {
                 let mut state = self.state.lock().unwrap();
-                let already_pending = state.pending.iter().any(|p| p.signature == sig.signature);
-                let already_credited = state.credited_signatures.contains(&sig.signature);
+                let already_pending = state.pending.iter().any(|p| {
+                    p.signature == sig.signature
+                        && p.address == reservation.address
+                        && p.asset.as_deref() == Some(token.symbol.as_str())
+                });
+                let already_credited = state.credited_payments.contains(&dedup_key);
 
                 if !already_pending && !already_credited {
                     state.pending.push(SolanaPendingPayment {
@@ -1121,10 +1380,59 @@ impl SolanaDetector {
                 return Ok(());
             }
 
+            let entry_dedup_key =
+                payment_key(&entry.signature, &entry.address, entry.asset.as_deref());
             let already_credited = {
                 let state = self.state.lock().unwrap();
-                state.credited_signatures.contains(&entry.signature)
+                state.credited_payments.contains(&entry_dedup_key)
             };
+
+            // Defense-in-depth: before crediting (and especially before
+            // sweeping the user's funds out of the managed wallet), make
+            // sure the address still belongs to the user_id captured at
+            // detection time. If the assignment was rewritten (admin
+            // cancel-all + reclaim, manual Redis edit, etc.) we'd be
+            // about to credit the wrong user. We refuse to credit and
+            // keep the entry in pending for manual review — the funds
+            // stay safe on the managed wallet because the sweep call
+            // happens *after* this check.
+            if !already_credited {
+                match load_assignment_for_address(&self.config.redis_url, &entry.address).await {
+                    Ok(Some(current)) if current.user_id != entry.user_id => {
+                        log::error!(
+                            "[SOL][SECURITY] Refusing to credit signature {} for address {}: \
+                             pending entry user_id={} but Redis now says user_id={} (dormant={}). \
+                             Keeping entry pending for manual review.",
+                            entry.signature,
+                            entry.address,
+                            entry.user_id,
+                            current.user_id,
+                            current.dormant
+                        );
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        log::warn!(
+                            "[SOL] No current Redis assignment for address {} when crediting \
+                             signature {} (pending user_id={}); proceeding with pending entry's \
+                             user_id since the depositor's intent was captured at detection time.",
+                            entry.address,
+                            entry.signature,
+                            entry.user_id,
+                        );
+                    }
+                    Ok(Some(_)) => {
+                        // owner matches — proceed normally
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[SOL] Failed to verify Redis assignment for {} before credit \
+                             (continuing): {error}",
+                            entry.address
+                        );
+                    }
+                }
+            }
 
             let payment_and_deferred: Option<(DetectedPayment, bool)> = match entry.asset.as_deref() {
                 None => {
@@ -1179,6 +1487,8 @@ impl SolanaDetector {
                         fiat_amount: None,
                         fiat_currency: None,
                         coin_price: None,
+                        event_id: Some(entry_dedup_key.clone()),
+                        log_index: None,
                         asset: None,
                         asset_decimals: None,
                         amount_base_units: None,
@@ -1266,6 +1576,8 @@ impl SolanaDetector {
                         fiat_amount: None,
                         fiat_currency: None,
                         coin_price: None,
+                        event_id: Some(entry_dedup_key.clone()),
+                        log_index: None,
                         asset: Some(symbol.to_string()),
                         asset_decimals: Some(decimals),
                         amount_base_units: Some(entry.amount_base_units.to_string()),
@@ -1305,7 +1617,7 @@ impl SolanaDetector {
 
                 {
                     let mut state = self.state.lock().unwrap();
-                    state.credited_signatures.insert(entry.signature.clone());
+                    state.credited_payments.insert(entry_dedup_key.clone());
                 }
                 self.persist_state()?;
             }
@@ -1313,9 +1625,15 @@ impl SolanaDetector {
             if !was_deferred {
                 {
                     let mut state = self.state.lock().unwrap();
-                    state
-                        .pending
-                        .retain(|pending| pending.signature != entry.signature);
+                    // Match by the same composite key we used to insert the
+                    // pending entry — multiple entries can share a signature
+                    // when one tx credits several of our addresses, and we
+                    // must only retain *this* entry's slot.
+                    state.pending.retain(|pending| {
+                        !(pending.signature == entry.signature
+                            && pending.address == entry.address
+                            && pending.asset == entry.asset)
+                    });
                 }
                 self.persist_state()?;
             }
@@ -1388,7 +1706,40 @@ impl SolanaDetector {
             recent_blockhash,
         );
 
-        let txid = self.send_solana_transaction(&tx).await?;
+        let txid = match self.send_solana_transaction(&tx).await {
+            Ok(txid) => txid,
+            Err(error) if is_account_drained_error(&error) => {
+                // The wallet has no record of a prior credit (rent-reaped
+                // or never funded) by the time the RPC simulates our tx,
+                // even though `get_balance` returned non-zero a moment
+                // ago. Causes seen in the wild:
+                //   - The boot orphan-sweep already drained the wallet
+                //     after consolidation dropped a duplicate assignment
+                //     for this user (race between consolidation cleanup
+                //     and a stale pending entry).
+                //   - Two concurrent sweep attempts (Helius push +
+                //     pending-confirmation loop): the first wins, the
+                //     second simulates against the now-empty account.
+                //   - The wallet balance was below rent-exempt and the
+                //     account got reaped between balance read and send.
+                // The deposit was real (we observed it on-chain when we
+                // added it to pending) and the funds went somewhere we
+                // control, so we still owe the user the credit. Treat
+                // this exactly like balance==0: no sweep, no defer, the
+                // outer credit step emits `payment_credited` with
+                // sweep_txid=None and the entry leaves pending.
+                log::warn!(
+                    "[SOL] Native sweep for {} skipped: wallet has no SOL to debit (already drained / rent-reaped). Marking pending entry as credited; original deposit will still be paid out to the user. error={error}",
+                    address
+                );
+                return Ok(SweepResult {
+                    amount_base_units: 0,
+                    txid: None,
+                    deferred: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         log::info!(
             "[SOL] Swept {:.9} SOL from {} to {} (tx={})",
@@ -1629,7 +1980,27 @@ impl SolanaDetector {
             recent_blockhash,
         )?;
 
-        let txid = self.send_solana_transaction(&tx).await?;
+        let txid = match self.send_solana_transaction(&tx).await {
+            Ok(txid) => txid,
+            Err(error) if is_account_drained_error(&error) => {
+                // Same defensive fallback as the native sweep path:
+                // simulation reports the source ATA has nothing to debit
+                // (closed or never funded). Likely already swept by the
+                // boot orphan-sweep or by a concurrent sweep attempt.
+                // Treat as already-drained → no sweep, but the outer
+                // credit step still emits payment_credited so the user
+                // gets the original deposit amount.
+                log::warn!(
+                    "[SOL] {symbol} sweep for {owner_address} skipped: source ATA {source_ata} has no balance to debit (already drained / closed). Marking pending entry as credited; original deposit will still be paid out. error={error}"
+                );
+                return Ok(SweepResult {
+                    amount_base_units: 0,
+                    txid: None,
+                    deferred: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         log::info!(
             "[SOL] Swept {} {} units from {} (ata={}) to {} (ata={}) (tx={})",
@@ -2126,20 +2497,15 @@ impl SolanaDetector {
             )
         };
 
-        // Detector-side dedup: if we've already credited this signature
-        // in any prior cycle/recovery, do nothing. The backend either
-        // already has the balance, or its unique index swallowed the
-        // duplicate webhook and the user needs operator help.
-        {
-            let state = self.state.lock().unwrap();
-            if state.credited_signatures.contains(signature) {
-                log::info!(
-                    "[SOL] /recover-txid: {} already credited for user_id={user_id}",
-                    signature
-                );
-                return Ok(mk(RecoverStatus::AlreadyCredited));
-            }
-        }
+        // The detector-side dedup is now per-(sig, address, asset), not
+        // per-signature: a single tx can credit two of our managed
+        // wallets (Binance batch sends being the canonical case) and
+        // each leg gets its own credit row. We therefore can't
+        // short-circuit here without the address — the actual
+        // already-credited check happens inside the per-asset enqueue
+        // paths once we know which address the recovered tx hits.
+        // The backend's per-user/per-signature legacy row check then
+        // catches double-credits against pre-upgrade state.
 
         // Look up the user's permanent assignment. Refusing here when
         // the user has no assignment prevents anyone from sliding a
@@ -2206,6 +2572,8 @@ impl SolanaDetector {
             self.run_recovery_credit_cycle().await?;
             return Ok(self.recover_outcome_for_signature(
                 signature,
+                &reservation.address,
+                None,
                 Chain::Solana.ticker().to_string(),
                 amount_coin,
                 user_id,
@@ -2249,6 +2617,8 @@ impl SolanaDetector {
                 self.run_recovery_credit_cycle().await?;
                 return Ok(self.recover_outcome_for_signature(
                     signature,
+                    &reservation.address,
+                    Some(token.symbol.as_str()),
                     token.symbol.clone(),
                     amount_coin,
                     user_id,
@@ -2270,6 +2640,7 @@ impl SolanaDetector {
         tx: &RpcTransactionResult,
         amount_lamports: u64,
     ) -> Result<(), DetectorError> {
+        let dedup_key = payment_key(signature, &reservation.address, None);
         let detected = DetectedPayment {
             chain: Chain::Solana,
             ticker: Chain::Solana.ticker().to_string(),
@@ -2289,6 +2660,8 @@ impl SolanaDetector {
             fiat_amount: None,
             fiat_currency: None,
             coin_price: None,
+            event_id: Some(dedup_key.clone()),
+            log_index: None,
             asset: None,
             asset_decimals: None,
             amount_base_units: None,
@@ -2306,8 +2679,12 @@ impl SolanaDetector {
 
         {
             let mut state = self.state.lock().unwrap();
-            let already_pending = state.pending.iter().any(|p| p.signature == signature);
-            let already_credited = state.credited_signatures.contains(signature);
+            let already_pending = state.pending.iter().any(|p| {
+                p.signature == signature
+                    && p.address == reservation.address
+                    && p.asset.is_none()
+            });
+            let already_credited = state.credited_payments.contains(&dedup_key);
             if !already_pending && !already_credited {
                 state.pending.push(SolanaPendingPayment {
                     signature: signature.to_string(),
@@ -2340,6 +2717,11 @@ impl SolanaDetector {
         let mint_string = token.mint.to_string();
         let amount_coin =
             amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
+        let dedup_key = payment_key(
+            signature,
+            &reservation.address,
+            Some(token.symbol.as_str()),
+        );
         let detected = DetectedPayment {
             chain: Chain::Solana,
             ticker: token.symbol.clone(),
@@ -2359,6 +2741,8 @@ impl SolanaDetector {
             fiat_amount: None,
             fiat_currency: None,
             coin_price: None,
+            event_id: Some(dedup_key.clone()),
+            log_index: None,
             asset: Some(token.symbol.clone()),
             asset_decimals: Some(token.decimals),
             amount_base_units: Some(amount_base_units.to_string()),
@@ -2376,8 +2760,12 @@ impl SolanaDetector {
 
         {
             let mut state = self.state.lock().unwrap();
-            let already_pending = state.pending.iter().any(|p| p.signature == signature);
-            let already_credited = state.credited_signatures.contains(signature);
+            let already_pending = state.pending.iter().any(|p| {
+                p.signature == signature
+                    && p.address == reservation.address
+                    && p.asset.as_deref() == Some(token.symbol.as_str())
+            });
+            let already_credited = state.credited_payments.contains(&dedup_key);
             if !already_pending && !already_credited {
                 state.pending.push(SolanaPendingPayment {
                     signature: signature.to_string(),
@@ -2412,13 +2800,16 @@ impl SolanaDetector {
     fn recover_outcome_for_signature(
         &self,
         signature: &str,
-        asset: String,
+        address: &str,
+        dedup_asset: Option<&str>,
+        asset_label: String,
         amount_coin: f64,
         user_id: &str,
     ) -> RecoverResponse {
+        let dedup_key = payment_key(signature, address, dedup_asset);
         let credited = {
             let state = self.state.lock().unwrap();
-            state.credited_signatures.contains(signature)
+            state.credited_payments.contains(&dedup_key)
         };
         let status = if credited {
             RecoverStatus::Credited
@@ -2431,7 +2822,7 @@ impl SolanaDetector {
             user_id.to_string(),
             status,
         )
-        .with_asset(asset, amount_coin)
+        .with_asset(asset_label, amount_coin)
     }
 }
 
@@ -2526,6 +2917,26 @@ fn fee_ratio_too_high(fee: u64, total: u64, max_ratio: f64) -> bool {
     (fee as f64) / (total as f64) > max_ratio
 }
 
+/// Detect "the source account has nothing left to debit" errors returned
+/// by `sendTransaction` simulation. These mean a previous sweep (orphan
+/// or concurrent) already drained the wallet, so the pending entry should
+/// be treated as credited rather than retried forever.
+///
+/// Matches the canonical Solana strings:
+/// - `"Attempt to debit an account but found no record of a prior credit"`
+///   (account never funded / rent-reaped after balance dropped to 0)
+/// - `"insufficient lamports"` (balance check raced with concurrent sweep)
+/// - `"AccountNotFound"` / `"could not find account"` (account closed)
+fn is_account_drained_error(error: &DetectorError) -> bool {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    lower.contains("found no record of a prior credit")
+        || lower.contains("attempt to debit an account but found")
+        || lower.contains("insufficient lamports")
+        || lower.contains("accountnotfound")
+        || lower.contains("could not find account")
+}
+
 fn usd_to_lamports(usd: f64, sol_usd: f64) -> Option<u64> {
     if !usd.is_finite() || usd <= 0.0 || !sol_usd.is_finite() || sol_usd <= 0.0 {
         return None;
@@ -2543,6 +2954,61 @@ fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScheduledOutcome {
+    /// A scheduled payment was successfully sent — or definitively failed
+    /// and reported back. The caller should NOT also do a ledger sweep.
+    Sent,
+    /// A scheduled payment is pending but the gas tank can't cover it yet.
+    /// The caller must skip ledger sweeps so funds keep accumulating.
+    WaitingForFunds,
+    /// No eligible scheduled payment. Caller proceeds with a normal sweep.
+    None,
+}
+
+/// Resolves the lamport amount for a scheduled payment from its declared
+/// `(amount_value, amount_currency)`. SOL is treated as exact; EUR/USD are
+/// recomputed at send time using the live FX rate so the admin's intent
+/// ("send 100 EUR") survives across price moves between scheduling and
+/// execution.
+async fn payment_amount_lamports(
+    payment: &crate::solana_scheduled::ScheduledSolPayment,
+    sol_usd: f64,
+    sol_eur_fetcher: &crate::pricing::PriceFetcher,
+) -> Result<u64, String> {
+    let amount: f64 = payment
+        .amount_value
+        .parse()
+        .map_err(|e| format!("amount_value not a decimal: {e}"))?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(format!("non-positive amount: {amount}"));
+    }
+    let lamports = match payment.amount_currency.as_str() {
+        "SOL" => amount * 1_000_000_000.0,
+        "USD" => {
+            if !sol_usd.is_finite() || sol_usd <= 0.0 {
+                return Err("invalid SOL/USD price".into());
+            }
+            (amount / sol_usd) * 1_000_000_000.0
+        }
+        "EUR" => {
+            let sol_eur = sol_eur_fetcher
+                .get_price()
+                .await
+                .map_err(|e| format!("failed to fetch SOL/EUR: {e}"))?;
+            if !sol_eur.is_finite() || sol_eur <= 0.0 {
+                return Err("invalid SOL/EUR price".into());
+            }
+            (amount / sol_eur) * 1_000_000_000.0
+        }
+        other => return Err(format!("unsupported currency '{other}'")),
+    };
+    if !lamports.is_finite() || lamports < 0.0 || lamports > u64::MAX as f64 {
+        return Err("lamports overflow".into());
+    }
+    Ok(lamports.ceil() as u64)
 }
 
 fn parse_solana_keypair(value: &str) -> Result<Keypair, String> {
@@ -2604,5 +3070,39 @@ fn load_solana_state(path: &str) -> SolanaState {
             );
             SolanaState::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drained_error_matches_real_rpc_response() {
+        // Exact wording observed in production:
+        let exact = DetectorError::ApiError(
+            "Solana RPC sendTransaction returned error -32002: Transaction simulation failed: Attempt to debit an account but found no record of a prior credit.".into(),
+        );
+        assert!(is_account_drained_error(&exact));
+
+        // Variations the matcher must also recognise
+        let insufficient = DetectorError::ApiError(
+            "Transaction simulation failed: insufficient lamports 0, need 5000".into(),
+        );
+        assert!(is_account_drained_error(&insufficient));
+
+        let not_found = DetectorError::ApiError("AccountNotFound: 9xZ...".into());
+        assert!(is_account_drained_error(&not_found));
+
+        // Unrelated errors must NOT trigger the fallback
+        let generic_429 = DetectorError::ApiError(
+            "Solana RPC getLatestBlockhash returned error -32016: Too many requests".into(),
+        );
+        assert!(!is_account_drained_error(&generic_429));
+
+        let invalid_blockhash = DetectorError::ApiError(
+            "Transaction simulation failed: Blockhash not found".into(),
+        );
+        assert!(!is_account_drained_error(&invalid_blockhash));
     }
 }

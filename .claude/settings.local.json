@@ -9,7 +9,8 @@
       "Bash(grep -viE \"\\\\.\\(lnk|txt|exe|dmp|url|rar|torrent\\)$\")",
       "Bash(ls \"/c/Users/Admin/Desktop/\" 2>/dev/null | grep -iE \"site|web|panel|interface|ui|control\")",
       "Bash(cd \"/c/Users/Admin/Desktop/bitcoin_payment_detector\" && grep -n \"No UTXOs\\\\|fetch_utxos\\\\|utxos.is_empty\\\\|/address/.*utxo\" src/bitcoin_sweep.rs | head -20)",
-      "Bash(curl -s \"https://blockstream.info/api/address/bc1qysz2e42y2ntx8ef95ajmramk3e6wcn04emv3q6/utxo\")"
+      "Bash(curl -s \"https://blockstream.info/api/address/bc1qysz2e42y2ntx8ef95ajmramk3e6wcn04emv3q6/utxo\")",
+      "Bash(curl -s -X POST https://api.mainnet-beta.solana.com -H \"Content-Type: application/json\" -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\",\"params\":[\"3MmjfQMzM6BoB7SM68MHCQmeUggdqpkZXTQwA9VVtdVUf4vcN3ZLmSLQ26K6d7uubyS7uZMGEPDwswuBhdoVEDDJ\",{\"encoding\":\"jsonParsed\",\"maxSupportedTransactionVersion\":0}]}')"
     ]
   }
 }

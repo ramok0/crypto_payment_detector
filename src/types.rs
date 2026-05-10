@@ -153,6 +153,18 @@ pub struct DetectedPayment {
     pub fiat_amount: Option<f64>,
     pub fiat_currency: Option<String>,
     pub coin_price: Option<f64>,
+    /// Per-deposit unique identifier the backend keys its idempotency
+    /// lock on. For Solana we set this to `<sig>|<addr>|<asset>` so two
+    /// deposits in the same transaction produce two distinct credit
+    /// rows. Other chains can populate it however they need; missing
+    /// values fall back to the chain-specific default at the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Optional secondary disambiguator (e.g. EVM log index). Currently
+    /// not populated by the Solana detector — `event_id` carries the
+    /// full per-deposit key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

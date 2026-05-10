@@ -43,6 +43,17 @@ pub struct ManagedSolanaWallet {
 /// `expires_at_unix` field is kept for wire-format compatibility with
 /// downstream consumers and is set to the sentinel value 0 to indicate
 /// "no expiration".
+///
+/// `dormant` rows are addresses the user *used to* own but rotated away
+/// from. We keep them in Redis so:
+///   - The address never gets reassigned to anyone else (the
+///     `solana:assignment:<addr>` key stays present, blocking SET NX in
+///     `claim_first_unassigned_wallet`).
+///   - Late deposits to the old address are still attributed to the
+///     original user (the detector reads `user_id` from the payload at
+///     detection time).
+/// `load_assignment_for_user` skips dormant entries so the user-facing
+/// "what's my address?" lookup returns the current active one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolanaReservation {
     pub user_id: String,
@@ -54,6 +65,12 @@ pub struct SolanaReservation {
     /// still carry a real Unix timestamp here; both are tolerated.
     #[serde(default)]
     pub expires_at_unix: i64,
+    /// `true` when the user has rotated away from this address. The
+    /// payload is preserved so funds sent to the old address are still
+    /// credited to `user_id`, but `load_assignment_for_user` no longer
+    /// treats it as the user's current address.
+    #[serde(default)]
+    pub dormant: bool,
 }
 
 /// Public alias matching the new domain language. Internally identical to
@@ -308,13 +325,24 @@ pub async fn load_assignment_for_user(
     // Fast path: per-user index
     if let Some(address) = redis_get_string(&mut connection, &user_index_key(user_id)).await? {
         if let Some(assignment) = read_assignment_payload(&mut connection, &address).await? {
-            return Ok(Some(assignment));
+            // Dormant entries shouldn't appear via the user_index, but if
+            // they do (e.g. older payloads or a half-applied rotation),
+            // fall through to the scan path so the user gets a real
+            // active assignment instead of their archived address.
+            if !assignment.dormant {
+                return Ok(Some(assignment));
+            }
+            log::warn!(
+                "[SOL] user_index for user_id={user_id} points at dormant address {address}; \
+                 falling back to scan to find an active assignment"
+            );
+        } else {
+            // Stale pointer: the assignment payload was deleted. Drop the
+            // index and fall through to the scan path below.
+            log::warn!(
+                "[SOL] Stale user_index for user_id={user_id} pointed at {address}; scanning to recover"
+            );
         }
-        // Stale pointer: the assignment payload was deleted. Drop the
-        // index and fall through to the scan path below.
-        log::warn!(
-            "[SOL] Stale user_index for user_id={user_id} pointed at {address}; scanning to recover"
-        );
         let _: i64 = redis::cmd("DEL")
             .arg(user_index_key(user_id))
             .query_async(&mut connection)
@@ -322,14 +350,38 @@ pub async fn load_assignment_for_user(
             .map_err(redis_error)?;
     }
 
-    // Slow path: scan + return the earliest assignment for this user
+    // Slow path: scan + return the earliest *active* assignment for this
+    // user. Dormant entries (post-rotation archives) are filtered out so a
+    // fresh `/solana/address` call returns the user's current address.
     let mut matches: Vec<SolanaAssignment> = load_active_assignments(redis_url)
         .await?
         .into_iter()
-        .filter(|a| a.user_id == user_id)
+        .filter(|a| a.user_id == user_id && !a.dormant)
         .collect();
     matches.sort_by_key(|a| a.reserved_at_unix);
     Ok(matches.into_iter().next())
+}
+
+/// Reads the assignment payload at `solana:assignment:<address>`. Used by
+/// the detector for credit-time defense-in-depth: before crediting a
+/// pending payment, we check that the address is still owned by the
+/// user_id captured at detection time. Returns `None` when the payload
+/// is missing (assignment cancelled) or unparseable.
+pub async fn load_assignment_for_address(
+    redis_url: &str,
+    address: &str,
+) -> Result<Option<SolanaAssignment>, DetectorError> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Ok(None);
+    }
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(redis_error)?;
+    read_assignment_payload(&mut connection, address).await
 }
 
 /// Get-or-create the permanent Solana deposit address for `user_id`.
@@ -476,6 +528,7 @@ async fn claim_first_unassigned_wallet(
             wallet_index: index,
             reserved_at_unix: now,
             expires_at_unix: NEVER_EXPIRES,
+            dormant: false,
         };
 
         let payload = serde_json::to_string(&assignment)?;
@@ -522,6 +575,7 @@ async fn claim_first_unassigned_wallet(
         wallet_index: new_wallet.index,
         reserved_at_unix: now,
         expires_at_unix: NEVER_EXPIRES,
+        dormant: false,
     };
     let payload = serde_json::to_string(&assignment)?;
     let response: Option<String> = redis::cmd("SET")
@@ -636,17 +690,20 @@ pub async fn delete_all_assignments(redis_url: &str) -> Result<usize, DetectorEr
 ///    the user with multiple `solana:assignment:*` entries. This
 ///    function picks the canonical one (smallest `reserved_at_unix`,
 ///    address sort as tiebreaker), writes the per-user index to point
-///    at it, and **deletes the duplicate assignment payloads** so the
-///    detector stops scanning them. Funds that may sit on a deleted
-///    duplicate are recovered automatically by the existing orphan
-///    sweep at startup.
+///    at it, and **marks the duplicates dormant** (still owned by the
+///    same user, but no longer the user's "active" address). Marking
+///    dormant — rather than deleting — preserves attribution: late
+///    deposits to a duplicate address still credit the original user
+///    instead of going to whoever happens to claim that address next.
 ///
 /// 2. **Missing index** — assignments created before the user_index key
 ///    existed have no `solana:user_assignment:*` entry. This function
 ///    publishes the index for them so future O(1) lookups work.
 ///
-/// Returns `(users_indexed, duplicates_dropped)`. Safe to run every
-/// startup; idempotent once converged.
+/// Returns `(users_indexed, duplicates_archived)`. Safe to run every
+/// startup; idempotent once converged. Already-dormant entries are
+/// excluded from the canonical-picking step but counted toward each
+/// user's archive.
 pub async fn consolidate_assignments(
     redis_url: &str,
 ) -> Result<(usize, usize), DetectorError> {
@@ -662,19 +719,23 @@ pub async fn consolidate_assignments(
         return Ok((0, 0));
     }
 
-    // Group by user_id
-    let mut by_user: std::collections::HashMap<String, Vec<SolanaAssignment>> =
+    // Group by user_id, splitting dormant from active.
+    let mut active_by_user: std::collections::HashMap<String, Vec<SolanaAssignment>> =
         std::collections::HashMap::new();
     for assignment in assignments {
-        by_user
+        if assignment.dormant {
+            // Dormant entries are already archived; nothing to do.
+            continue;
+        }
+        active_by_user
             .entry(assignment.user_id.clone())
             .or_default()
             .push(assignment);
     }
 
     let mut indexed: usize = 0;
-    let mut dropped: usize = 0;
-    for (user_id, mut group) in by_user {
+    let mut archived: usize = 0;
+    for (user_id, mut group) in active_by_user {
         // Canonical = smallest reserved_at_unix, then smallest address
         group.sort_by(|a, b| {
             a.reserved_at_unix
@@ -683,21 +744,28 @@ pub async fn consolidate_assignments(
         });
         let canonical = group.remove(0);
 
-        // Drop the duplicates (everything after canonical)
+        // Archive the duplicates (everything after canonical) by rewriting
+        // them as dormant. The reservation key is preserved, so the
+        // address can never be reassigned to a different user; late
+        // deposits still credit `user_id`.
         for dupe in &group {
             log::warn!(
-                "[SOL] consolidate: dropping duplicate assignment {} for user_id={} (canonical={}, reserved_at={})",
+                "[SOL] consolidate: archiving duplicate assignment {} for user_id={} as dormant (canonical={}, reserved_at={})",
                 dupe.address,
                 user_id,
                 canonical.address,
                 dupe.reserved_at_unix
             );
-            let _: i64 = redis::cmd("DEL")
+            let mut archived_payload = dupe.clone();
+            archived_payload.dormant = true;
+            let payload = serde_json::to_string(&archived_payload)?;
+            let _: () = redis::cmd("SET")
                 .arg(reservation_key(&dupe.address))
+                .arg(payload)
                 .query_async(&mut connection)
                 .await
                 .map_err(redis_error)?;
-            dropped += 1;
+            archived += 1;
         }
 
         // Publish (or refresh) the per-user index pointing at canonical
@@ -711,11 +779,139 @@ pub async fn consolidate_assignments(
     }
 
     log::info!(
-        "[SOL] consolidate: indexed {} user(s), dropped {} duplicate assignment(s) (any funds on dropped addresses will be recovered by the orphan sweep)",
+        "[SOL] consolidate: indexed {} user(s), archived {} duplicate assignment(s) as dormant",
         indexed,
-        dropped
+        archived
     );
-    Ok((indexed, dropped))
+    Ok((indexed, archived))
+}
+
+/// Rotate `user_id` to a fresh deposit address. The current active
+/// assignment is rewritten as dormant (preserved in Redis so late
+/// deposits keep crediting the right user) and a new wallet is claimed
+/// from the pool. Returns `(old_dormant, new_active)`.
+///
+/// Errors if the user has no current active assignment. The caller is
+/// responsible for rate-limiting (the autoshop backend enforces 1/day
+/// per user).
+pub async fn rotate_assignment(
+    redis_url: &str,
+    wallets: &SharedSolanaWallets,
+    pool_path: &str,
+    user_id: &str,
+) -> Result<(SolanaAssignment, SolanaAssignment), DetectorError> {
+    let user_id = user_id.trim().to_string();
+    if user_id.is_empty() {
+        return Err(DetectorError::InvalidConfig(
+            "user_id cannot be empty when rotating a Solana assignment".into(),
+        ));
+    }
+
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(redis_error)?;
+
+    let lock_key = user_lock_key(&user_id);
+
+    // Acquire per-user lock; serialises against assign_wallet_for_user
+    // and other rotate calls for the same user.
+    let mut acquired = false;
+    for _ in 0..30 {
+        let response: Option<String> = redis::cmd("SET")
+            .arg(&lock_key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(USER_LOCK_TTL_SECS)
+            .query_async(&mut connection)
+            .await
+            .map_err(redis_error)?;
+        if response.is_some() {
+            acquired = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !acquired {
+        return Err(DetectorError::ApiError(format!(
+            "Failed to acquire assignment lock for user_id={user_id} after 3s"
+        )));
+    }
+
+    let result = rotate_assignment_locked(&mut connection, wallets, pool_path, &user_id).await;
+    release_user_lock(&mut connection, &lock_key).await;
+    result
+}
+
+async fn rotate_assignment_locked(
+    connection: &mut redis::aio::MultiplexedConnection,
+    wallets: &SharedSolanaWallets,
+    pool_path: &str,
+    user_id: &str,
+) -> Result<(SolanaAssignment, SolanaAssignment), DetectorError> {
+    let user_idx = user_index_key(user_id);
+
+    // Load the current active assignment via the per-user index. If the
+    // index points at a dormant entry we treat it as "no active address"
+    // — the user must call /solana/address first.
+    let current_address = redis_get_string(connection, &user_idx).await?;
+    let Some(current_address) = current_address else {
+        return Err(DetectorError::InvalidConfig(format!(
+            "No active assignment for user_id={user_id} - call /solana/address first"
+        )));
+    };
+    let Some(mut current) = read_assignment_payload(connection, &current_address).await? else {
+        return Err(DetectorError::InvalidConfig(format!(
+            "user_index for user_id={user_id} points at {current_address} but the assignment payload is missing"
+        )));
+    };
+    if current.dormant {
+        return Err(DetectorError::InvalidConfig(format!(
+            "Active assignment for user_id={user_id} is already dormant; nothing to rotate"
+        )));
+    }
+
+    // Mark the old assignment dormant, in place. The reservation key
+    // stays present so the address never gets reassigned to anyone else;
+    // late deposits keep crediting `user_id`.
+    current.dormant = true;
+    let dormant_payload = serde_json::to_string(&current)?;
+    let _: () = redis::cmd("SET")
+        .arg(reservation_key(&current.address))
+        .arg(&dormant_payload)
+        .query_async(connection)
+        .await
+        .map_err(redis_error)?;
+
+    // Drop the user_index so claim_first_unassigned_wallet gives this
+    // user a brand-new wallet on the next assign call.
+    let _: i64 = redis::cmd("DEL")
+        .arg(&user_idx)
+        .query_async(connection)
+        .await
+        .map_err(redis_error)?;
+
+    let now = unix_timestamp();
+    let fresh =
+        claim_first_unassigned_wallet(connection, wallets, pool_path, user_id, now).await?;
+    let _: () = redis::cmd("SET")
+        .arg(&user_idx)
+        .arg(&fresh.address)
+        .query_async(connection)
+        .await
+        .map_err(redis_error)?;
+
+    log::warn!(
+        "[SOL] Rotated user_id={} from {} (now dormant) to {} (new active)",
+        user_id,
+        current.address,
+        fresh.address
+    );
+
+    Ok((current, fresh))
 }
 
 /// Backwards-compatible alias used by older callers (and the API binary

@@ -367,6 +367,15 @@ fn build_solana_config() -> SolanaConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.10),
+        core_api_url: std::env::var("CORE_API_INTERNAL_URL")
+            .or_else(|_| std::env::var("BACKEND_API_INTERNAL_URL"))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        internal_service_token: std::env::var("INTERNAL_SERVICE_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     }
 }
 
