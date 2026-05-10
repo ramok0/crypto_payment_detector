@@ -722,12 +722,21 @@ impl SolanaDetector {
         let now = unix_timestamp();
         let interval = i64::try_from(self.config.gas_tank_check_interval_secs.max(1))
             .unwrap_or(i64::MAX);
-        let should_run = {
+        let throttle_elapsed = {
             let state = self.state.lock().unwrap();
             state
                 .gas_tank_last_maintenance_unix
                 .map_or(true, |last| now.saturating_sub(last) >= interval)
         };
+
+        // Bypass the maintenance throttle when an outbound scheduled
+        // payment is waiting in Redis: a single GET is cheap, and lets the
+        // payout fire on the next cycle (~poll_interval_secs, default 60s)
+        // instead of waiting up to the full gas_tank_check_interval_secs
+        // window. `try_fulfill_scheduled_payment` still enforces the
+        // target-buffer + amount + fee balance check, so we never drain
+        // the SPL fee buffer.
+        let should_run = throttle_elapsed || self.has_pending_scheduled_payment(now).await;
         if !should_run {
             return Ok(());
         }
@@ -741,6 +750,34 @@ impl SolanaDetector {
             state.gas_tank_last_maintenance_unix = Some(now);
         }
         self.persist_state()
+    }
+
+    /// Cheap Redis peek: returns true when the backend has published a
+    /// pending scheduled SOL payout that hasn't expired yet. Used to
+    /// bypass the gas-tank maintenance throttle so scheduled payments
+    /// fire on the next cycle instead of waiting up to 15 minutes.
+    /// Returns false when the feature isn't configured or when Redis is
+    /// unreachable — callers fall back to the regular throttled schedule.
+    async fn has_pending_scheduled_payment(&self, now_unix: i64) -> bool {
+        if self.config.core_api_url.as_deref().is_none()
+            || self.config.internal_service_token.as_deref().is_none()
+        {
+            return false;
+        }
+        let pending = match crate::solana_scheduled::load_pending_scheduled_payments(
+            &self.config.redis_url,
+        )
+        .await
+        {
+            Ok(list) => list,
+            Err(error) => {
+                log::debug!(
+                    "[SOL][SCHED] Redis peek for pending payments failed (will retry next cycle): {error}"
+                );
+                return false;
+            }
+        };
+        pending.iter().any(|p| p.expires_at_unix > now_unix)
     }
 
     async fn maintain_gas_tank(&self, gas_tank_pubkey: Pubkey) -> Result<(), DetectorError> {
