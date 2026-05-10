@@ -800,6 +800,35 @@ impl SolanaDetector {
         }
 
         let balance = self.get_balance(&gas_tank_pubkey.to_string()).await?;
+
+        // Admin-scheduled outbound payments are checked FIRST, regardless of
+        // the target buffer. Two reasons:
+        //   1. A scheduled payout is an explicit operator intent — it should
+        //      fire as soon as the gas tank holds `amount + fee`, even if
+        //      that means temporarily dipping below the SPL fee reserve.
+        //   2. The previous flow gated this behind `balance >= target`,
+        //      which silently swallowed payouts whenever the operator hadn't
+        //      pre-funded the buffer. End result: scheduled payments looked
+        //      "stuck pending" forever.
+        // The fulfillment helper still enforces `balance >= amount + fee`,
+        // so we never send more than we have. One payment per maintenance
+        // tick (oldest first) to keep the logic predictable.
+        match self
+            .try_fulfill_scheduled_payment(gas_tank_pubkey, balance, sol_usd)
+            .await
+        {
+            ScheduledOutcome::Sent => return Ok(()),
+            ScheduledOutcome::WaitingForFunds => {
+                // A payment is scheduled but the gas tank doesn't yet hold
+                // enough lamports to cover the requested amount + fee.
+                // Skip the ledger sweep so funds keep accumulating.
+                return Ok(());
+            }
+            ScheduledOutcome::None => {}
+        }
+
+        // No scheduled payment — apply the regular target-buffer rule
+        // before sweeping any excess to the ledger.
         if balance < target_lamports {
             log::warn!(
                 "[SOL] Gas tank balance {} lamports below target {} lamports (~${:.2}); top up the gas tank to keep token sweeps running",
@@ -808,29 +837,6 @@ impl SolanaDetector {
                 self.config.gas_tank_target_usd
             );
             return Ok(());
-        }
-
-        // Check for an admin-scheduled outbound payment. If one exists and is
-        // not yet expired, divert the excess sweep to that destination
-        // instead of the ledger. We process a single payment per maintenance
-        // tick to keep the logic predictable; multi-payment queues fulfill
-        // one payment at a time, oldest first.
-        match self.try_fulfill_scheduled_payment(
-            gas_tank_pubkey,
-            balance,
-            target_lamports,
-            sol_usd,
-        )
-        .await
-        {
-            ScheduledOutcome::Sent => return Ok(()),
-            ScheduledOutcome::WaitingForFunds => {
-                // A payment is scheduled but the gas tank doesn't yet hold
-                // enough lamports to cover both the buffer and the requested
-                // amount. Skip the ledger sweep so funds keep accumulating.
-                return Ok(());
-            }
-            ScheduledOutcome::None => {}
         }
 
         let recent_blockhash = self.get_latest_blockhash().await?;
@@ -884,7 +890,6 @@ impl SolanaDetector {
         &self,
         gas_tank_pubkey: Pubkey,
         balance: u64,
-        target_lamports: u64,
         sol_usd: f64,
     ) -> ScheduledOutcome {
         let (Some(core_api_url), Some(internal_token)) = (
@@ -995,16 +1000,17 @@ impl SolanaDetector {
             }
         };
 
-        // Keep the gas-tank fee buffer intact: only fire when the balance
-        // covers the requested amount AND the buffer AND the network fee.
-        let required = target_lamports.saturating_add(amount_lamports).saturating_add(fee);
+        // "Funds available" semantics: only require `amount + fee`. We
+        // deliberately allow draining the gas-tank target buffer here —
+        // the operator scheduled this payout knowing it might temporarily
+        // shrink the SPL fee reserve; the next deposit refills the tank.
+        let required = amount_lamports.saturating_add(fee);
         if balance < required {
             log::info!(
-                "[SOL][SCHED] Payment {} waiting: balance {} < required {} (target_buffer={} amount={} fee={})",
+                "[SOL][SCHED] Payment {} waiting: balance {} < required {} (amount={} fee={})",
                 payment.id,
                 balance,
                 required,
-                target_lamports,
                 amount_lamports,
                 fee
             );
