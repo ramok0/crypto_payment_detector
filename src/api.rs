@@ -11,12 +11,12 @@ use crypto_payment_detector::derivation::derive_address;
 use crypto_payment_detector::env_utils::{
     chain_env_bool, chain_env_prefix, chain_env_var, env_bool, proxy_env_var,
 };
-use crypto_payment_detector::persistence::load_state;
-use crypto_payment_detector::recover::{RecoverRequest, RecoverResponse, RecoverStatus};
-use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::helius_webhooks::{
     HeliusWebhookClient, HeliusWebhookConfig, collect_candidate_addresses, verify_auth_header,
 };
+use crypto_payment_detector::persistence::load_state;
+use crypto_payment_detector::recover::{RecoverRequest, RecoverResponse, RecoverStatus};
+use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
     BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
     EthereumReservation, EtherscanConfig, PaymentDetector, RetryConfig, SharedEthereumWallets,
@@ -686,9 +686,7 @@ async fn handle_admin_cancel_all_reservations(
         // - AssignedOnly: clear the webhook list so we don't keep
         //   receiving pushes for now-released wallets.
         // Best-effort either way — a failure here is logged and ignored.
-        if let (Some(helius), Some(detector)) =
-            (pool.helius.as_ref(), pool.detector.as_ref())
-        {
+        if let (Some(helius), Some(detector)) = (pool.helius.as_ref(), pool.detector.as_ref()) {
             match helius_watch_mode(detector.as_ref()) {
                 HeliusWatchMode::WholePool => {
                     log::info!(
@@ -841,8 +839,7 @@ async fn handle_solana_webhook_status(
             webhook_type: None,
             in_sync: None,
             note: Some(
-                "Helius integration disabled (HELIUS_WEBHOOK_ENABLED is not true)"
-                    .to_string(),
+                "Helius integration disabled (HELIUS_WEBHOOK_ENABLED is not true)".to_string(),
             ),
         });
     };
@@ -865,9 +862,7 @@ async fn handle_solana_webhook_status(
         HeliusWatchMode::AssignedOnly => {
             // Cheap projection: count of (owner + ATAs) per active assignment.
             match load_active_reservations(&solana_pool.redis_url).await {
-                Ok(assignments) => {
-                    assignments.len() * (1 + detector.token_count())
-                }
+                Ok(assignments) => assignments.len() * (1 + detector.token_count()),
                 Err(_) => 0,
             }
         }
@@ -967,8 +962,7 @@ async fn handle_solana_webhook(
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "Helius webhook integration is disabled (HELIUS_WEBHOOK_ENABLED is not true)"
-                .into(),
+            "Helius webhook integration is disabled (HELIUS_WEBHOOK_ENABLED is not true)".into(),
         ));
     };
     let detector = solana_pool.detector.clone().ok_or_else(|| {
@@ -989,7 +983,10 @@ async fn handle_solana_webhook(
                 "[HELIUS] Webhook rejected: Authorization header mismatch (source={})",
                 source_ip
             );
-            return Err((StatusCode::UNAUTHORIZED, "invalid Authorization header".into()));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "invalid Authorization header".into(),
+            ));
         }
     }
 
@@ -1040,10 +1037,7 @@ async fn handle_solana_webhook(
     // Helius retries before our background task finishes.
     let detector_for_task = detector.clone();
     tokio::spawn(async move {
-        match detector_for_task
-            .process_address_set_now(&candidates)
-            .await
-        {
+        match detector_for_task.process_address_set_now(&candidates).await {
             Ok(scanned) if scanned.is_empty() => {
                 log::info!(
                     "[HELIUS] background scan: {} candidate(s) had no matching active assignment (orphan/external — polling will recover if relevant)",
@@ -1058,9 +1052,7 @@ async fn handle_solana_webhook(
                 );
             }
             Err(error) => {
-                log::warn!(
-                    "[HELIUS] background scan failed (polling will retry): {error}"
-                );
+                log::warn!("[HELIUS] background scan failed (polling will retry): {error}");
             }
         }
     });
@@ -1151,7 +1143,11 @@ async fn handle_btc_recover(
 
     let response = recovery
         .detector
-        .recover_txid(payload.txid.trim(), user_id_u32, recovery.max_derivation_index)
+        .recover_txid(
+            payload.txid.trim(),
+            user_id_u32,
+            recovery.max_derivation_index,
+        )
         .await
         .map_err(map_internal_error)?;
     if matches!(response.status, RecoverStatus::WrongUser) {
@@ -1495,16 +1491,14 @@ fn build_evm_config(chain: Chain) -> EthereumConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.10),
-        rpc_min_request_interval_ms: std::env::var(format!(
-            "{prefix}_RPC_MIN_REQUEST_INTERVAL_MS"
-        ))
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(match chain {
-            Chain::Ethereum => 0,
-            Chain::Base => 200,
-            _ => 0,
-        }),
+        rpc_min_request_interval_ms: std::env::var(format!("{prefix}_RPC_MIN_REQUEST_INTERVAL_MS"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(match chain {
+                Chain::Ethereum => 0,
+                Chain::Base => 200,
+                _ => 0,
+            }),
         etherscan,
     }
 }
@@ -1666,23 +1660,19 @@ async fn sync_helius_webhook_addresses(
     let mode = helius_watch_mode(detector);
     let addresses = match mode {
         HeliusWatchMode::WholePool => detector.webhook_address_set(),
-        HeliusWatchMode::AssignedOnly => {
-            match load_active_reservations(redis_url).await {
-                Ok(assignments) => {
-                    let mut out = Vec::with_capacity(assignments.len() * 4);
-                    for assignment in assignments {
-                        out.extend(detector.webhook_addresses_for_wallet(&assignment.address));
-                    }
-                    out
+        HeliusWatchMode::AssignedOnly => match load_active_reservations(redis_url).await {
+            Ok(assignments) => {
+                let mut out = Vec::with_capacity(assignments.len() * 4);
+                for assignment in assignments {
+                    out.extend(detector.webhook_addresses_for_wallet(&assignment.address));
                 }
-                Err(error) => {
-                    log::warn!(
-                        "[HELIUS] Failed to load assignments for startup sync: {error}"
-                    );
-                    return;
-                }
+                out
             }
-        }
+            Err(error) => {
+                log::warn!("[HELIUS] Failed to load assignments for startup sync: {error}");
+                return;
+            }
+        },
     };
     let count = addresses.len();
     match helius.replace_addresses(addresses).await {
@@ -1692,9 +1682,9 @@ async fn sync_helius_webhook_addresses(
             count,
             helius_max_watch_addresses(),
         ),
-        Err(error) => log::warn!(
-            "[HELIUS] Startup sync failed (will rely on per-assignment add): {error}"
-        ),
+        Err(error) => {
+            log::warn!("[HELIUS] Startup sync failed (will rely on per-assignment add): {error}")
+        }
     }
 }
 
@@ -1864,6 +1854,12 @@ async fn main() {
     dotenvy::dotenv().ok();
     env_logger::init();
 
+    // Apply owner-managed configuration from the admin Configuration panel
+    // over the local env BEFORE any config builder runs, then watch for
+    // changes (a change triggers a clean restart so it always applies).
+    let cfg_sig = crypto_payment_detector::remote_config::bootstrap().await;
+    crypto_payment_detector::remote_config::spawn_watcher(cfg_sig);
+
     let chain_str = std::env::var("CHAIN").unwrap_or_else(|_| "bitcoin".to_string());
     let max_index: u32 = std::env::var("MAX_DERIVATION_INDEX")
         .ok()
@@ -1894,7 +1890,9 @@ async fn main() {
         let before = chains.len();
         chains.retain(|chain| *chain != Chain::Base);
         if chains.len() < before {
-            log::info!("[BASE] Disabled via DISABLE_BASE=true — skipping detector, sweep, orphan scan, and /base/* endpoints will return errors");
+            log::info!(
+                "[BASE] Disabled via DISABLE_BASE=true — skipping detector, sweep, orphan scan, and /base/* endpoints will return errors"
+            );
         }
     }
 
@@ -1974,10 +1972,7 @@ async fn main() {
                     // `solana:assignment:*` entries, leading to deposit
                     // addresses that "changed" between page loads).
                     // Idempotent — safe to run every boot.
-                    match crypto_payment_detector::consolidate_assignments(
-                        &config.redis_url,
-                    )
-                    .await
+                    match crypto_payment_detector::consolidate_assignments(&config.redis_url).await
                     {
                         Ok((indexed, dropped)) => {
                             if dropped > 0 {
@@ -2060,9 +2055,8 @@ async fn main() {
                     ),
                 );
                 let detector = Arc::new(
-                    EthereumDetector::new(config.clone(), tokens, wallets.clone()).unwrap_or_else(
-                        |e| panic!("Failed to create {ticker} detector: {e}"),
-                    ),
+                    EthereumDetector::new(config.clone(), tokens, wallets.clone())
+                        .unwrap_or_else(|e| panic!("Failed to create {ticker} detector: {e}")),
                 );
                 let gas_tank_address = detector.gas_tank_address();
                 let pool_state = build_ethereum_pool_api_state(

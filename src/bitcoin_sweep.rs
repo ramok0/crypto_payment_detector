@@ -81,9 +81,8 @@ pub fn derive_private_key(
     chain: Chain,
 ) -> Result<SecretKey, DetectorError> {
     let normalized = normalize_xpriv_to_bitcoin(xpriv_str, chain)?;
-    let xpriv = Xpriv::from_str(&normalized).map_err(|e| {
-        DetectorError::InvalidXpub(format!("Invalid extended private key: {e}"))
-    })?;
+    let xpriv = Xpriv::from_str(&normalized)
+        .map_err(|e| DetectorError::InvalidXpub(format!("Invalid extended private key: {e}")))?;
     let secp = Secp256k1::new();
 
     let external_chain = xpriv
@@ -132,16 +131,13 @@ fn normalize_xpriv_to_bitcoin(xpriv_str: &str, chain: Chain) -> Result<String, D
     }
 }
 
-pub fn parse_destination_script(
-    address: &str,
-    chain: Chain,
-) -> Result<ScriptBuf, DetectorError> {
+pub fn parse_destination_script(address: &str, chain: Chain) -> Result<ScriptBuf, DetectorError> {
     let trimmed = address.trim();
     let lower = trimmed.to_ascii_lowercase();
 
     if lower.starts_with("bc1") || lower.starts_with("ltc1") {
-        let (hrp, witness_version, witness_program) = bech32::segwit::decode(trimmed)
-            .map_err(|e| {
+        let (hrp, witness_version, witness_program) =
+            bech32::segwit::decode(trimmed).map_err(|e| {
                 DetectorError::InvalidConfig(format!(
                     "Invalid bech32 sweep destination '{}': {e}",
                     trimmed
@@ -200,9 +196,10 @@ async fn fetch_raw_utxos(
         esplora_url.trim_end_matches('/'),
         address
     );
-    let response = client.get(&url).send().await.map_err(|e| {
-        DetectorError::ApiError(format!("Failed to fetch UTXOs from {url}: {e}"))
-    })?;
+    let response =
+        client.get(&url).send().await.map_err(|e| {
+            DetectorError::ApiError(format!("Failed to fetch UTXOs from {url}: {e}"))
+        })?;
     if !response.status().is_success() {
         return Err(DetectorError::ApiError(format!(
             "UTXO endpoint returned status {} for {address}",
@@ -266,7 +263,8 @@ pub async fn sweep_address(
     }
 
     let total_input: u64 = utxos.iter().map(|u| u.value).sum();
-    let vsize = TX_OVERHEAD_VBYTES + (utxos.len() as u64) * P2WPKH_INPUT_VBYTES + P2WPKH_OUTPUT_VBYTES;
+    let vsize =
+        TX_OVERHEAD_VBYTES + (utxos.len() as u64) * P2WPKH_INPUT_VBYTES + P2WPKH_OUTPUT_VBYTES;
     let fee = vsize.saturating_mul(config.fee_rate_sats_per_vb.max(1));
 
     if total_input <= fee {
@@ -389,9 +387,8 @@ pub async fn sweep_address(
     }
 
     let mut serialized = Vec::with_capacity(256);
-    tx.consensus_encode(&mut serialized).map_err(|e| {
-        DetectorError::ApiError(format!("Failed to serialize sweep tx: {e}"))
-    })?;
+    tx.consensus_encode(&mut serialized)
+        .map_err(|e| DetectorError::ApiError(format!("Failed to serialize sweep tx: {e}")))?;
     let tx_hex = hex::encode(&serialized);
 
     let txid = broadcast_tx(client, esplora_url, &tx_hex).await?;

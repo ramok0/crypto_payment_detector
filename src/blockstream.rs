@@ -3,9 +3,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::bitcoin_sweep::{
-    self, BitcoinSweepConfig, BitcoinSweepResult, validate_sweep_config,
-};
+use crate::bitcoin_sweep::{self, BitcoinSweepConfig, BitcoinSweepResult, validate_sweep_config};
 use crate::derivation::derive_address;
 use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
@@ -321,10 +319,12 @@ impl ChainDetector {
                 ExplorerApi::Blockchair { .. } => None,
             })
             .or_else(|| {
-                self.explorer_apis.iter().find_map(|explorer| match explorer {
-                    ExplorerApi::Esplora { base_url } => Some(base_url.clone()),
-                    ExplorerApi::Blockchair { .. } => None,
-                })
+                self.explorer_apis
+                    .iter()
+                    .find_map(|explorer| match explorer {
+                        ExplorerApi::Esplora { base_url } => Some(base_url.clone()),
+                        ExplorerApi::Blockchair { .. } => None,
+                    })
             })
     }
 
@@ -832,9 +832,8 @@ impl ChainDetector {
                         enriched.swept_to_address = Some(destination.to_string());
                     }
                     enriched.swept_amount_sat = Some(result.amount_sat);
-                    enriched.swept_amount_coin = Some(
-                        result.amount_sat as f64 / self.config.chain.sats_per_unit() as f64,
-                    );
+                    enriched.swept_amount_coin =
+                        Some(result.amount_sat as f64 / self.config.chain.sats_per_unit() as f64);
                     enriched.sweep_txid = result.txid.clone();
                 }
             }
@@ -882,7 +881,11 @@ impl ChainDetector {
                     pending.payment.amount_sat,
                     enriched.fiat_amount,
                     self.price_fetcher.currency(),
-                    if sweep_deferred { " (sweep deferred)" } else { "" },
+                    if sweep_deferred {
+                        " (sweep deferred)"
+                    } else {
+                        ""
+                    },
                 );
             }
 
@@ -899,7 +902,9 @@ impl ChainDetector {
 
         if !to_remove.is_empty() {
             let mut state = self.state.lock().unwrap();
-            state.pending.retain(|p| !to_remove.contains(&p.payment.txid));
+            state
+                .pending
+                .retain(|p| !to_remove.contains(&p.payment.txid));
         }
 
         Ok(())
@@ -1086,13 +1091,10 @@ impl ChainDetector {
         } else {
             RecoverStatus::PendingSweep
         };
-        Ok(RecoverResponse::new(
-            chain,
-            txid.to_string(),
-            user_id_str,
-            status,
+        Ok(
+            RecoverResponse::new(chain, txid.to_string(), user_id_str, status)
+                .with_asset(chain.ticker().to_string(), amount_coin),
         )
-        .with_asset(chain.ticker().to_string(), amount_coin))
     }
 
     /// Fetch a transaction by id from the first available
@@ -1100,10 +1102,7 @@ impl ChainDetector {
     /// found yet / never existed) and an error for transport failures.
     /// Blockchair-only configurations cause an error because the
     /// transaction-by-id schema is different and not used elsewhere.
-    async fn fetch_esplora_tx(
-        &self,
-        txid: &str,
-    ) -> Result<Option<EsploraTx>, DetectorError> {
+    async fn fetch_esplora_tx(&self, txid: &str) -> Result<Option<EsploraTx>, DetectorError> {
         let base_url = match self.esplora_base_url() {
             Some(url) => url,
             None => {
@@ -1112,11 +1111,7 @@ impl ChainDetector {
                 ));
             }
         };
-        let url = format!(
-            "{}/tx/{}",
-            base_url.trim_end_matches('/'),
-            txid
-        );
+        let url = format!("{}/tx/{}", base_url.trim_end_matches('/'), txid);
 
         let resp = self
             .client

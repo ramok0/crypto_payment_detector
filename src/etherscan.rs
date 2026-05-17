@@ -133,9 +133,7 @@ impl EtherscanClient {
             .no_proxy()
             .build()
             .map_err(|e| {
-                DetectorError::InvalidConfig(format!(
-                    "Failed to build Etherscan HTTP client: {e}"
-                ))
+                DetectorError::InvalidConfig(format!("Failed to build Etherscan HTTP client: {e}"))
             })?;
 
         Ok(Self {
@@ -194,8 +192,7 @@ impl EtherscanClient {
                 let mut last = self.last_request_at.lock().await;
                 if let Some(previous) = *last {
                     let elapsed = previous.elapsed();
-                    let min_interval =
-                        Duration::from_millis(self.config.min_request_interval_ms);
+                    let min_interval = Duration::from_millis(self.config.min_request_interval_ms);
                     if elapsed < min_interval {
                         tokio::time::sleep(min_interval - elapsed).await;
                     }
@@ -463,7 +460,10 @@ mod tests {
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(config.timeout_secs, DEFAULT_TIMEOUT_SECS);
-        assert_eq!(config.min_request_interval_ms, DEFAULT_MIN_REQUEST_INTERVAL_MS);
+        assert_eq!(
+            config.min_request_interval_ms,
+            DEFAULT_MIN_REQUEST_INTERVAL_MS
+        );
         unsafe {
             std::env::remove_var("ETHERSCAN_API_KEY");
         }

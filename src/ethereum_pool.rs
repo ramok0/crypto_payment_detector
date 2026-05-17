@@ -172,9 +172,7 @@ fn read_or_create_ethereum_wallet_pool_file(
 ) -> Result<String, DetectorError> {
     match std::fs::read_to_string(path) {
         Ok(data) => Ok(data),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            create_ethereum_wallet_pool_file(chain, path)
-        }
+        Err(e) if e.kind() == ErrorKind::NotFound => create_ethereum_wallet_pool_file(chain, path),
         Err(e) => Err(DetectorError::InvalidConfig(format!(
             "Failed to read Ethereum wallet pool file '{}': {e}",
             path
@@ -291,7 +289,10 @@ pub fn find_ethereum_wallet(
     wallets: &[ManagedEthereumWallet],
     address: Address,
 ) -> Option<ManagedEthereumWallet> {
-    wallets.iter().find(|wallet| wallet.eth_address == address).cloned()
+    wallets
+        .iter()
+        .find(|wallet| wallet.eth_address == address)
+        .cloned()
 }
 
 pub fn generate_random_ethereum_wallet(index: u32) -> Result<ManagedEthereumWallet, DetectorError> {
@@ -331,10 +332,7 @@ pub fn append_ethereum_wallet_to_pool_file(
         ))
     })?;
 
-    let private_key_hex = format!(
-        "0x{}",
-        hex::encode(wallet.wallet.signer().to_bytes())
-    );
+    let private_key_hex = format!("0x{}", hex::encode(wallet.wallet.signer().to_bytes()));
     let new_entry = serde_json::json!({
         "address": wallet.address.clone(),
         "private_key": private_key_hex,
@@ -669,9 +667,7 @@ pub fn ethereum_reservation_store_url_from_env(chain: Chain) -> String {
     } else {
         let prefix = chain_env_prefix(chain);
         std::env::var("REDIS_URL").unwrap_or_else(|_| {
-            panic!(
-                "REDIS_URL env var required unless {prefix}_RESERVATION_STORE=memory"
-            )
+            panic!("REDIS_URL env var required unless {prefix}_RESERVATION_STORE=memory")
         })
     }
 }
@@ -754,9 +750,7 @@ fn assign_ethereum_wallet_for_user_in_memory(
 
         let candidate_addresses: Vec<(String, u32)> = {
             let pool = wallets.read().unwrap_or_else(|p| p.into_inner());
-            pool.iter()
-                .map(|w| (w.address.clone(), w.index))
-                .collect()
+            pool.iter().map(|w| (w.address.clone(), w.index)).collect()
         };
 
         for (address, index) in candidate_addresses {

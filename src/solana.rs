@@ -17,6 +17,7 @@ use solana_system_interface::instruction as system_instruction;
 use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
 use crate::pricing::PriceFetcher;
+use crate::recover::{RecoverResponse, RecoverStatus};
 use crate::solana_pool::{
     ManagedSolanaWallet, SharedSolanaWallets, SolanaReservation, find_wallet,
     load_active_reservations, load_assignment_for_address, load_assignment_for_user,
@@ -26,7 +27,6 @@ use crate::solana_tokens::{
     SplTokenConfig, create_associated_token_account_idempotent_instruction,
     derive_associated_token_address, spl_transfer_checked_instruction,
 };
-use crate::recover::{RecoverResponse, RecoverStatus};
 use crate::trait_def::PaymentDetector;
 use crate::types::{Chain, DetectedPayment, WebhookEvent};
 use crate::webhook::send_webhook;
@@ -319,13 +319,12 @@ impl SolanaDetector {
                 "SOLANA_DEPOSIT_ADDRESS is required".into(),
             ));
         }
-        let ledger_pubkey =
-            Pubkey::from_str(&config.secure_deposit_address).map_err(|e| {
-                DetectorError::InvalidConfig(format!(
-                    "Invalid SOLANA_DEPOSIT_ADDRESS '{}': {e}",
-                    config.secure_deposit_address
-                ))
-            })?;
+        let ledger_pubkey = Pubkey::from_str(&config.secure_deposit_address).map_err(|e| {
+            DetectorError::InvalidConfig(format!(
+                "Invalid SOLANA_DEPOSIT_ADDRESS '{}': {e}",
+                config.secure_deposit_address
+            ))
+        })?;
         if config.wallet_pool_file.is_empty() {
             return Err(DetectorError::InvalidConfig(
                 "SOLANA_WALLET_POOL_FILE is required".into(),
@@ -346,13 +345,13 @@ impl SolanaDetector {
         }
 
         let gas_tank_keypair = match config.gas_tank_private_key.as_deref() {
-            Some(value) if !value.trim().is_empty() => {
-                Some(Arc::new(parse_solana_keypair(value.trim()).map_err(|e| {
+            Some(value) if !value.trim().is_empty() => Some(Arc::new(
+                parse_solana_keypair(value.trim()).map_err(|e| {
                     DetectorError::InvalidConfig(format!(
                         "Invalid SOLANA_GAS_TANK_PRIVATE_KEY: {e}"
                     ))
-                })?))
-            }
+                })?,
+            )),
             _ => None,
         };
         let gas_tank_pubkey = gas_tank_keypair.as_ref().map(|kp| kp.pubkey());
@@ -578,9 +577,7 @@ impl SolanaDetector {
             {
                 // Don't abort the whole webhook on one address failing —
                 // the polling fallback will pick it up. Just log and skip.
-                log::warn!(
-                    "[SOL] Webhook-triggered scan failed for {address}: {error}"
-                );
+                log::warn!("[SOL] Webhook-triggered scan failed for {address}: {error}");
                 continue;
             }
             scanned.push(address);
@@ -713,15 +710,13 @@ impl SolanaDetector {
         if gas_tank_pubkey == self.ledger_pubkey {
             return Ok(());
         }
-        if !self.config.gas_tank_target_usd.is_finite()
-            || self.config.gas_tank_target_usd <= 0.0
-        {
+        if !self.config.gas_tank_target_usd.is_finite() || self.config.gas_tank_target_usd <= 0.0 {
             return Ok(());
         }
 
         let now = unix_timestamp();
-        let interval = i64::try_from(self.config.gas_tank_check_interval_secs.max(1))
-            .unwrap_or(i64::MAX);
+        let interval =
+            i64::try_from(self.config.gas_tank_check_interval_secs.max(1)).unwrap_or(i64::MAX);
         let throttle_elapsed = {
             let state = self.state.lock().unwrap();
             state
@@ -899,19 +894,16 @@ impl SolanaDetector {
             return ScheduledOutcome::None;
         };
 
-        let pending = match crate::solana_scheduled::load_pending_scheduled_payments(
-            &self.config.redis_url,
-        )
-        .await
-        {
-            Ok(list) => list,
-            Err(error) => {
-                log::warn!(
-                    "[SOL][SCHED] Failed to load pending scheduled payments: {error}"
-                );
-                return ScheduledOutcome::None;
-            }
-        };
+        let pending =
+            match crate::solana_scheduled::load_pending_scheduled_payments(&self.config.redis_url)
+                .await
+            {
+                Ok(list) => list,
+                Err(error) => {
+                    log::warn!("[SOL][SCHED] Failed to load pending scheduled payments: {error}");
+                    return ScheduledOutcome::None;
+                }
+            };
         if pending.is_empty() {
             return ScheduledOutcome::None;
         }
@@ -927,25 +919,26 @@ impl SolanaDetector {
             return ScheduledOutcome::None;
         };
 
-        let amount_lamports = match payment_amount_lamports(&payment, sol_usd, &self.sol_eur_fetcher).await {
-            Ok(value) => value,
-            Err(reason) => {
-                log::warn!(
-                    "[SOL][SCHED] Payment {} has invalid amount/currency ({}); marking failed",
-                    payment.id,
-                    reason
-                );
-                crate::solana_scheduled::notify_payment_failed(
-                    &self.webhook_client,
-                    core_api_url,
-                    internal_token,
-                    payment.id,
-                    &reason,
-                )
-                .await;
-                return ScheduledOutcome::Sent;
-            }
-        };
+        let amount_lamports =
+            match payment_amount_lamports(&payment, sol_usd, &self.sol_eur_fetcher).await {
+                Ok(value) => value,
+                Err(reason) => {
+                    log::warn!(
+                        "[SOL][SCHED] Payment {} has invalid amount/currency ({}); marking failed",
+                        payment.id,
+                        reason
+                    );
+                    crate::solana_scheduled::notify_payment_failed(
+                        &self.webhook_client,
+                        core_api_url,
+                        internal_token,
+                        payment.id,
+                        &reason,
+                    )
+                    .await;
+                    return ScheduledOutcome::Sent;
+                }
+            };
         if amount_lamports == 0 {
             crate::solana_scheduled::notify_payment_failed(
                 &self.webhook_client,
@@ -1249,7 +1242,10 @@ impl SolanaDetector {
 
         log::debug!(
             "[SOL] Scanning {} ATA {} for reservation {} (mint={})",
-            token.symbol, ata_string, reservation.address, token.mint
+            token.symbol,
+            ata_string,
+            reservation.address,
+            token.mint
         );
 
         let new_signatures = self.get_new_signatures(&ata_string).await?;
@@ -1277,15 +1273,15 @@ impl SolanaDetector {
                 }
             };
 
-            let Some(amount_base_units) = Self::extract_positive_token_amount(
-                &tx,
-                &owner_string,
-                &mint_string,
-                &ata_string,
-            ) else {
+            let Some(amount_base_units) =
+                Self::extract_positive_token_amount(&tx, &owner_string, &mint_string, &ata_string)
+            else {
                 log::info!(
                     "[SOL] {} tx {} on ata {} produced no positive balance change for owner {} (likely outgoing transfer or zero-amount)",
-                    token.symbol, sig.signature, ata_string, owner_string
+                    token.symbol,
+                    sig.signature,
+                    ata_string,
+                    owner_string
                 );
                 self.update_last_processed_signature(&ata_string, &sig.signature)?;
                 continue;
@@ -1477,7 +1473,8 @@ impl SolanaDetector {
                 }
             }
 
-            let payment_and_deferred: Option<(DetectedPayment, bool)> = match entry.asset.as_deref() {
+            let payment_and_deferred: Option<(DetectedPayment, bool)> = match entry.asset.as_deref()
+            {
                 None => {
                     let sweep_result = self.sweep_native_sol_from_address(&entry.address).await?;
                     let was_deferred = sweep_result.deferred;
@@ -1485,12 +1482,14 @@ impl SolanaDetector {
                         if already_credited {
                             log::info!(
                                 "[SOL] Native sweep retry deferred for already-credited {} (signature {})",
-                                entry.address, entry.signature
+                                entry.address,
+                                entry.signature
                             );
                         } else {
                             log::info!(
                                 "[SOL] Crediting {} immediately (funds on managed wallet); native sweep deferred and will retry next cycle (signature {})",
-                                entry.address, entry.signature
+                                entry.address,
+                                entry.signature
                             );
                         }
                     }
@@ -1526,7 +1525,11 @@ impl SolanaDetector {
                                     / Chain::Solana.sats_per_unit() as f64,
                             )
                         },
-                        sweep_txid: if was_deferred { None } else { sweep_result.txid.clone() },
+                        sweep_txid: if was_deferred {
+                            None
+                        } else {
+                            sweep_result.txid.clone()
+                        },
                         fiat_amount: None,
                         fiat_currency: None,
                         coin_price: None,
@@ -1578,20 +1581,24 @@ impl SolanaDetector {
                         if already_credited {
                             log::info!(
                                 "[SOL] {} sweep retry deferred for already-credited {} (signature {})",
-                                symbol, entry.address, entry.signature
+                                symbol,
+                                entry.address,
+                                entry.signature
                             );
                         } else {
                             log::info!(
                                 "[SOL] Crediting {} {} immediately (funds on managed wallet); sweep deferred and will retry next cycle (signature {})",
-                                entry.address, symbol, entry.signature
+                                entry.address,
+                                symbol,
+                                entry.signature
                             );
                         }
                     }
 
                     let amount_coin =
                         entry.amount_base_units as f64 / 10f64.powi(i32::from(decimals));
-                    let swept_coin = sweep_result.amount_base_units as f64
-                        / 10f64.powi(i32::from(decimals));
+                    let swept_coin =
+                        sweep_result.amount_base_units as f64 / 10f64.powi(i32::from(decimals));
                     let mut payment = DetectedPayment {
                         chain: Chain::Solana,
                         ticker: symbol.to_string(),
@@ -1615,7 +1622,11 @@ impl SolanaDetector {
                             Some(sweep_result.amount_base_units)
                         },
                         swept_amount_coin: if was_deferred { None } else { Some(swept_coin) },
-                        sweep_txid: if was_deferred { None } else { sweep_result.txid.clone() },
+                        sweep_txid: if was_deferred {
+                            None
+                        } else {
+                            sweep_result.txid.clone()
+                        },
                         fiat_amount: None,
                         fiat_currency: None,
                         coin_price: None,
@@ -1635,8 +1646,7 @@ impl SolanaDetector {
                     if is_fiat_pegged_token(symbol) {
                         if let Some(rate) = self.token_to_configured_fiat_rate(symbol).await {
                             payment.coin_price = Some(rate);
-                            payment.fiat_currency =
-                                Some(self.price_fetcher.currency().to_string());
+                            payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
                             payment.fiat_amount = Some(amount_coin * rate);
                         }
                     }
@@ -1707,7 +1717,9 @@ impl SolanaDetector {
         }
 
         let recent_blockhash = self.get_latest_blockhash().await?;
-        let fee = self.estimate_transfer_fee(&wallet, recent_blockhash).await?;
+        let fee = self
+            .estimate_transfer_fee(&wallet, recent_blockhash)
+            .await?;
 
         if balance <= fee {
             log::info!(
@@ -1743,7 +1755,11 @@ impl SolanaDetector {
         let amount_lamports = balance - fee;
         let destination = self.sol_native_sweep_destination();
         let tx = Transaction::new_signed_with_payer(
-            &[system_instruction::transfer(&from, &destination, amount_lamports)],
+            &[system_instruction::transfer(
+                &from,
+                &destination,
+                amount_lamports,
+            )],
             Some(&from),
             &[wallet.keypair.as_ref()],
             recent_blockhash,
@@ -1969,8 +1985,7 @@ impl SolanaDetector {
                             // tx fee only (~5000 lamports). Don't include rent for ATA creation
                             // since that's a one-time bootstrap cost amortized over future sweeps.
                             let fee_lamports = 5_000u64;
-                            let fee_pegged =
-                                (fee_lamports as f64 / 1_000_000_000.0) * sol_peg;
+                            let fee_pegged = (fee_lamports as f64 / 1_000_000_000.0) * sol_peg;
                             if fee_pegged > amount_pegged * self.config.max_fee_ratio {
                                 log::info!(
                                     "[SOL] Deferring {} sweep for {}: fee ~{:.4}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%)",
@@ -2566,7 +2581,9 @@ impl SolanaDetector {
 
         log::info!(
             "[SOL] /recover-txid: signature={} user_id={} assigned_address={}",
-            signature, user_id, reservation.address
+            signature,
+            user_id,
+            reservation.address
         );
 
         // Sanity check: the reserved address must still exist in our
@@ -2597,7 +2614,8 @@ impl SolanaDetector {
                 {
                     log::info!(
                         "[SOL] /recover-txid: signature={} not found on chain ({})",
-                        signature, error
+                        signature,
+                        error
                     );
                     return Ok(mk(RecoverStatus::TxNotFound));
                 }
@@ -2641,14 +2659,10 @@ impl SolanaDetector {
             let ata_string = ata.to_string();
             let mint_string = token.mint.to_string();
             let owner_string = owner.to_string();
-            if let Some(amount_base_units) = Self::extract_positive_token_amount(
-                &tx,
-                &owner_string,
-                &mint_string,
-                &ata_string,
-            ) {
-                let amount_coin =
-                    amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
+            if let Some(amount_base_units) =
+                Self::extract_positive_token_amount(&tx, &owner_string, &mint_string, &ata_string)
+            {
+                let amount_coin = amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
                 self.enqueue_recovered_token(
                     &reservation,
                     signature,
@@ -2671,7 +2685,8 @@ impl SolanaDetector {
 
         log::info!(
             "[SOL] /recover-txid: signature={} produced no positive credit to {} (for user_id={user_id})",
-            signature, reservation.address
+            signature,
+            reservation.address
         );
         Ok(mk(RecoverStatus::NoCreditAmount))
     }
@@ -2723,9 +2738,7 @@ impl SolanaDetector {
         {
             let mut state = self.state.lock().unwrap();
             let already_pending = state.pending.iter().any(|p| {
-                p.signature == signature
-                    && p.address == reservation.address
-                    && p.asset.is_none()
+                p.signature == signature && p.address == reservation.address && p.asset.is_none()
             });
             let already_credited = state.credited_payments.contains(&dedup_key);
             if !already_pending && !already_credited {
@@ -2758,13 +2771,8 @@ impl SolanaDetector {
         amount_base_units: u64,
     ) -> Result<(), DetectorError> {
         let mint_string = token.mint.to_string();
-        let amount_coin =
-            amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
-        let dedup_key = payment_key(
-            signature,
-            &reservation.address,
-            Some(token.symbol.as_str()),
-        );
+        let amount_coin = amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
+        let dedup_key = payment_key(signature, &reservation.address, Some(token.symbol.as_str()));
         let detected = DetectedPayment {
             chain: Chain::Solana,
             ticker: token.symbol.clone(),
@@ -3143,9 +3151,8 @@ mod tests {
         );
         assert!(!is_account_drained_error(&generic_429));
 
-        let invalid_blockhash = DetectorError::ApiError(
-            "Transaction simulation failed: Blockhash not found".into(),
-        );
+        let invalid_blockhash =
+            DetectorError::ApiError("Transaction simulation failed: Blockhash not found".into());
         assert!(!is_account_drained_error(&invalid_blockhash));
     }
 }

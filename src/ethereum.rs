@@ -359,16 +359,19 @@ impl EthereumDetector {
     /// assigned address. The webhook (`payment_detected` then
     /// `payment_credited`) is fired by the underlying pipeline.
     pub async fn claim_for_user(&self, user_id: &str) -> Result<String, DetectorError> {
-        let assignment =
-            load_ethereum_assignment_for_user(self.config.chain, &self.config.redis_url, user_id)
-                .await?
-                .ok_or_else(|| {
-                    DetectorError::InvalidConfig(format!(
-                        "No {} deposit address assigned to user_id={user_id} - call /{}/address first",
-                        self.config.chain.name(),
-                        self.config.chain.name().to_ascii_lowercase()
-                    ))
-                })?;
+        let assignment = load_ethereum_assignment_for_user(
+            self.config.chain,
+            &self.config.redis_url,
+            user_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            DetectorError::InvalidConfig(format!(
+                "No {} deposit address assigned to user_id={user_id} - call /{}/address first",
+                self.config.chain.name(),
+                self.config.chain.name().to_ascii_lowercase()
+            ))
+        })?;
 
         let address = assignment.address.clone();
         log::info!(
@@ -384,23 +387,30 @@ impl EthereumDetector {
     }
 
     pub async fn sweep_orphan_balances(&self) -> Result<(), DetectorError> {
-        let active_addresses: HashSet<String> =
-            match load_active_ethereum_reservations(self.config.chain, &self.config.redis_url).await
-            {
-                Ok(reservations) => reservations
-                    .into_iter()
-                    .map(|r| r.address.to_ascii_lowercase())
-                    .collect(),
-                Err(error) => {
-                    log::warn!("[{}] Orphan sweep: failed to load active reservations ({error}); \
-                         skipping to avoid touching reserved wallets", self.config.chain.ticker()
-                    );
-                    return Ok(());
-                }
-            };
+        let active_addresses: HashSet<String> = match load_active_ethereum_reservations(
+            self.config.chain,
+            &self.config.redis_url,
+        )
+        .await
+        {
+            Ok(reservations) => reservations
+                .into_iter()
+                .map(|r| r.address.to_ascii_lowercase())
+                .collect(),
+            Err(error) => {
+                log::warn!(
+                    "[{}] Orphan sweep: failed to load active reservations ({error}); \
+                         skipping to avoid touching reserved wallets",
+                    self.config.chain.ticker()
+                );
+                return Ok(());
+            }
+        };
 
         let snapshot = snapshot_ethereum_wallets(&self.wallets);
-        log::info!("[{}] Orphan sweep starting: {} managed wallet(s), skipping {} active reservation(s)", self.config.chain.ticker(),
+        log::info!(
+            "[{}] Orphan sweep starting: {} managed wallet(s), skipping {} active reservation(s)",
+            self.config.chain.ticker(),
             snapshot.len(),
             active_addresses.len()
         );
@@ -419,7 +429,9 @@ impl EthereumDetector {
                 Ok(balance) if !balance.is_zero() => {
                     match self.sweep_native_from_address(&wallet.address).await {
                         Ok(result) if result.txid.is_some() => {
-                            log::info!("[{}] Orphan ETH swept: {} wei from {} (index {}, tx={})", self.config.chain.ticker(),
+                            log::info!(
+                                "[{}] Orphan ETH swept: {} wei from {} (index {}, tx={})",
+                                self.config.chain.ticker(),
                                 result.amount,
                                 wallet.address,
                                 wallet.index,
@@ -429,14 +441,18 @@ impl EthereumDetector {
                             native_swept_count += 1;
                         }
                         Ok(_) => {}
-                        Err(error) => log::warn!("[{}] Failed to sweep orphan ETH from {} (index {}): {error}", self.config.chain.ticker(),
+                        Err(error) => log::warn!(
+                            "[{}] Failed to sweep orphan ETH from {} (index {}): {error}",
+                            self.config.chain.ticker(),
                             wallet.address,
                             wallet.index
                         ),
                     }
                 }
                 Ok(_) => {}
-                Err(error) => log::warn!("[{}] Failed to read ETH balance for {} (index {}): {error}", self.config.chain.ticker(),
+                Err(error) => log::warn!(
+                    "[{}] Failed to read ETH balance for {} (index {}): {error}",
+                    self.config.chain.ticker(),
                     wallet.address,
                     wallet.index
                 ),
@@ -447,7 +463,9 @@ impl EthereumDetector {
                 let balance = match self.erc20_balance(token.contract, wallet.eth_address).await {
                     Ok(b) => b,
                     Err(error) => {
-                        log::warn!("[{}] Failed to read {} balance for {} (index {}): {error}", self.config.chain.ticker(),
+                        log::warn!(
+                            "[{}] Failed to read {} balance for {} (index {}): {error}",
+                            self.config.chain.ticker(),
                             token.symbol,
                             wallet.address,
                             wallet.index
@@ -464,7 +482,9 @@ impl EthereumDetector {
                     .await
                 {
                     Ok(result) if result.txid.is_some() => {
-                        log::info!("[{}] Orphan {} swept: {} units from {} (index {}, tx={})", self.config.chain.ticker(),
+                        log::info!(
+                            "[{}] Orphan {} swept: {} units from {} (index {}, tx={})",
+                            self.config.chain.ticker(),
                             token.symbol,
                             result.amount,
                             wallet.address,
@@ -474,7 +494,9 @@ impl EthereumDetector {
                         token_swept_count += 1;
                     }
                     Ok(_) => {}
-                    Err(error) => log::warn!("[{}] Failed to sweep orphan {} from {} (index {}): {error}", self.config.chain.ticker(),
+                    Err(error) => log::warn!(
+                        "[{}] Failed to sweep orphan {} from {} (index {}): {error}",
+                        self.config.chain.ticker(),
                         token.symbol,
                         wallet.address,
                         wallet.index
@@ -483,7 +505,9 @@ impl EthereumDetector {
             }
         }
 
-        log::info!("[{}] Orphan sweep complete: {} ETH sweep(s) ({} wei total), {} token sweep(s)", self.config.chain.ticker(),
+        log::info!(
+            "[{}] Orphan sweep complete: {} ETH sweep(s) ({} wei total), {} token sweep(s)",
+            self.config.chain.ticker(),
             native_swept_count,
             native_swept_wei,
             token_swept_count
@@ -545,7 +569,9 @@ impl EthereumDetector {
         let to_block = safe_block.min(from_block.saturating_add(max_blocks).saturating_sub(1));
         let reservation_lookup = self.reservation_lookup(reservations);
 
-        log::info!("[{}] Scanning blocks {}..={} for {} reserved address(es)", self.config.chain.ticker(),
+        log::info!(
+            "[{}] Scanning blocks {}..={} for {} reserved address(es)",
+            self.config.chain.ticker(),
             from_block,
             to_block,
             reservation_lookup.len()
@@ -634,7 +660,9 @@ impl EthereumDetector {
                     continue;
                 };
                 if is_native_gas_tank_top_up(tx.from, to, self.gas_tank_address) {
-                    log::debug!("[{}] Ignoring gas tank top-up tx {:#x} to reserved address {}", self.config.chain.ticker(),
+                    log::debug!(
+                        "[{}] Ignoring gas tank top-up tx {:#x} to reserved address {}",
+                        self.config.chain.ticker(),
                         tx.hash,
                         format_address(to)
                     );
@@ -659,7 +687,9 @@ impl EthereumDetector {
             }
         }
 
-        log::debug!("[{}] Native scan {}..={} produced {} candidate(s), current block {}", self.config.chain.ticker(),
+        log::debug!(
+            "[{}] Native scan {}..={} produced {} candidate(s), current block {}",
+            self.config.chain.ticker(),
             from_block,
             to_block,
             detected.len(),
@@ -780,7 +810,9 @@ impl EthereumDetector {
                     // advances after the whole loop succeeds via the caller's
                     // `set_last_scanned_block`, so we return the error to keep
                     // the cursor put and retry next cycle.
-                    log::warn!("[{}] Etherscan scan failed for {} ({}..={}): {error}", self.config.chain.ticker(),
+                    log::warn!(
+                        "[{}] Etherscan scan failed for {} ({}..={}): {error}",
+                        self.config.chain.ticker(),
                         format_address(*address),
                         from_block,
                         to_block
@@ -804,7 +836,9 @@ impl EthereumDetector {
                     continue;
                 }
                 if is_native_gas_tank_top_up(tx.from, tx.to, self.gas_tank_address) {
-                    log::debug!("[{}] Ignoring internal gas tank top-up tx {} to reserved address {}", self.config.chain.ticker(),
+                    log::debug!(
+                        "[{}] Ignoring internal gas tank top-up tx {} to reserved address {}",
+                        self.config.chain.ticker(),
                         tx.hash,
                         format_address(tx.to)
                     );
@@ -839,7 +873,9 @@ impl EthereumDetector {
             }
         }
 
-        log::debug!("[{}] Internal scan {}..={} across {} reserved address(es) inspected {} entry(ies), produced {} candidate(s)", self.config.chain.ticker(),
+        log::debug!(
+            "[{}] Internal scan {}..={} across {} reserved address(es) inspected {} entry(ies), produced {} candidate(s)",
+            self.config.chain.ticker(),
             from_block,
             to_block,
             reservations.len(),
@@ -900,7 +936,9 @@ impl EthereumDetector {
                 continue;
             }
             if entry.token_contract.is_none() && self.is_pending_gas_tank_top_up(&entry).await? {
-                log::info!("[{}] Ignoring previously queued gas tank top-up {} for {}", self.config.chain.ticker(),
+                log::info!(
+                    "[{}] Ignoring previously queued gas tank top-up {} for {}",
+                    self.config.chain.ticker(),
                     entry.txid,
                     entry.address
                 );
@@ -1012,9 +1050,7 @@ impl EthereumDetector {
 
     async fn sweep_native_from_address(&self, address: &str) -> Result<SweepResult, DetectorError> {
         let eth_address = Address::from_str(address).map_err(|e| {
-            DetectorError::InvalidConfig(format!(
-                "Invalid managed EVM address '{address}': {e}"
-            ))
+            DetectorError::InvalidConfig(format!("Invalid managed EVM address '{address}': {e}"))
         })?;
         let wallet = find_ethereum_wallet(&snapshot_ethereum_wallets(&self.wallets), eth_address)
             .ok_or_else(|| {
@@ -1036,7 +1072,9 @@ impl EthereumDetector {
         let gas_price = self.gas_price().await?;
         let fee = U256::from(NATIVE_TRANSFER_GAS_LIMIT) * gas_price;
         if balance <= fee {
-            log::info!("[{}] Address {} balance {} wei is not enough to cover native sweep fee {} - deferring", self.config.chain.ticker(),
+            log::info!(
+                "[{}] Address {} balance {} wei is not enough to cover native sweep fee {} - deferring",
+                self.config.chain.ticker(),
                 address,
                 balance,
                 fee
@@ -1049,7 +1087,9 @@ impl EthereumDetector {
         }
 
         if fee_ratio_too_high_u256(fee, balance, self.config.max_fee_ratio) {
-            log::info!("[{}] Deferring native sweep for {}: fee {} wei would be {:.1}% of balance {} wei (max {:.1}%) - retry when gas drops", self.config.chain.ticker(),
+            log::info!(
+                "[{}] Deferring native sweep for {}: fee {} wei would be {:.1}% of balance {} wei (max {:.1}%) - retry when gas drops",
+                self.config.chain.ticker(),
                 address,
                 fee,
                 ratio_percent_u256(fee, balance),
@@ -1079,7 +1119,9 @@ impl EthereumDetector {
             )
             .await?;
 
-        log::info!("[{}] Swept {} wei from {} to gas tank {} (tx={})", self.config.chain.ticker(),
+        log::info!(
+            "[{}] Swept {} wei from {} to gas tank {} (tx={})",
+            self.config.chain.ticker(),
             amount,
             address,
             self.gas_tank_address(),
@@ -1100,9 +1142,7 @@ impl EthereumDetector {
         amount: U256,
     ) -> Result<SweepResult, DetectorError> {
         let eth_address = Address::from_str(address).map_err(|e| {
-            DetectorError::InvalidConfig(format!(
-                "Invalid managed EVM address '{address}': {e}"
-            ))
+            DetectorError::InvalidConfig(format!("Invalid managed EVM address '{address}': {e}"))
         })?;
         let wallet = find_ethereum_wallet(&snapshot_ethereum_wallets(&self.wallets), eth_address)
             .ok_or_else(|| {
@@ -1125,7 +1165,9 @@ impl EthereumDetector {
             .estimate_token_transfer_gas(eth_address, contract, self.gas_tank_address, amount)
             .await
             .unwrap_or_else(|e| {
-                log::warn!("[{}] Token gas estimate failed for {} -> {}: {}; using configured limit {}", self.config.chain.ticker(),
+                log::warn!(
+                    "[{}] Token gas estimate failed for {} -> {}: {}; using configured limit {}",
+                    self.config.chain.ticker(),
                     address,
                     format_address(contract),
                     e,
@@ -1149,7 +1191,9 @@ impl EthereumDetector {
                             let fee_eth = u256_to_units_f64(needed_fee, ETH_DECIMALS);
                             let fee_pegged = fee_eth * eth_peg;
                             if fee_pegged > amount_pegged * self.config.max_fee_ratio {
-                                log::info!("[{}] Deferring {} sweep for {}: fee ~{:.2}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%) - retry when gas drops", self.config.chain.ticker(),
+                                log::info!(
+                                    "[{}] Deferring {} sweep for {}: fee ~{:.2}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%) - retry when gas drops",
+                                    self.config.chain.ticker(),
                                     token.symbol,
                                     address,
                                     fee_pegged,
@@ -1168,7 +1212,9 @@ impl EthereumDetector {
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            log::warn!("[{}] Skipping fee-ratio check for {} sweep: failed to fetch ETH/{}: {}", self.config.chain.ticker(),
+                            log::warn!(
+                                "[{}] Skipping fee-ratio check for {} sweep: failed to fetch ETH/{}: {}",
+                                self.config.chain.ticker(),
                                 token.symbol,
                                 peg,
                                 error
@@ -1197,7 +1243,9 @@ impl EthereumDetector {
             .gas_price(gas_price);
         let txid = self.send_transaction(wallet, tx).await?;
 
-        log::info!("[{}] Swept ERC-20 {} units from {} directly to ledger {} (contract={}, tx={})", self.config.chain.ticker(),
+        log::info!(
+            "[{}] Swept ERC-20 {} units from {} directly to ledger {} (contract={}, tx={})",
+            self.config.chain.ticker(),
             amount,
             address,
             self.ledger_address(),
@@ -1206,7 +1254,9 @@ impl EthereumDetector {
         );
 
         if let Err(error) = self.sweep_native_from_address(address).await {
-            log::warn!("[{}] Failed to sweep leftover ETH after token sweep from {}: {}", self.config.chain.ticker(),
+            log::warn!(
+                "[{}] Failed to sweep leftover ETH after token sweep from {}: {}",
+                self.config.chain.ticker(),
                 address,
                 error
             );
@@ -1253,7 +1303,9 @@ impl EthereumDetector {
                 gas_price,
             )
             .await?;
-        log::info!("[{}] Topped up {} with {} wei from gas tank (tx={})", self.config.chain.ticker(),
+        log::info!(
+            "[{}] Topped up {} with {} wei from gas tank (tx={})",
+            self.config.chain.ticker(),
             format_address(address),
             top_up_amount,
             txid
@@ -1291,11 +1343,18 @@ impl EthereumDetector {
         let eth_usd = match self.eth_usd_fetcher.get_price().await {
             Ok(price) if price > 0.0 => price,
             Ok(price) => {
-                log::warn!("[{}] Ignoring invalid ETH/USD price {}", self.config.chain.ticker(), price);
+                log::warn!(
+                    "[{}] Ignoring invalid ETH/USD price {}",
+                    self.config.chain.ticker(),
+                    price
+                );
                 return Ok(());
             }
             Err(error) => {
-                log::warn!("[{}] Failed to fetch ETH/USD for gas tank maintenance: {error}", self.config.chain.ticker());
+                log::warn!(
+                    "[{}] Failed to fetch ETH/USD for gas tank maintenance: {error}",
+                    self.config.chain.ticker()
+                );
                 return Ok(());
             }
         };
@@ -1303,7 +1362,9 @@ impl EthereumDetector {
         let target_wei = usd_to_wei(self.config.gas_tank_target_usd, eth_usd)?;
         let balance = self.eth_balance(self.gas_tank_address).await?;
         if balance <= target_wei {
-            log::info!("[{}] Gas tank balance {} wei is at or below target {} wei (${:.2})", self.config.chain.ticker(),
+            log::info!(
+                "[{}] Gas tank balance {} wei is at or below target {} wei (${:.2})",
+                self.config.chain.ticker(),
                 balance,
                 target_wei,
                 self.config.gas_tank_target_usd
@@ -1323,7 +1384,9 @@ impl EthereumDetector {
         }
 
         if fee_ratio_too_high_u256(fee, amount, self.config.max_fee_ratio) {
-            log::info!("[{}] Deferring gas tank excess sweep: fee {} wei would be {:.1}% of {} wei excess (max {:.1}%)", self.config.chain.ticker(),
+            log::info!(
+                "[{}] Deferring gas tank excess sweep: fee {} wei would be {:.1}% of {} wei excess (max {:.1}%)",
+                self.config.chain.ticker(),
                 fee,
                 ratio_percent_u256(fee, amount),
                 amount,
@@ -1342,7 +1405,9 @@ impl EthereumDetector {
             )
             .await?;
 
-        log::info!("[{}] Gas tank excess sweep: {} wei to ledger {} (kept ~${:.2}, tx={})", self.config.chain.ticker(),
+        log::info!(
+            "[{}] Gas tank excess sweep: {} wei to ledger {} (kept ~${:.2}, tx={})",
+            self.config.chain.ticker(),
             amount,
             self.ledger_address(),
             self.config.gas_tank_target_usd,
@@ -1402,7 +1467,9 @@ impl EthereumDetector {
                         if eth_peg > 0.0 {
                             let fee_pegged = u256_to_units_f64(fee, ETH_DECIMALS) * eth_peg;
                             if fee_pegged > amount_pegged * self.config.max_fee_ratio {
-                                log::info!("[{}] Deferring gas tank {} sweep to ledger: fee ~{:.2}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%)", self.config.chain.ticker(),
+                                log::info!(
+                                    "[{}] Deferring gas tank {} sweep to ledger: fee ~{:.2}{} would be {:.1}% of swept ~{:.2}{} (max {:.1}%)",
+                                    self.config.chain.ticker(),
                                     token.symbol,
                                     fee_pegged,
                                     peg,
@@ -1429,7 +1496,9 @@ impl EthereumDetector {
                 .send_transaction(self.gas_tank_wallet.clone(), tx)
                 .await?;
 
-            log::info!("[{}] Gas tank token sweep: {} {} units to ledger {} (contract={}, tx={})", self.config.chain.ticker(),
+            log::info!(
+                "[{}] Gas tank token sweep: {} {} units to ledger {} (contract={}, tx={})",
+                self.config.chain.ticker(),
                 balance,
                 token.symbol,
                 self.ledger_address(),
@@ -1672,7 +1741,10 @@ impl EthereumDetector {
                     payment.fiat_amount = Some(payment.amount_coin * price);
                 }
                 Err(error) => {
-                    log::warn!("[{}] Failed to fetch ETH price: {error}", self.config.chain.ticker());
+                    log::warn!(
+                        "[{}] Failed to fetch ETH price: {error}",
+                        self.config.chain.ticker()
+                    );
                 }
             }
         } else if let Some(peg) = token_peg_currency(&payment.ticker) {
@@ -1683,7 +1755,9 @@ impl EthereumDetector {
                     payment.fiat_amount = Some(payment.amount_coin * rate);
                 }
                 Err(error) => {
-                    log::warn!("[{}] Failed to convert {} from {} peg to {}: {error}", self.config.chain.ticker(),
+                    log::warn!(
+                        "[{}] Failed to convert {} from {} peg to {}: {error}",
+                        self.config.chain.ticker(),
                         payment.ticker,
                         peg,
                         self.price_fetcher.currency()
@@ -1909,7 +1983,8 @@ impl EthereumDetector {
                 };
                 let amount_coin = u256_to_units_f64(detected.amount, ETH_DECIMALS);
                 let current_block = self.current_block_number().await?;
-                self.emit_detected_and_enqueue(detected, current_block).await?;
+                self.emit_detected_and_enqueue(detected, current_block)
+                    .await?;
                 self.process_credits(current_block).await?;
                 return Ok(self.recover_outcome_for_event_id(
                     &event_id,
@@ -1996,7 +2071,8 @@ impl EthereumDetector {
             let amount_coin = u256_to_units_f64(detected.amount, token.decimals);
             let asset_for_response = token.symbol.clone();
             let current_block = self.current_block_number().await?;
-            self.emit_detected_and_enqueue(detected, current_block).await?;
+            self.emit_detected_and_enqueue(detected, current_block)
+                .await?;
             self.process_credits(current_block).await?;
             return Ok(self.recover_outcome_for_event_id(
                 &event_id,

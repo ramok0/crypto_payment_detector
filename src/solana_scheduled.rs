@@ -39,9 +39,8 @@ pub struct ScheduledSolPayment {
 pub async fn load_pending_scheduled_payments(
     redis_url: &str,
 ) -> Result<Vec<ScheduledSolPayment>, DetectorError> {
-    let client = redis::Client::open(redis_url).map_err(|error| {
-        DetectorError::RedisError(format!("Invalid Redis URL: {error}"))
-    })?;
+    let client = redis::Client::open(redis_url)
+        .map_err(|error| DetectorError::RedisError(format!("Invalid Redis URL: {error}")))?;
     let mut connection = client
         .get_multiplexed_async_connection()
         .await

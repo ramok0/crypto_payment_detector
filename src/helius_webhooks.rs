@@ -29,7 +29,12 @@ impl HeliusWebhookConfig {
     pub fn from_env() -> Result<Option<Self>, DetectorError> {
         let enabled = std::env::var("HELIUS_WEBHOOK_ENABLED")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         if !enabled {
             return Ok(None);
@@ -105,9 +110,7 @@ impl HeliusWebhookClient {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| {
-                DetectorError::InvalidConfig(format!(
-                    "Failed to build Helius HTTP client: {e}"
-                ))
+                DetectorError::InvalidConfig(format!("Failed to build Helius HTTP client: {e}"))
             })?;
         Ok(Self { config, http })
     }
@@ -149,19 +152,14 @@ impl HeliusWebhookClient {
             )));
         }
         serde_json::from_str::<Value>(&body).map_err(|e| {
-            DetectorError::ApiError(format!(
-                "Helius GET webhook returned invalid JSON: {e}"
-            ))
+            DetectorError::ApiError(format!("Helius GET webhook returned invalid JSON: {e}"))
         })
     }
 
     /// Replace the webhook's `accountAddresses` field wholesale and PUT the
     /// merged payload back. Preserves every other field returned by GET.
     /// Caller is responsible for de-duplicating the input.
-    pub async fn replace_addresses(
-        &self,
-        addresses: Vec<String>,
-    ) -> Result<(), DetectorError> {
+    pub async fn replace_addresses(&self, addresses: Vec<String>) -> Result<(), DetectorError> {
         let mut current = self.get_webhook().await?;
         let dedup: Vec<String> = {
             let set: HashSet<String> = addresses.into_iter().collect();
@@ -467,7 +465,10 @@ mod tests {
         assert!(!obj.contains_key("project"));
         assert!(!obj.contains_key("createdAt"));
         // Writable fields are preserved untouched
-        assert_eq!(obj.get("webhookURL").unwrap(), "https://example.com/webhook");
+        assert_eq!(
+            obj.get("webhookURL").unwrap(),
+            "https://example.com/webhook"
+        );
         assert_eq!(
             obj.get("accountAddresses").unwrap(),
             &serde_json::json!(["AAA", "BBB"])

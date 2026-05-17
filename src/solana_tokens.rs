@@ -36,11 +36,7 @@ pub fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey 
     let token_program = token_program_id();
     let ata_program = associated_token_program_id();
     let (ata, _bump) = Pubkey::find_program_address(
-        &[
-            owner.as_ref(),
-            token_program.as_ref(),
-            mint.as_ref(),
-        ],
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ata_program,
     );
     ata

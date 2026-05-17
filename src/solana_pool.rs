@@ -166,7 +166,10 @@ pub fn load_wallet_pool(path: &str) -> Result<Vec<ManagedSolanaWallet>, Detector
 }
 
 pub fn find_wallet(wallets: &[ManagedSolanaWallet], address: &str) -> Option<ManagedSolanaWallet> {
-    wallets.iter().find(|wallet| wallet.address == address).cloned()
+    wallets
+        .iter()
+        .find(|wallet| wallet.address == address)
+        .cloned()
 }
 
 pub fn snapshot_wallets(shared: &SharedSolanaWallets) -> Vec<ManagedSolanaWallet> {
@@ -472,14 +475,8 @@ pub async fn assign_wallet_for_user(
     }
 
     // Find an unassigned wallet from the pool.
-    let result = claim_first_unassigned_wallet(
-        &mut connection,
-        wallets,
-        pool_path,
-        &user_id,
-        now,
-    )
-    .await;
+    let result =
+        claim_first_unassigned_wallet(&mut connection, wallets, pool_path, &user_id, now).await;
 
     match result {
         Ok(assignment) => {
@@ -616,18 +613,13 @@ async fn read_assignment_payload(
     match serde_json::from_str::<SolanaAssignment>(&raw) {
         Ok(a) => Ok(Some(a)),
         Err(error) => {
-            log::warn!(
-                "[SOL] Failed to parse assignment payload for {address}: {error}"
-            );
+            log::warn!("[SOL] Failed to parse assignment payload for {address}: {error}");
             Ok(None)
         }
     }
 }
 
-async fn release_user_lock(
-    connection: &mut redis::aio::MultiplexedConnection,
-    lock_key: &str,
-) {
+async fn release_user_lock(connection: &mut redis::aio::MultiplexedConnection, lock_key: &str) {
     let result: Result<i64, redis::RedisError> = redis::cmd("DEL")
         .arg(lock_key)
         .query_async(connection)
@@ -655,9 +647,8 @@ pub async fn delete_all_assignments(redis_url: &str) -> Result<usize, DetectorEr
     let user_idx_keys = scan_keys_by_prefix(&mut connection, USER_INDEX_KEY_PREFIX).await?;
     let lock_keys = scan_keys_by_prefix(&mut connection, USER_LOCK_KEY_PREFIX).await?;
 
-    let mut all_keys = Vec::with_capacity(
-        assignment_keys.len() + user_idx_keys.len() + lock_keys.len(),
-    );
+    let mut all_keys =
+        Vec::with_capacity(assignment_keys.len() + user_idx_keys.len() + lock_keys.len());
     all_keys.extend(assignment_keys.iter().cloned());
     all_keys.extend(user_idx_keys.iter().cloned());
     all_keys.extend(lock_keys.iter().cloned());
@@ -704,9 +695,7 @@ pub async fn delete_all_assignments(redis_url: &str) -> Result<usize, DetectorEr
 /// startup; idempotent once converged. Already-dormant entries are
 /// excluded from the canonical-picking step but counted toward each
 /// user's archive.
-pub async fn consolidate_assignments(
-    redis_url: &str,
-) -> Result<(usize, usize), DetectorError> {
+pub async fn consolidate_assignments(redis_url: &str) -> Result<(usize, usize), DetectorError> {
     let client = redis::Client::open(redis_url)
         .map_err(|e| DetectorError::RedisError(format!("Invalid Redis URL: {e}")))?;
     let mut connection = client
@@ -895,8 +884,7 @@ async fn rotate_assignment_locked(
         .map_err(redis_error)?;
 
     let now = unix_timestamp();
-    let fresh =
-        claim_first_unassigned_wallet(connection, wallets, pool_path, user_id, now).await?;
+    let fresh = claim_first_unassigned_wallet(connection, wallets, pool_path, user_id, now).await?;
     let _: () = redis::cmd("SET")
         .arg(&user_idx)
         .arg(&fresh.address)

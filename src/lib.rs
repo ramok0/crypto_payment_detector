@@ -10,6 +10,7 @@ pub mod helius_webhooks;
 pub mod persistence;
 pub mod pricing;
 pub mod recover;
+pub mod remote_config;
 pub mod solana;
 pub mod solana_pool;
 pub mod solana_scheduled;
@@ -29,8 +30,8 @@ pub use ethereum_pool::{
     assign_ethereum_wallet_for_user, delete_all_ethereum_assignments,
     ethereum_reservation_store_url_from_env, ethereum_reservations_use_memory,
     load_active_ethereum_assignments, load_active_ethereum_reservations,
-    load_ethereum_assignment_for_user, load_ethereum_wallet_pool,
-    reserve_ethereum_wallet_for_user, shared_ethereum_wallets,
+    load_ethereum_assignment_for_user, load_ethereum_wallet_pool, reserve_ethereum_wallet_for_user,
+    shared_ethereum_wallets,
 };
 pub use etherscan::{EtherscanClient, EtherscanConfig, EtherscanInternalTx};
 pub use helius_webhooks::{

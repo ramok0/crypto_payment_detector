@@ -291,16 +291,14 @@ fn build_evm_config(chain: Chain) -> EthereumConfig {
         // is a safe default for the public endpoint. Mainnet Ethereum users
         // typically have a paid endpoint and don't need throttling — default 0.
         // Override per-chain: ETH_RPC_MIN_REQUEST_INTERVAL_MS / BASE_RPC_MIN_REQUEST_INTERVAL_MS.
-        rpc_min_request_interval_ms: std::env::var(format!(
-            "{prefix}_RPC_MIN_REQUEST_INTERVAL_MS"
-        ))
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(match chain {
-            Chain::Ethereum => 0,
-            Chain::Base => 200,
-            _ => 0,
-        }),
+        rpc_min_request_interval_ms: std::env::var(format!("{prefix}_RPC_MIN_REQUEST_INTERVAL_MS"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(match chain {
+                Chain::Ethereum => 0,
+                Chain::Base => 200,
+                _ => 0,
+            }),
         etherscan,
     }
 }
@@ -450,6 +448,12 @@ async fn main() {
     dotenvy::dotenv().ok();
     env_logger::init();
 
+    // Apply owner-managed configuration from the admin Configuration panel
+    // over the local env BEFORE any config builder runs, then watch for
+    // changes (a change triggers a clean restart so it always applies).
+    let cfg_sig = crypto_payment_detector::remote_config::bootstrap().await;
+    crypto_payment_detector::remote_config::spawn_watcher(cfg_sig);
+
     let chain_str = std::env::var("CHAIN").unwrap_or_else(|_| "bitcoin".to_string());
 
     let max_index: u32 = std::env::args()
@@ -483,7 +487,9 @@ async fn main() {
         let before = chains.len();
         chains.retain(|chain| *chain != Chain::Base);
         if chains.len() < before {
-            log::info!("[BASE] Disabled via DISABLE_BASE=true — skipping detector, sweep, and orphan scan");
+            log::info!(
+                "[BASE] Disabled via DISABLE_BASE=true — skipping detector, sweep, and orphan scan"
+            );
         }
     }
 
@@ -573,8 +579,9 @@ async fn main() {
                     ),
                 );
                 let detector = Arc::new(
-                    EthereumDetector::new(config, tokens, wallets)
-                        .unwrap_or_else(|e| panic!("Failed to create {} detector: {e}", evm_chain.ticker())),
+                    EthereumDetector::new(config, tokens, wallets).unwrap_or_else(|e| {
+                        panic!("Failed to create {} detector: {e}", evm_chain.ticker())
+                    }),
                 );
 
                 println!("{} Payment Detector starting", evm_chain.name());
