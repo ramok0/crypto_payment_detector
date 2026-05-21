@@ -569,6 +569,23 @@ async fn main() {
             }
             Chain::Ethereum | Chain::Base => {
                 let evm_chain = *chain;
+                // The gas tank key funds every sweep/top-up, so it is the
+                // signal that this EVM chain is actually configured. Treat an
+                // absent or empty value as "not configured" and skip — same as
+                // BTC_XPUB / SOLANA_DEPOSIT_ADDRESS — instead of panicking and
+                // taking the whole process down.
+                let gas_tank_var = format!("{}_GAS_TANK_PRIVATE_KEY", chain_env_prefix(evm_chain));
+                let gas_tank_configured = std::env::var(&gas_tank_var)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                if !gas_tank_configured {
+                    log::warn!(
+                        "[{}] {} not set, skipping",
+                        evm_chain.ticker(),
+                        gas_tank_var
+                    );
+                    continue;
+                }
                 let config = build_evm_config(evm_chain);
                 let tokens_env = format!("{}_ERC20_TOKENS", chain_env_prefix(evm_chain));
                 let tokens = parse_erc20_tokens(std::env::var(&tokens_env).ok().as_deref())
@@ -602,10 +619,13 @@ async fn main() {
     }
 
     if handles.is_empty() {
-        eprintln!(
-            "No chains configured. Set BTC_XPUB/LTC_XPUB, SOLANA_DEPOSIT_ADDRESS, ETH_GAS_TANK_PRIVATE_KEY, or BASE_GAS_TANK_PRIVATE_KEY."
+        log::warn!(
+            "No chains configured yet — waiting for admin-panel configuration (the config \
+             watcher restarts the process once settings are applied). Set BTC_XPUB/LTC_XPUB, \
+             SOLANA_DEPOSIT_ADDRESS, ETH_GAS_TANK_PRIVATE_KEY, or BASE_GAS_TANK_PRIVATE_KEY to \
+             enable a chain."
         );
-        std::process::exit(1);
+        std::future::pending::<()>().await;
     }
 
     let _ = handles.remove(0).await;
