@@ -493,7 +493,11 @@ async fn main() {
         }
     }
 
-    let mut handles = Vec::new();
+    // Every detector runs in its own task. `JoinSet` (rather than a bare Vec of
+    // handles) is what lets us notice the *first* one to stop, whichever it is:
+    // these loops are infinite, so a task that finishes has panicked, and a
+    // silently dead chain stops crediting deposits with nothing in the logs.
+    let mut tasks: tokio::task::JoinSet<&'static str> = tokio::task::JoinSet::new();
 
     for chain in &chains {
         match chain {
@@ -525,9 +529,11 @@ async fn main() {
                 println!();
 
                 let detector_handle = detector.clone();
-                handles.push(tokio::spawn(async move {
+                let ticker = chain.ticker();
+                tasks.spawn(async move {
                     run_detector(detector_handle, max_index).await;
-                }));
+                    ticker
+                });
             }
             Chain::Solana => {
                 let config = build_solana_config();
@@ -559,13 +565,15 @@ async fn main() {
                 println!();
 
                 let detector_handle = detector.clone();
-                handles.push(tokio::spawn(async move {
+                tasks.spawn(async move {
                     run_solana_detector(detector_handle).await;
-                }));
+                    "SOL"
+                });
                 let pending_handle = detector.clone();
-                handles.push(tokio::spawn(async move {
+                tasks.spawn(async move {
                     run_solana_pending_confirmation_loop(pending_handle).await;
-                }));
+                    "SOL pending-confirmation"
+                });
             }
             Chain::Ethereum | Chain::Base => {
                 let evm_chain = *chain;
@@ -611,14 +619,15 @@ async fn main() {
 
                 let detector_handle = detector.clone();
                 let ticker = evm_chain.ticker();
-                handles.push(tokio::spawn(async move {
+                tasks.spawn(async move {
                     run_ethereum_detector(detector_handle, ticker).await;
-                }));
+                    ticker
+                });
             }
         }
     }
 
-    if handles.is_empty() {
+    if tasks.is_empty() {
         log::warn!(
             "No chains configured yet — waiting for admin-panel configuration (the config \
              watcher restarts the process once settings are applied). Set BTC_XPUB/LTC_XPUB, \
@@ -628,5 +637,23 @@ async fn main() {
         std::future::pending::<()>().await;
     }
 
-    let _ = handles.remove(0).await;
+    // The detector loops never return on their own, so the first task to finish
+    // has died. Exiting non-zero hands the restart to the process supervisor
+    // (systemd/docker) with its own backoff, instead of limping along with one
+    // chain silently stopped.
+    match tasks.join_next().await {
+        Some(Ok(label)) => {
+            log::error!("[{label}] Detector task exited unexpectedly - stopping the process");
+        }
+        Some(Err(join_error)) if join_error.is_panic() => {
+            log::error!("A detector task panicked ({join_error}) - stopping the process");
+        }
+        Some(Err(join_error)) => {
+            log::error!("A detector task was cancelled ({join_error}) - stopping the process");
+        }
+        None => {
+            log::error!("No detector task left to supervise - stopping the process");
+        }
+    }
+    std::process::exit(1);
 }

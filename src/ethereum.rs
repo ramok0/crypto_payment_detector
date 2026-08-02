@@ -341,6 +341,16 @@ impl EthereumDetector {
         self.wallets.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
+    /// Poison-tolerant state lock.
+    ///
+    /// Without this, a panic anywhere under the lock poisons it for good and
+    /// every later `lock().unwrap()` panics too — turning one bad cycle into a
+    /// permanently dead detector. The guarded value is plain data with no
+    /// invariant a partial update can break, so recovering it is safe.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, EthereumState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn gas_tank_address(&self) -> String {
         format_address(self.gas_tank_address)
     }
@@ -542,7 +552,7 @@ impl EthereumDetector {
             return Ok(());
         }
 
-        let maybe_last = { self.state.lock().unwrap().last_scanned_block };
+        let maybe_last = { self.lock_state().last_scanned_block };
         let from_block = match maybe_last {
             Some(last) => last.saturating_add(1),
             None => {
@@ -602,7 +612,7 @@ impl EthereumDetector {
 
     fn initialize_or_advance_cursor(&self, safe_block: u64) -> Result<(), DetectorError> {
         let should_update = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state
                 .last_scanned_block
                 .map_or(true, |last| last < safe_block)
@@ -905,7 +915,7 @@ impl EthereumDetector {
         .await?;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             let already_pending = state.pending.iter().any(|p| p.event_id == payment.event_id);
             let already_credited = state.credited_events.contains(&payment.event_id);
             if !already_pending && !already_credited {
@@ -928,7 +938,7 @@ impl EthereumDetector {
     }
 
     async fn process_credits(&self, current_block: u64) -> Result<(), DetectorError> {
-        let pending = { self.state.lock().unwrap().pending.clone() };
+        let pending = { self.lock_state().pending.clone() };
 
         for entry in pending {
             let confirmations = current_block.saturating_sub(entry.block_number) + 1;
@@ -983,7 +993,7 @@ impl EthereumDetector {
                 .await?;
 
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.lock_state();
                     state.credited_events.insert(entry.event_id.clone());
                 }
                 self.persist_state()?;
@@ -1005,7 +1015,7 @@ impl EthereumDetector {
 
             if !sweep.deferred {
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.lock_state();
                     state
                         .pending
                         .retain(|pending| pending.event_id != entry.event_id);
@@ -1320,7 +1330,7 @@ impl EthereumDetector {
             .unwrap_or(i64::MAX)
             .max(1);
         let should_run = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state
                 .gas_tank_last_maintenance_unix
                 .map_or(true, |last| now.saturating_sub(last) >= interval)
@@ -1331,7 +1341,7 @@ impl EthereumDetector {
 
         self.maintain_gas_tank().await?;
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             state.gas_tank_last_maintenance_unix = Some(now);
         }
         self.persist_state()
@@ -1788,7 +1798,7 @@ impl EthereumDetector {
     }
 
     fn is_known_event(&self, event_id: &str) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.lock_state();
         state.credited_events.contains(event_id)
             || state.ignored_events.contains(event_id)
             || state
@@ -1798,13 +1808,13 @@ impl EthereumDetector {
     }
 
     fn is_credited_event(&self, event_id: &str) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.lock_state();
         state.credited_events.contains(event_id)
     }
 
     fn mark_event_ignored(&self, event_id: &str) -> Result<(), DetectorError> {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             state.ignored_events.insert(event_id.to_string());
             state.pending.retain(|pending| pending.event_id != event_id);
         }
@@ -1813,23 +1823,15 @@ impl EthereumDetector {
 
     fn set_last_scanned_block(&self, block_number: u64) -> Result<(), DetectorError> {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             state.last_scanned_block = Some(block_number);
         }
         self.persist_state()
     }
 
     fn persist_state(&self) -> Result<(), DetectorError> {
-        let state = { self.state.lock().unwrap().clone() };
-        let tmp_path = format!("{}.tmp", self.config.state_file);
-        let data = serde_json::to_string_pretty(&state)?;
-        std::fs::write(&tmp_path, &data).map_err(|e| {
-            DetectorError::InvalidConfig(format!("Failed to write Ethereum state file: {e}"))
-        })?;
-        std::fs::rename(&tmp_path, &self.config.state_file).map_err(|e| {
-            DetectorError::InvalidConfig(format!("Failed to rename Ethereum state file: {e}"))
-        })?;
-        Ok(())
+        let state = { self.lock_state().clone() };
+        crate::persistence::write_json_atomic(&self.config.state_file, &state)
     }
 
     /// On-demand TXID recovery for Ethereum mainnet / Base. The user
@@ -1965,7 +1967,7 @@ impl EthereumDetector {
                 let event_id = format!("native:{:#x}:{}", tx_hash, format_address(to));
 
                 {
-                    let state = self.state.lock().unwrap();
+                    let state = self.lock_state();
                     if state.credited_events.contains(&event_id) {
                         return Ok(mk(RecoverStatus::AlreadyCredited));
                     }
@@ -2052,7 +2054,7 @@ impl EthereumDetector {
             );
 
             {
-                let state = self.state.lock().unwrap();
+                let state = self.lock_state();
                 if state.credited_events.contains(&event_id) {
                     return Ok(mk(RecoverStatus::AlreadyCredited));
                 }
@@ -2101,7 +2103,7 @@ impl EthereumDetector {
         user_id: &str,
     ) -> RecoverResponse {
         let credited = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state.credited_events.contains(event_id)
         };
         let status = if credited {

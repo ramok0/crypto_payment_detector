@@ -7,6 +7,7 @@ use crate::bitcoin_sweep::{self, BitcoinSweepConfig, BitcoinSweepResult, validat
 use crate::derivation::derive_address;
 use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
+use crate::persistence::PendingPayment;
 use crate::pricing::PriceFetcher;
 use crate::recover::{RecoverResponse, RecoverStatus};
 use crate::trait_def::PaymentDetector;
@@ -128,6 +129,11 @@ fn blockchair_url(base_url: &str, path: &str) -> String {
     url
 }
 
+/// Upper bound on a single backoff sleep. `base_delay_ms << attempt` reaches
+/// hours within ~20 attempts, which stalls the scan loop far longer than any
+/// explorer outage warrants — and overflows outright past 64 attempts.
+const MAX_RETRY_DELAY_MS: u64 = 30_000;
+
 async fn retry<F, Fut, T>(
     name: &str,
     max_retries: u32,
@@ -138,32 +144,38 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, DetectorError>>,
 {
+    // `MAX_RETRIES=0` would otherwise skip the loop entirely and leave no error
+    // to return — the operation must run at least once.
+    let attempts = max_retries.max(1);
     let mut last_err = None;
-    for attempt in 0..max_retries {
+
+    for attempt in 0..attempts {
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                let delay = base_delay_ms * 2u64.pow(attempt);
+                last_err = Some(e);
+                if attempt + 1 == attempts {
+                    break;
+                }
+                let delay = base_delay_ms
+                    .saturating_mul(2u64.saturating_pow(attempt.min(32)))
+                    .min(MAX_RETRY_DELAY_MS);
                 log::warn!(
                     "Retry {}/{} for '{}' in {}ms - {}",
                     attempt + 1,
-                    max_retries,
+                    attempts,
                     name,
                     delay,
-                    e
+                    last_err.as_ref().expect("error recorded above")
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                last_err = Some(e);
             }
         }
     }
-    Err(last_err.unwrap())
-}
 
-#[derive(Debug, Clone)]
-struct PendingPayment {
-    payment: DetectedPayment,
-    block_height: u64,
+    Err(last_err.unwrap_or_else(|| {
+        DetectorError::ApiError(format!("'{name}' failed without recording an error"))
+    }))
 }
 
 #[derive(Debug)]
@@ -310,7 +322,10 @@ impl ChainDetector {
     }
 
     fn esplora_base_url(&self) -> Option<String> {
-        let index = *self.active_explorer_index.lock().unwrap();
+        let index = *self
+            .active_explorer_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.explorer_apis
             .get(index)
             .or_else(|| self.explorer_apis.first())
@@ -372,13 +387,45 @@ impl ChainDetector {
         self.config.chain
     }
 
+    /// Poison-tolerant state lock.
+    ///
+    /// A panic anywhere under the lock would otherwise poison it, and every
+    /// later `lock().unwrap()` would panic in turn — one transient bug would
+    /// take the detector down permanently instead of for a single cycle. The
+    /// guarded state is plain data with no invariant that a partial update can
+    /// break, so recovering the inner value is safe.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SharedState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Snapshot the mutable state and write it to the state file.
+    ///
+    /// Everything the scan loop cannot reconstruct after a restart lives here:
+    /// the scan height, the reorg hash window, payments still waiting for
+    /// confirmations, and the txids already credited.
+    fn persist_state(&self) -> Result<(), DetectorError> {
+        let snapshot = {
+            let state = self.lock_state();
+            crate::persistence::PersistedState {
+                last_scanned_height: state.last_scanned_height,
+                known_block_hashes: state.known_block_hashes.clone(),
+                pending: state.pending.clone(),
+                notified_confirmed: state.notified_confirmed.clone(),
+            }
+        };
+        crate::persistence::save_state(&self.config.state_file, &snapshot)
+    }
+
     async fn try_explorers<T, F, Fut>(&self, name: &str, mut call: F) -> Result<T, DetectorError>
     where
         F: FnMut(ExplorerApi) -> Fut,
         Fut: Future<Output = Result<T, DetectorError>>,
     {
         let len = self.explorer_apis.len();
-        let start = *self.active_explorer_index.lock().unwrap();
+        let start = *self
+            .active_explorer_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut last_err = None;
 
         for offset in 0..len {
@@ -396,7 +443,10 @@ impl ChainDetector {
                             name
                         );
                     }
-                    *self.active_explorer_index.lock().unwrap() = index;
+                    *self
+                        .active_explorer_index
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = index;
                     return Ok(value);
                 }
                 Err(error) => {
@@ -545,8 +595,12 @@ impl ChainDetector {
     ) -> Result<bitcoin::Block, DetectorError> {
         let bytes = self.fetch_raw_block_bytes_from(explorer, hash).await?;
 
-        let block = bitcoin::Block::consensus_decode(&mut bytes.as_slice())
-            .map_err(|e| DetectorError::ApiError(format!("Failed to parse raw block: {e}")))?;
+        // Litecoin blocks carry MWEB extensions the bitcoin crate cannot decode.
+        let block = match self.config.chain {
+            Chain::Litecoin => crate::litecoin_block::deserialize_litecoin_block(&bytes)?,
+            _ => bitcoin::Block::consensus_decode(&mut bytes.as_slice())
+                .map_err(|e| DetectorError::ApiError(format!("Failed to parse raw block: {e}")))?,
+        };
 
         Ok(block)
     }
@@ -719,7 +773,7 @@ impl ChainDetector {
 
     async fn detect_reorg(&self, current_height: u64) -> u64 {
         let known = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state.known_block_hashes.clone()
         };
 
@@ -769,7 +823,7 @@ impl ChainDetector {
 
     fn enqueue_or_confirm(&self, payments: Vec<DetectedPayment>) {
         let min_conf = self.config.min_confirmations;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         for payment in payments {
             if state.notified_confirmed.contains(&payment.txid) {
                 continue;
@@ -803,7 +857,7 @@ impl ChainDetector {
         // so we can keep retrying a deferred sweep without re-firing the
         // webhook.
         let ready: Vec<PendingPayment> = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state
                 .pending
                 .iter()
@@ -839,7 +893,7 @@ impl ChainDetector {
             }
 
             let already_notified = {
-                let state = self.state.lock().unwrap();
+                let state = self.lock_state();
                 state.notified_confirmed.contains(&pending.payment.txid)
             };
 
@@ -867,7 +921,7 @@ impl ChainDetector {
                 .await?;
 
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.lock_state();
                     state
                         .notified_confirmed
                         .insert(pending.payment.txid.clone());
@@ -901,7 +955,7 @@ impl ChainDetector {
         }
 
         if !to_remove.is_empty() {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             state
                 .pending
                 .retain(|p| !to_remove.contains(&p.payment.txid));
@@ -948,7 +1002,7 @@ impl ChainDetector {
         // scan or a previous recovery. Backend's unique DB index will
         // also catch duplicates if a webhook somehow re-fires.
         {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             if state.notified_confirmed.contains(txid) {
                 log::info!(
                     "[{}] /recover-txid: txid={txid} already credited (user_id={user_id})",
@@ -1082,8 +1136,17 @@ impl ChainDetector {
         self.enqueue_or_confirm(vec![detected]);
         self.process_confirmed(tip_height).await?;
 
+        // A recovery runs outside the scan loop, so nothing else would write
+        // the credit (or the still-pending entry) to disk.
+        if let Err(e) = self.persist_state() {
+            log::error!(
+                "[{}] Failed to persist state after recovery: {e}",
+                chain.ticker()
+            );
+        }
+
         let credited = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state.notified_confirmed.contains(txid)
         };
         let status = if credited {
@@ -1248,19 +1311,42 @@ impl PaymentDetector for ChainDetector {
         };
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             state.last_scanned_height = Some(current_height.saturating_sub(1));
             state.known_block_hashes = known_block_hashes.clone();
+            // Payments detected before the last restart but not yet confirmed:
+            // their block is already behind `last_scanned_height`, so the scan
+            // will never surface them again. Restoring them here is what makes
+            // a restart mid-confirmation non-destructive.
+            //
+            // Merged, not assigned: `run_detector` re-enters this function after
+            // a scan error, and in that case the in-memory state is newer than
+            // the file. Overwriting it would resurrect entries already credited
+            // since the last save.
+            state
+                .notified_confirmed
+                .extend(persisted.notified_confirmed.iter().cloned());
+            let mut restored = 0usize;
+            for entry in &persisted.pending {
+                let txid = &entry.payment.txid;
+                let known = state.notified_confirmed.contains(txid)
+                    || state.pending.iter().any(|p| &p.payment.txid == txid);
+                if !known {
+                    state.pending.push(entry.clone());
+                    restored += 1;
+                }
+            }
+            if restored > 0 {
+                log::info!(
+                    "[{}] Restored {} pending payment(s) awaiting confirmation from state file",
+                    ticker,
+                    restored
+                );
+            }
         }
 
         if self.config.skip_initial_block_sync {
-            crate::persistence::save_state(
-                &self.config.state_file,
-                &crate::persistence::PersistedState {
-                    last_scanned_height: Some(current_height.saturating_sub(1)),
-                    known_block_hashes: known_block_hashes.clone(),
-                },
-            )?;
+            self.persist_state()?;
         }
 
         loop {
@@ -1276,6 +1362,11 @@ impl PaymentDetector for ChainDetector {
             if current_height > tip_height {
                 if let Err(e) = self.process_confirmed(tip_height).await {
                     log::error!("[{}] Failed to process confirmed payments: {e}", ticker);
+                }
+                // At the tip there is no block save to piggyback on, so credits
+                // and sweeps settled just now would only exist in memory.
+                if let Err(e) = self.persist_state() {
+                    log::error!("[{}] Failed to persist state: {e}", ticker);
                 }
                 tokio::time::sleep(poll_interval).await;
                 continue;
@@ -1296,7 +1387,7 @@ impl PaymentDetector for ChainDetector {
                     );
                     let rollback_from = current_height - reorg_depth;
                     {
-                        let mut state = self.state.lock().unwrap();
+                        let mut state = self.lock_state();
                         state.pending.retain(|p| p.block_height < rollback_from);
                         for h in rollback_from..current_height {
                             state.known_block_hashes.remove(&h);
@@ -1390,7 +1481,7 @@ impl PaymentDetector for ChainDetector {
                 }
 
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.lock_state();
                     state.last_scanned_height = Some(current_height);
                     state
                         .known_block_hashes
@@ -1400,17 +1491,7 @@ impl PaymentDetector for ChainDetector {
                     state.known_block_hashes.retain(|&h, _| h >= min_keep);
                 }
 
-                let persisted_hashes = {
-                    let state = self.state.lock().unwrap();
-                    state.known_block_hashes.clone()
-                };
-                if let Err(e) = crate::persistence::save_state(
-                    &self.config.state_file,
-                    &crate::persistence::PersistedState {
-                        last_scanned_height: Some(current_height),
-                        known_block_hashes: persisted_hashes,
-                    },
-                ) {
+                if let Err(e) = self.persist_state() {
                     log::error!("[{}] Failed to persist state: {e}", ticker);
                 }
 
@@ -1479,6 +1560,125 @@ mod tests {
         }
     }
 
+    fn sample_payment(txid: &str, block_height: u64) -> DetectedPayment {
+        DetectedPayment {
+            chain: Chain::Litecoin,
+            ticker: "LTC".to_string(),
+            txid: txid.to_string(),
+            address: "ltc1qexample".to_string(),
+            user_id: None,
+            amount_sat: 500_000,
+            amount_coin: 0.005,
+            confirmations: 1,
+            block_height: Some(block_height),
+            derivation_index: 3,
+            memo: None,
+            swept_to_address: None,
+            swept_amount_sat: None,
+            swept_amount_coin: None,
+            sweep_txid: None,
+            fiat_amount: None,
+            fiat_currency: None,
+            coin_price: None,
+            event_id: None,
+            log_index: None,
+            asset: None,
+            asset_decimals: None,
+            amount_base_units: None,
+            swept_amount_base_units: None,
+            token_contract: None,
+        }
+    }
+
+    /// A payment detected but not yet confirmed used to live only in memory,
+    /// while `last_scanned_height` was persisted — so a restart in that window
+    /// dropped the deposit for good (the scan never revisits the block).
+    #[test]
+    fn persists_pending_payments_across_restart() {
+        let mut state_file = std::env::temp_dir();
+        state_file.push("cpd_blockstream_pending_restart.json");
+        let state_file = state_file.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&state_file);
+
+        let mut detector = blockchair_litecoin_detector();
+        detector.config.state_file = state_file.clone();
+        detector.config.min_confirmations = 6;
+
+        detector.enqueue_or_confirm(vec![sample_payment("deadbeef", 3_000_000)]);
+        {
+            let mut state = detector.lock_state();
+            state.last_scanned_height = Some(3_000_000);
+            state.notified_confirmed.insert("cafe".to_string());
+        }
+        detector.persist_state().expect("state should persist");
+
+        let reloaded = crate::persistence::load_state(&state_file).expect("state should reload");
+        assert_eq!(reloaded.last_scanned_height, Some(3_000_000));
+        assert_eq!(reloaded.pending.len(), 1);
+        assert_eq!(reloaded.pending[0].payment.txid, "deadbeef");
+        assert_eq!(reloaded.pending[0].block_height, 3_000_000);
+        assert!(reloaded.notified_confirmed.contains("cafe"));
+
+        let _ = std::fs::remove_file(&state_file);
+    }
+
+    /// A panic under the state lock used to poison it, so every later
+    /// `lock().unwrap()` panicked too and the detector stayed dead until the
+    /// process was restarted.
+    #[test]
+    fn survives_a_poisoned_state_lock() {
+        let detector = Arc::new(blockchair_litecoin_detector());
+
+        let poisoner = Arc::clone(&detector.state);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+
+        assert!(detector.state.is_poisoned());
+
+        let mut state = detector.lock_state();
+        state.last_scanned_height = Some(42);
+        drop(state);
+        assert_eq!(detector.lock_state().last_scanned_height, Some(42));
+    }
+
+    #[tokio::test]
+    async fn retry_runs_once_and_reports_the_error_when_max_retries_is_zero() {
+        // `MAX_RETRIES=0` used to skip the loop entirely and then unwrap a
+        // `None` error, panicking the detector task.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), DetectorError> = retry("test_op", 0, 1, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(DetectorError::ApiError("boom".into()))
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            result.unwrap_err().to_string().contains("boom"),
+            "the real error must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_returns_the_first_success_without_sleeping_again() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<u32, DetectorError> = retry("test_op", 5, 1, || async {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(DetectorError::ApiError("transient".into()))
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+
+        assert_eq!(result.expect("should succeed on the second attempt"), 7);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     #[ignore = "hits the live Blockchair Litecoin API"]
     async fn blockchair_live_gets_litecoin_tip_height() {
@@ -1545,6 +1745,35 @@ mod tests {
             block.header.time > 1_600_000_000,
             "downloaded Litecoin block {block_hash} has an implausible timestamp: {}",
             block.header.time
+        );
+    }
+
+    /// Companion to the pre-MWEB test above: every block mined since the MWEB
+    /// activation ends with a HogEx transaction whose flag byte is `0x08`, which
+    /// used to abort the scan loop with "unsupported segwit version: 8".
+    #[tokio::test]
+    #[ignore = "hits the live Blockchair Litecoin API"]
+    async fn blockchair_live_decodes_recent_mweb_litecoin_block() {
+        let detector = blockchair_litecoin_detector();
+        let tip_height = detector
+            .get_chain_tip()
+            .await
+            .expect("Blockchair should return a Litecoin tip height");
+        let block_height = tip_height.saturating_sub(6);
+        let block_hash = detector
+            .get_block_hash(block_height)
+            .await
+            .expect("Blockchair should return a Litecoin block hash by height");
+
+        let block = detector
+            .fetch_raw_block(&block_hash)
+            .await
+            .expect("Blockchair should return a decodable raw Litecoin block");
+
+        assert_eq!(block.block_hash().to_string(), block_hash);
+        assert!(
+            block.check_merkle_root(),
+            "merkle root mismatch on Litecoin block {block_hash} at height {block_height}"
         );
     }
 }

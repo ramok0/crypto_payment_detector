@@ -442,6 +442,16 @@ impl SolanaDetector {
             .collect()
     }
 
+    /// Poison-tolerant state lock.
+    ///
+    /// Without this, a panic anywhere under the lock poisons it for good and
+    /// every later `lock().unwrap()` panics too — turning one bad cycle into a
+    /// permanently dead detector. The guarded value is plain data with no
+    /// invariant a partial update can break, so recovering it is safe.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SolanaState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn gas_tank_address(&self) -> Option<String> {
         self.gas_tank_pubkey.map(|pk| pk.to_string())
     }
@@ -514,7 +524,7 @@ impl SolanaDetector {
     /// queued for processing.
     pub async fn confirm_pending_payments(&self) -> Result<usize, DetectorError> {
         let pending_count = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state.pending.len()
         };
         if pending_count == 0 {
@@ -718,7 +728,7 @@ impl SolanaDetector {
         let interval =
             i64::try_from(self.config.gas_tank_check_interval_secs.max(1)).unwrap_or(i64::MAX);
         let throttle_elapsed = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state
                 .gas_tank_last_maintenance_unix
                 .map_or(true, |last| now.saturating_sub(last) >= interval)
@@ -741,7 +751,7 @@ impl SolanaDetector {
         }
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             state.gas_tank_last_maintenance_unix = Some(now);
         }
         self.persist_state()
@@ -1201,7 +1211,7 @@ impl SolanaDetector {
             .await?;
 
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.lock_state();
                 let already_pending = state.pending.iter().any(|p| {
                     p.signature == sig.signature
                         && p.address == reservation.address
@@ -1354,7 +1364,7 @@ impl SolanaDetector {
             .await?;
 
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.lock_state();
                 let already_pending = state.pending.iter().any(|p| {
                     p.signature == sig.signature
                         && p.address == reservation.address
@@ -1385,7 +1395,7 @@ impl SolanaDetector {
 
     async fn process_credits(&self, current_slot: u64) -> Result<(), DetectorError> {
         let pending = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state.pending.clone()
         };
 
@@ -1422,7 +1432,7 @@ impl SolanaDetector {
             let entry_dedup_key =
                 payment_key(&entry.signature, &entry.address, entry.asset.as_deref());
             let already_credited = {
-                let state = self.state.lock().unwrap();
+                let state = self.lock_state();
                 state.credited_payments.contains(&entry_dedup_key)
             };
 
@@ -1669,7 +1679,7 @@ impl SolanaDetector {
                 .await?;
 
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.lock_state();
                     state.credited_payments.insert(entry_dedup_key.clone());
                 }
                 self.persist_state()?;
@@ -1677,7 +1687,7 @@ impl SolanaDetector {
 
             if !was_deferred {
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.lock_state();
                     // Match by the same composite key we used to insert the
                     // pending entry — multiple entries can share a signature
                     // when one tx credits several of our addresses, and we
@@ -2349,7 +2359,7 @@ impl SolanaDetector {
 
     async fn get_new_signatures(&self, address: &str) -> Result<Vec<SignatureInfo>, DetectorError> {
         let last_processed = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state
                 .addresses
                 .get(address)
@@ -2483,7 +2493,7 @@ impl SolanaDetector {
         signature: &str,
     ) -> Result<(), DetectorError> {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             state
                 .addresses
                 .entry(address.to_string())
@@ -2496,19 +2506,10 @@ impl SolanaDetector {
 
     fn persist_state(&self) -> Result<(), DetectorError> {
         let state = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state.clone()
         };
-
-        let tmp_path = format!("{}.tmp", self.config.state_file);
-        let data = serde_json::to_string_pretty(&state)?;
-        std::fs::write(&tmp_path, &data).map_err(|e| {
-            DetectorError::InvalidConfig(format!("Failed to write state file: {e}"))
-        })?;
-        std::fs::rename(&tmp_path, &self.config.state_file).map_err(|e| {
-            DetectorError::InvalidConfig(format!("Failed to rename state file: {e}"))
-        })?;
-        Ok(())
+        crate::persistence::write_json_atomic(&self.config.state_file, &state)
     }
 
     /// On-demand TXID recovery. Called when a user submits a Solana
@@ -2736,7 +2737,7 @@ impl SolanaDetector {
         .await?;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             let already_pending = state.pending.iter().any(|p| {
                 p.signature == signature && p.address == reservation.address && p.asset.is_none()
             });
@@ -2810,7 +2811,7 @@ impl SolanaDetector {
         .await?;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             let already_pending = state.pending.iter().any(|p| {
                 p.signature == signature
                     && p.address == reservation.address
@@ -2859,7 +2860,7 @@ impl SolanaDetector {
     ) -> RecoverResponse {
         let dedup_key = payment_key(signature, address, dedup_asset);
         let credited = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state.credited_payments.contains(&dedup_key)
         };
         let status = if credited {

@@ -43,7 +43,7 @@ impl PriceFetcher {
 
     pub async fn get_price(&self) -> Result<f64, DetectorError> {
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref entry) = *cache {
                 if entry.fetched_at.elapsed() < self.cache_ttl {
                     return Ok(entry.price);
@@ -54,7 +54,7 @@ impl PriceFetcher {
         let price = self.fetch_from_kraken().await?;
 
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             *cache = Some(PriceCache {
                 price,
                 fetched_at: Instant::now(),

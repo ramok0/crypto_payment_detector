@@ -31,6 +31,11 @@ use crypto_payment_detector::{
 #[derive(Clone)]
 struct AppState {
     chains: Vec<ChainInfo>,
+    /// Shared client for the explorer/RPC probes in `/health`. Built once:
+    /// a `reqwest::Client` owns a connection pool, so constructing one per
+    /// request throws away keep-alive and leaves a fresh pool behind on every
+    /// load-balancer probe.
+    health_client: reqwest::Client,
     solana_pool: Option<SolanaPoolApiState>,
     ethereum_pool: Option<EthereumPoolApiState>,
     base_pool: Option<EthereumPoolApiState>,
@@ -302,10 +307,7 @@ async fn handle_derive(
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let mut chains = Vec::new();
     let mut all_ok = true;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
+    let client = &state.health_client;
 
     for info in &state.chains {
         let (last_scanned_height, last_processed_signature, explorer_reachable, chain_ok) =
@@ -1897,7 +1899,10 @@ async fn main() {
     }
 
     let mut chain_infos = Vec::new();
-    let mut detector_handles = Vec::new();
+    // Detector loops are infinite; a task that finishes has panicked. Tracking
+    // them in a JoinSet lets a supervisor notice and say so, instead of the
+    // chain going quiet while the API keeps answering 200s.
+    let mut detector_tasks: tokio::task::JoinSet<&'static str> = tokio::task::JoinSet::new();
     let mut bitcoin_detectors: HashMap<Chain, BitcoinRecoveryState> = HashMap::new();
     let mut solana_pool = None;
     let mut ethereum_pool = None;
@@ -1929,9 +1934,11 @@ async fn main() {
                     );
 
                     let detector_handle = detector.clone();
-                    detector_handles.push(tokio::spawn(async move {
+                    let ticker = chain.ticker();
+                    detector_tasks.spawn(async move {
                         run_detector(detector_handle, max_index).await;
-                    }));
+                        ticker
+                    });
 
                     bitcoin_detectors.insert(
                         *chain,
@@ -2028,13 +2035,15 @@ async fn main() {
                     }
 
                     let detector_handle = detector.clone();
-                    detector_handles.push(tokio::spawn(async move {
+                    detector_tasks.spawn(async move {
                         run_solana_detector(detector_handle).await;
-                    }));
+                        "SOL"
+                    });
                     let pending_handle = detector.clone();
-                    detector_handles.push(tokio::spawn(async move {
+                    detector_tasks.spawn(async move {
                         run_solana_pending_confirmation_loop(pending_handle).await;
-                    }));
+                        "SOL pending-confirmation"
+                    });
 
                     chain_infos.push(info);
                     solana_pool = Some(pool_state);
@@ -2090,9 +2099,10 @@ async fn main() {
                 );
 
                 let detector_handle = detector.clone();
-                detector_handles.push(tokio::spawn(async move {
+                detector_tasks.spawn(async move {
                     run_ethereum_detector(detector_handle, ticker).await;
-                }));
+                    ticker
+                });
 
                 chain_infos.push(build_evm_chain_info(&config, gas_tank_address));
                 match evm_chain {
@@ -2115,6 +2125,10 @@ async fn main() {
 
     let state = Arc::new(AppState {
         chains: chain_infos,
+        health_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|e| panic!("Failed to build the /health HTTP client: {e}")),
         solana_pool,
         ethereum_pool,
         base_pool,
@@ -2147,8 +2161,40 @@ async fn main() {
         )
         .with_state(state);
 
+    // The API future below never completes, so nothing would ever observe a
+    // dead detector task: the process would keep answering /reserve while
+    // deposits stopped being credited. Watch the tasks and fail fast instead,
+    // leaving the restart to the process supervisor.
+    //
+    // The JoinSet must stay owned by this task — dropping it aborts every task
+    // still running.
+    tokio::spawn(async move {
+        match detector_tasks.join_next().await {
+            Some(Ok(label)) => {
+                log::error!(
+                    "[{label}] Detector task exited unexpectedly - stopping the API process"
+                );
+            }
+            Some(Err(join_error)) if join_error.is_panic() => {
+                log::error!("A detector task panicked ({join_error}) - stopping the API process");
+            }
+            Some(Err(join_error)) => {
+                log::error!(
+                    "A detector task was cancelled ({join_error}) - stopping the API process"
+                );
+            }
+            // No detector configured: the API still serves /derive and /health.
+            None => return,
+        }
+        std::process::exit(1);
+    });
+
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind API_BIND={bind}: {e}"));
     log::info!("API server listening on {bind}");
-    let listener = tokio::net::TcpListener::bind(&bind).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .unwrap_or_else(|e| panic!("API server stopped: {e}"));
 }
