@@ -233,21 +233,10 @@ pub fn append_solana_wallet_to_pool_file(
     };
     entries.push(new_entry);
 
-    let serialized = serde_json::to_string_pretty(&value)?;
-    let tmp_path = format!("{}.tmp", path);
-    std::fs::write(&tmp_path, serialized).map_err(|e| {
-        DetectorError::InvalidConfig(format!(
-            "Failed to write Solana wallet pool tmp file '{}': {e}",
-            tmp_path
-        ))
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        DetectorError::InvalidConfig(format!(
-            "Failed to rename Solana wallet pool tmp file '{}' -> '{}': {e}",
-            tmp_path, path
-        ))
-    })?;
-    Ok(())
+    // Durable write: this file is the only copy of the new wallet's private
+    // key, and the caller reserves the address for a user right after. Losing
+    // it to an unsynced rename would strand whatever gets deposited there.
+    crate::persistence::write_json_atomic(path, &value)
 }
 
 fn solana_max_pool_size() -> usize {

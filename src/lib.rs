@@ -7,6 +7,7 @@ pub mod ethereum;
 pub mod ethereum_pool;
 pub mod etherscan;
 pub mod helius_webhooks;
+pub mod litecoin_block;
 pub mod persistence;
 pub mod pricing;
 pub mod recover;
@@ -37,6 +38,7 @@ pub use etherscan::{EtherscanClient, EtherscanConfig, EtherscanInternalTx};
 pub use helius_webhooks::{
     HeliusWebhookClient, HeliusWebhookConfig, collect_candidate_addresses, verify_auth_header,
 };
+pub use litecoin_block::deserialize_litecoin_block;
 pub use pricing::PriceFetcher;
 pub use recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 pub use solana::{SolanaConfig, SolanaDetector};
