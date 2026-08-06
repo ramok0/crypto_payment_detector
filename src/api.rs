@@ -2,15 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crypto_payment_detector::derivation::derive_address;
-use crypto_payment_detector::env_utils::{
-    chain_env_bool, chain_env_prefix, chain_env_var, env_bool, proxy_env_var,
-};
+use crypto_payment_detector::env_utils::{chain_env_prefix, chain_env_var, env_bool};
 use crypto_payment_detector::helius_webhooks::{
     HeliusWebhookClient, HeliusWebhookConfig, collect_candidate_addresses, verify_auth_header,
 };
@@ -18,14 +16,15 @@ use crypto_payment_detector::persistence::load_state;
 use crypto_payment_detector::recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
-    BasicAuth, ChainDetector, DetectorConfig, DetectorError, EthereumConfig, EthereumDetector,
-    EthereumReservation, EtherscanConfig, PaymentDetector, RetryConfig, SharedEthereumWallets,
+    ChainDetector, ChainReadiness, DetectorError, EthereumConfig, EthereumDetector,
+    EthereumReservation, MissingSetting, PaymentDetector, SettingSchema, SharedEthereumWallets,
     SharedSolanaWallets, SolanaConfig, SolanaDetector, SolanaReservation,
-    assign_ethereum_wallet_for_user, assign_wallet_for_user, delete_all_assignments,
-    delete_all_ethereum_assignments, ethereum_reservation_store_url_from_env,
-    load_active_ethereum_reservations, load_active_reservations, load_ethereum_wallet_pool,
-    load_wallet_pool, parse_erc20_tokens, parse_spl_tokens, rotate_assignment,
-    shared_ethereum_wallets, shared_wallets,
+    assign_ethereum_wallet_for_user, assign_wallet_for_user, build_config, build_evm_config,
+    build_solana_config, chain_enable_key, chain_is_requested, delete_all_assignments,
+    delete_all_ethereum_assignments, load_active_ethereum_reservations, load_active_reservations,
+    load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens, parse_spl_tokens,
+    print_readiness_report, rotate_assignment, settings_schema, shared_ethereum_wallets,
+    shared_wallets,
 };
 
 #[derive(Clone)]
@@ -1161,350 +1160,6 @@ async fn handle_btc_recover(
     Ok(Json(response))
 }
 
-fn build_config(chain: Chain, xpub: String) -> DetectorConfig {
-    let state_file_default = match chain {
-        Chain::Bitcoin => "btc_detector_state.json",
-        Chain::Litecoin => "ltc_detector_state.json",
-        Chain::Solana => "sol_detector_state.json",
-        Chain::Ethereum => "eth_detector_state.json",
-        Chain::Base => "base_detector_state.json",
-    };
-    let state_file_var = match chain {
-        Chain::Bitcoin => "BTC_STATE_FILE",
-        Chain::Litecoin => "LTC_STATE_FILE",
-        Chain::Solana => "SOL_STATE_FILE",
-        Chain::Ethereum => "ETH_STATE_FILE",
-        Chain::Base => "BASE_STATE_FILE",
-    };
-
-    let (sweep_xpriv_var, sweep_dest_var) = match chain {
-        Chain::Bitcoin => ("BTC_XPRIV", "BTC_SWEEP_DESTINATION"),
-        Chain::Litecoin => ("LTC_XPRIV", "LTC_SWEEP_DESTINATION"),
-        _ => ("", ""),
-    };
-    let sweep_xpriv = std::env::var(sweep_xpriv_var)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let sweep_destination = std::env::var(sweep_dest_var)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-
-    DetectorConfig {
-        chain,
-        xpub,
-        webhook_url: std::env::var("WEBHOOK_URL").expect("WEBHOOK_URL env var required"),
-        webhook_hmac_secret: std::env::var("WEBHOOK_SECRET")
-            .expect("WEBHOOK_SECRET env var required"),
-        basic_auth: BasicAuth {
-            username: std::env::var("AUTH_USER").unwrap_or_default(),
-            password: std::env::var("AUTH_PASS").unwrap_or_default(),
-        },
-        poll_interval_secs: {
-            let chain_var = match chain {
-                Chain::Bitcoin => "BTC_POLL_INTERVAL",
-                Chain::Litecoin => "LTC_POLL_INTERVAL",
-                Chain::Solana => "SOL_POLL_INTERVAL",
-                Chain::Ethereum => "ETH_POLL_INTERVAL",
-                Chain::Base => "BASE_POLL_INTERVAL",
-            };
-            std::env::var(chain_var)
-                .or_else(|_| std::env::var("POLL_INTERVAL"))
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(30)
-        },
-        proxy_url: std::env::var("PROXY").ok(),
-        state_file: std::env::var(state_file_var)
-            .or_else(|_| std::env::var("STATE_FILE"))
-            .unwrap_or_else(|_| state_file_default.to_string()),
-        fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
-        retry: RetryConfig {
-            max_retries: std::env::var("MAX_RETRIES")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(5),
-            base_delay_ms: std::env::var("RETRY_BASE_DELAY_MS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1000),
-        },
-        explorer_api_url: explorer_api_config(chain),
-        min_confirmations: {
-            let chain_var = match chain {
-                Chain::Bitcoin => "BTC_MIN_CONFIRMATIONS",
-                Chain::Litecoin => "LTC_MIN_CONFIRMATIONS",
-                Chain::Solana => "SOL_MIN_CONFIRMATIONS",
-                Chain::Ethereum => "ETH_MIN_CONFIRMATIONS",
-                Chain::Base => "BASE_MIN_CONFIRMATIONS",
-            };
-            std::env::var(chain_var)
-                .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1)
-        },
-        skip_initial_block_sync: chain_env_bool(
-            chain,
-            "SKIP_INITIAL_BLOCK_SYNC",
-            "SKIP_INITIAL_BLOCK_SYNC",
-        ),
-        sweep_xpriv,
-        sweep_destination,
-        sweep_fee_rate_sats_per_vb: {
-            let chain_var = match chain {
-                Chain::Bitcoin => "BTC_SWEEP_FEE_RATE_SATS_PER_VB",
-                Chain::Litecoin => "LTC_SWEEP_FEE_RATE_SATS_PER_VB",
-                _ => "",
-            };
-            std::env::var(chain_var)
-                .or_else(|_| std::env::var("SWEEP_FEE_RATE_SATS_PER_VB"))
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(5)
-        },
-        sweep_min_sat: {
-            let chain_var = match chain {
-                Chain::Bitcoin => "BTC_SWEEP_MIN_SAT",
-                Chain::Litecoin => "LTC_SWEEP_MIN_SAT",
-                _ => "",
-            };
-            std::env::var(chain_var)
-                .or_else(|_| std::env::var("SWEEP_MIN_SAT"))
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(5_000)
-        },
-        sweep_max_fee_ratio: {
-            let chain_var = match chain {
-                Chain::Bitcoin => "BTC_MAX_FEE_RATIO",
-                Chain::Litecoin => "LTC_MAX_FEE_RATIO",
-                _ => "",
-            };
-            std::env::var(chain_var)
-                .or_else(|_| std::env::var("MAX_FEE_RATIO"))
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0.10)
-        },
-    }
-}
-
-fn build_solana_config() -> SolanaConfig {
-    SolanaConfig {
-        rpc_url: std::env::var("SOLANA_RPC_URL")
-            .unwrap_or_else(|_| "https://api.mainnet.solana.com".to_string()),
-        wallet_pool_file: std::env::var("SOLANA_WALLET_POOL_FILE")
-            .expect("SOLANA_WALLET_POOL_FILE env var required for CHAIN=solana"),
-        secure_deposit_address: std::env::var("SOLANA_DEPOSIT_ADDRESS")
-            .expect("SOLANA_DEPOSIT_ADDRESS env var required for CHAIN=solana"),
-        webhook_url: std::env::var("WEBHOOK_URL").expect("WEBHOOK_URL env var required"),
-        webhook_hmac_secret: std::env::var("WEBHOOK_SECRET")
-            .expect("WEBHOOK_SECRET env var required"),
-        redis_url: std::env::var("REDIS_URL").expect("REDIS_URL env var required"),
-        reservation_ttl_secs: std::env::var("SOLANA_RESERVATION_TTL_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(3600),
-        state_file: std::env::var("SOL_STATE_FILE")
-            .or_else(|_| std::env::var("STATE_FILE"))
-            .unwrap_or_else(|_| "sol_detector_state.json".to_string()),
-        poll_interval_secs: std::env::var("SOL_POLL_INTERVAL")
-            .or_else(|_| std::env::var("POLL_INTERVAL"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(60),
-        min_confirmations: std::env::var("SOL_MIN_CONFIRMATIONS")
-            .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1),
-        fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
-        proxy_url: proxy_env_var(&["SOLANA_PROXY", "SOL_PROXY", "PROXY"]),
-        max_retries: std::env::var("MAX_RETRIES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(5),
-        retry_base_delay_ms: std::env::var("RETRY_BASE_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1000),
-        min_deposit_fiat: std::env::var("SOL_MIN_DEPOSIT_FIAT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0.5),
-        gas_tank_private_key: std::env::var("SOLANA_GAS_TANK_PRIVATE_KEY")
-            .or_else(|_| std::env::var("SOLANA_FEE_PAYER_PRIVATE_KEY"))
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        gas_tank_target_usd: std::env::var("SOLANA_GAS_TANK_TARGET_USD")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(10.0),
-        gas_tank_check_interval_secs: std::env::var("SOLANA_GAS_TANK_INTERVAL_SECS")
-            .or_else(|_| std::env::var("SOLANA_GAS_TANK_CHECK_INTERVAL_SECS"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(900),
-        max_fee_ratio: std::env::var("SOLANA_MAX_FEE_RATIO")
-            .or_else(|_| std::env::var("SOL_MAX_FEE_RATIO"))
-            .or_else(|_| std::env::var("MAX_FEE_RATIO"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0.10),
-        core_api_url: std::env::var("CORE_API_INTERNAL_URL")
-            .or_else(|_| std::env::var("BACKEND_API_INTERNAL_URL"))
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        internal_service_token: std::env::var("INTERNAL_SERVICE_TOKEN")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-    }
-}
-
-/// Parse `{prefix}_ETHERSCAN_ENABLED`. Defaults to `true`. Setting the
-/// chain-specific var to `false`/`0`/`no`/`off` disables the etherscan client
-/// for that chain only — useful when the free Etherscan plan covers
-/// Ethereum mainnet but rejects Base.
-fn parse_etherscan_enabled_env(prefix: &str) -> bool {
-    match std::env::var(format!("{prefix}_ETHERSCAN_ENABLED")) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "no" | "off" | "disabled" => false,
-            _ => true,
-        },
-        Err(_) => true,
-    }
-}
-
-fn build_evm_config(chain: Chain) -> EthereumConfig {
-    assert!(chain.is_evm(), "build_evm_config requires an EVM chain");
-    let prefix = chain_env_prefix(chain);
-    let chain_lower = chain.name().to_ascii_lowercase();
-
-    let default_rpc_url = match chain {
-        Chain::Ethereum => "https://cloudflare-eth.com",
-        Chain::Base => "https://mainnet.base.org",
-        _ => unreachable!(),
-    };
-    let default_chain_id: u64 = match chain {
-        Chain::Ethereum => 1,
-        Chain::Base => 8453,
-        _ => unreachable!(),
-    };
-    let default_state_file = match chain {
-        Chain::Ethereum => "eth_detector_state.json",
-        Chain::Base => "base_detector_state.json",
-        _ => unreachable!(),
-    };
-
-    let chain_id = std::env::var(format!("{prefix}_CHAIN_ID"))
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default_chain_id);
-
-    // Etherscan's free tier does NOT cover Base. Set BASE_ETHERSCAN_ENABLED=false
-    // to skip the etherscan client on Base while keeping it on Ethereum.
-    let etherscan_enabled = parse_etherscan_enabled_env(prefix);
-    let etherscan = if etherscan_enabled {
-        EtherscanConfig::from_env().map(|mut config| {
-            config.chain_id = chain_id;
-            config
-        })
-    } else {
-        log::info!(
-            "[{}] Etherscan internal-tx scan disabled via {prefix}_ETHERSCAN_ENABLED=false",
-            chain.ticker()
-        );
-        None
-    };
-
-    EthereumConfig {
-        chain,
-        rpc_url: std::env::var(format!("{prefix}_RPC_URL"))
-            .unwrap_or_else(|_| default_rpc_url.to_string()),
-        chain_id,
-        wallet_pool_file: std::env::var(format!("{prefix}_WALLET_POOL_FILE")).unwrap_or_else(
-            |_| panic!("{prefix}_WALLET_POOL_FILE env var required for CHAIN={chain_lower}"),
-        ),
-        gas_tank_private_key: std::env::var(format!("{prefix}_GAS_TANK_PRIVATE_KEY"))
-            .unwrap_or_else(|_| {
-                panic!("{prefix}_GAS_TANK_PRIVATE_KEY env var required for CHAIN={chain_lower}")
-            }),
-        ledger_address: std::env::var(format!("{prefix}_LEDGER_ADDRESS")).unwrap_or_else(|_| {
-            panic!("{prefix}_LEDGER_ADDRESS env var required for CHAIN={chain_lower}")
-        }),
-        webhook_url: std::env::var("WEBHOOK_URL").expect("WEBHOOK_URL env var required"),
-        webhook_hmac_secret: std::env::var("WEBHOOK_SECRET")
-            .expect("WEBHOOK_SECRET env var required"),
-        redis_url: ethereum_reservation_store_url_from_env(chain),
-        reservation_ttl_secs: std::env::var(format!("{prefix}_RESERVATION_TTL_SECS"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(3600),
-        state_file: std::env::var(format!("{prefix}_STATE_FILE"))
-            .or_else(|_| std::env::var("STATE_FILE"))
-            .unwrap_or_else(|_| default_state_file.to_string()),
-        poll_interval_secs: std::env::var(format!("{prefix}_POLL_INTERVAL"))
-            .or_else(|_| std::env::var("POLL_INTERVAL"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(30),
-        min_confirmations: std::env::var(format!("{prefix}_MIN_CONFIRMATIONS"))
-            .or_else(|_| std::env::var("MIN_CONFIRMATIONS"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(match chain {
-                Chain::Ethereum => 12,
-                Chain::Base => 5,
-                _ => 12,
-            }),
-        fiat_currency: std::env::var("FIAT_CURRENCY").unwrap_or_else(|_| "EUR".to_string()),
-        proxy_url: {
-            let chain_proxy_var = format!("{prefix}_PROXY");
-            proxy_env_var(&[chain_proxy_var.as_str(), "PROXY"])
-        },
-        max_blocks_per_cycle: std::env::var(format!("{prefix}_MAX_BLOCKS_PER_CYCLE"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(250),
-        start_block: std::env::var(format!("{prefix}_START_BLOCK"))
-            .ok()
-            .and_then(|value| value.parse().ok()),
-        gas_tank_target_usd: std::env::var(format!("{prefix}_GAS_TANK_TARGET_USD"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(20.0),
-        gas_tank_check_interval_secs: std::env::var(format!("{prefix}_GAS_TANK_INTERVAL_SECS"))
-            .or_else(|_| std::env::var(format!("{prefix}_GAS_TANK_CHECK_INTERVAL_SECS")))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(900),
-        token_transfer_gas_limit: std::env::var(format!("{prefix}_TOKEN_TRANSFER_GAS_LIMIT"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(100_000),
-        gas_top_up_multiplier: std::env::var(format!("{prefix}_GAS_TOP_UP_MULTIPLIER"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1.25),
-        max_fee_ratio: std::env::var(format!("{prefix}_MAX_FEE_RATIO"))
-            .or_else(|_| std::env::var("MAX_FEE_RATIO"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0.10),
-        rpc_min_request_interval_ms: std::env::var(format!("{prefix}_RPC_MIN_REQUEST_INTERVAL_MS"))
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(match chain {
-                Chain::Ethereum => 0,
-                Chain::Base => 200,
-                _ => 0,
-            }),
-        etherscan,
-    }
-}
-
 fn build_chain_info(chain: Chain) -> Option<(ChainInfo, String)> {
     let xpub_var = match chain {
         Chain::Bitcoin => "BTC_XPUB",
@@ -1851,10 +1506,69 @@ fn map_internal_error(error: DetectorError) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
+#[derive(Serialize)]
+struct ConfigSchemaResponse {
+    settings: Vec<SettingSchema>,
+}
+
+/// Compare two secrets without leaking their common prefix through timing.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// Describe every setting this process understands, with its default, so the
+/// admin panel can render its form pre-filled instead of the operator guessing.
+///
+/// Returns the *shape* of the configuration only — it never reads the
+/// environment, so no configured value (let alone a private key) can leak here.
+async fn handle_config_schema(
+    headers: HeaderMap,
+) -> Result<Json<ConfigSchemaResponse>, (StatusCode, String)> {
+    // Every other route on this server is unauthenticated, so this one must
+    // fail closed: with no token configured there is nothing to check against,
+    // and serving the schema anyway would hand an anonymous caller a map of the
+    // deployment.
+    let expected = std::env::var("INTERNAL_SERVICE_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Config schema endpoint disabled: INTERNAL_SERVICE_TOKEN is not set".to_string(),
+        ))?;
+
+    let provided = headers
+        .get("X-Internal-Service-Token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .trim();
+
+    if !secret_eq(provided, &expected) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid or missing X-Internal-Service-Token".to_string(),
+        ));
+    }
+
+    Ok(Json(ConfigSchemaResponse {
+        settings: settings_schema(),
+    }))
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    env_logger::init();
+    // Default to `info` rather than env_logger's `error`. Without this, an
+    // operator who never sets RUST_LOG sees a process that starts, prints
+    // nothing at all, and appears to hang.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Apply owner-managed configuration from the admin Configuration panel
     // over the local env BEFORE any config builder runs, then watch for
@@ -1908,30 +1622,55 @@ async fn main() {
     let mut ethereum_pool = None;
     let mut base_pool = None;
 
+    // Collected as we go so the operator gets ONE report naming every gap,
+    // instead of discovering them one panic and one restart at a time.
+    let mut readiness: Vec<ChainReadiness> = Vec::new();
+
     for chain in &chains {
+        let chain = *chain;
+
+        // Nothing at all supplied for this chain: it simply isn't wanted here.
+        // Say so once, and don't list every other variable it would need.
+        if !chain_is_requested(chain) {
+            readiness.push(ChainReadiness::disabled(
+                chain,
+                vec![MissingSetting {
+                    key: chain_enable_key(chain),
+                    description: "Not set — this chain stays off until it is.",
+                }],
+            ));
+            continue;
+        }
+
         match chain {
             Chain::Bitcoin | Chain::Litecoin => {
-                if let Some((info, xpub)) = build_chain_info(*chain) {
-                    if let AddressSource::Xpub(ref configured_xpub) = info.address_source {
-                        log::info!(
-                            "[{}] Configured with xpub {}...{}",
-                            chain.ticker(),
-                            &configured_xpub[..8],
-                            &configured_xpub[configured_xpub.len() - 4..]
-                        );
-                    }
+                if let Some((info, xpub)) = build_chain_info(chain) {
+                    let config = match build_config(chain, xpub) {
+                        Ok(config) => config,
+                        Err(missing) => {
+                            readiness.push(ChainReadiness::disabled(chain, missing));
+                            continue;
+                        }
+                    };
+                    let detector = match ChainDetector::new(config) {
+                        Ok(detector) => Arc::new(detector),
+                        Err(error) => {
+                            log::error!("[{}] Invalid configuration: {error}", chain.ticker());
+                            readiness.push(ChainReadiness::disabled(chain, Vec::new()));
+                            continue;
+                        }
+                    };
 
-                    let config = build_config(*chain, xpub);
-                    let detector = Arc::new(
-                        ChainDetector::new(config)
-                            .expect(&format!("Failed to create {} detector", chain.ticker())),
-                    );
-
-                    log::info!(
-                        "[{}] Detector started - address 0: {}",
-                        chain.ticker(),
-                        detector.derive_address(0).unwrap()
-                    );
+                    readiness.push(ChainReadiness::enabled(
+                        chain,
+                        format!(
+                            "address 0 {}, max derivation index {}",
+                            detector
+                                .derive_address(0)
+                                .unwrap_or_else(|_| "<unavailable>".to_string()),
+                            max_index
+                        ),
+                    ));
 
                     let detector_handle = detector.clone();
                     let ticker = chain.ticker();
@@ -1941,35 +1680,34 @@ async fn main() {
                     });
 
                     bitcoin_detectors.insert(
-                        *chain,
+                        chain,
                         BitcoinRecoveryState {
                             detector: detector.clone(),
                             max_derivation_index: max_index,
                         },
                     );
                     chain_infos.push(info);
-                } else {
-                    let xpub_var = match chain {
-                        Chain::Bitcoin => "BTC_XPUB",
-                        Chain::Litecoin => "LTC_XPUB",
-                        Chain::Solana | Chain::Ethereum | Chain::Base => unreachable!(),
-                    };
-                    log::warn!("[{}] {} not set, skipping", chain.ticker(), xpub_var);
                 }
             }
             Chain::Solana => {
                 if let Some(info) = build_solana_chain_info() {
-                    let config = build_solana_config();
+                    let config = match build_solana_config() {
+                        Ok(config) => config,
+                        Err(missing) => {
+                            readiness.push(ChainReadiness::disabled(chain, missing));
+                            continue;
+                        }
+                    };
                     let tokens =
                         parse_spl_tokens(std::env::var("SOLANA_SPL_TOKENS").ok().as_deref())
-                            .expect("Invalid SOLANA_SPL_TOKENS");
+                            .unwrap_or_else(|e| panic!("Invalid SOLANA_SPL_TOKENS: {e}"));
                     let wallets = shared_wallets(
                         load_wallet_pool(&config.wallet_pool_file)
-                            .expect("Failed to load Solana wallet pool"),
+                            .unwrap_or_else(|e| panic!("Failed to load Solana wallet pool: {e}")),
                     );
                     let detector = Arc::new(
                         SolanaDetector::new(config.clone(), tokens, wallets.clone())
-                            .expect("Failed to create SOL detector"),
+                            .unwrap_or_else(|e| panic!("Failed to create SOL detector: {e}")),
                     );
 
                     // Reconcile per-user indices and drop any duplicate
@@ -2016,15 +1754,18 @@ async fn main() {
                     )
                     .expect("Failed to build Solana pool state");
 
-                    log::info!(
-                        "[SOL] Detector started - ledger: {} - gas tank: {} - managed wallets: {} - tokens: {} - permanent address assignments (no TTL)",
-                        detector.ledger_address(),
-                        detector
-                            .gas_tank_address()
-                            .unwrap_or_else(|| "<not configured>".to_string()),
-                        detector.wallet_count(),
-                        detector.token_count(),
-                    );
+                    readiness.push(ChainReadiness::enabled(
+                        chain,
+                        format!(
+                            "ledger {}, gas tank {}, {} wallet(s), {} SPL token(s), permanent address assignments (no TTL)",
+                            detector.ledger_address(),
+                            detector
+                                .gas_tank_address()
+                                .unwrap_or_else(|| "<not configured>".to_string()),
+                            detector.wallet_count(),
+                            detector.token_count()
+                        ),
+                    ));
                     for (symbol, mint, decimals) in detector.token_summary() {
                         log::info!(
                             "[SOL] SPL token configured: {} mint={} decimals={}",
@@ -2047,30 +1788,22 @@ async fn main() {
 
                     chain_infos.push(info);
                     solana_pool = Some(pool_state);
-                } else {
-                    log::warn!("[SOL] SOLANA_DEPOSIT_ADDRESS not set, skipping");
                 }
             }
             Chain::Ethereum | Chain::Base => {
-                let evm_chain = *chain;
+                let evm_chain = chain;
                 let ticker = evm_chain.ticker();
-                // The gas tank key funds every sweep/top-up, so it is the
-                // signal that this EVM chain is actually configured. Treat an
-                // absent or empty value as "not configured" and skip — same as
-                // BTC_XPUB / SOLANA_DEPOSIT_ADDRESS — instead of panicking and
-                // taking the whole process down.
-                let gas_tank_var = format!("{}_GAS_TANK_PRIVATE_KEY", chain_env_prefix(evm_chain));
-                let gas_tank_configured = std::env::var(&gas_tank_var)
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false);
-                if !gas_tank_configured {
-                    log::warn!("[{}] {} not set, skipping", ticker, gas_tank_var);
-                    continue;
-                }
-                let config = build_evm_config(evm_chain);
+                let config = match build_evm_config(evm_chain) {
+                    Ok(config) => config,
+                    Err(missing) => {
+                        readiness.push(ChainReadiness::disabled(chain, missing));
+                        continue;
+                    }
+                };
                 let tokens_env = format!("{}_ERC20_TOKENS", chain_env_prefix(evm_chain));
-                let tokens = parse_erc20_tokens(std::env::var(&tokens_env).ok().as_deref())
-                    .unwrap_or_else(|e| panic!("Invalid {tokens_env}: {e}"));
+                let tokens =
+                    parse_erc20_tokens(std::env::var(&tokens_env).ok().as_deref(), evm_chain)
+                        .unwrap_or_else(|e| panic!("Invalid {tokens_env}: {e}"));
                 let wallets = shared_ethereum_wallets(
                     load_ethereum_wallet_pool(evm_chain, &config.wallet_pool_file).unwrap_or_else(
                         |e| panic!("Failed to load {} wallet pool: {e}", evm_chain.name()),
@@ -2089,14 +1822,16 @@ async fn main() {
                 )
                 .unwrap_or_else(|e| panic!("Failed to build {} pool state: {e}", evm_chain.name()));
 
-                log::info!(
-                    "[{}] Detector started - gas tank: {} - ledger: {} - managed wallets: {} - tokens: {} - permanent address assignments (no TTL)",
-                    ticker,
-                    gas_tank_address,
-                    detector.ledger_address(),
-                    detector.wallet_count(),
-                    detector.token_count(),
-                );
+                readiness.push(ChainReadiness::enabled(
+                    chain,
+                    format!(
+                        "gas tank {}, ledger {}, {} wallet(s), {} ERC-20 token(s), permanent address assignments (no TTL)",
+                        gas_tank_address,
+                        detector.ledger_address(),
+                        detector.wallet_count(),
+                        detector.token_count()
+                    ),
+                ));
 
                 let detector_handle = detector.clone();
                 detector_tasks.spawn(async move {
@@ -2114,13 +1849,10 @@ async fn main() {
         }
     }
 
+    print_readiness_report(&readiness);
     if chain_infos.is_empty() {
-        log::warn!(
-            "No chain configured yet — starting the API anyway and waiting for admin-panel \
-             configuration (the config watcher restarts the process once settings are applied). \
-             Set BTC_XPUB/LTC_XPUB, SOLANA_DEPOSIT_ADDRESS, ETH_GAS_TANK_PRIVATE_KEY, or \
-             BASE_GAS_TANK_PRIVATE_KEY to enable a chain."
-        );
+        eprintln!("  The API still serves /health, /derive and /internal/config-schema.");
+        eprintln!();
     }
 
     let state = Arc::new(AppState {
@@ -2159,6 +1891,7 @@ async fn main() {
             "/admin/reservations/cancel-all",
             post(handle_admin_cancel_all_reservations),
         )
+        .route("/internal/config-schema", get(handle_config_schema))
         .with_state(state);
 
     // The API future below never completes, so nothing would ever observe a

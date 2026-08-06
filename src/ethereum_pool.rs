@@ -15,7 +15,7 @@ use crate::env_utils::chain_env_prefix;
 use crate::error::DetectorError;
 use crate::types::Chain;
 
-const IN_MEMORY_RESERVATION_URL: &str = "memory://evm-reservations";
+pub const IN_MEMORY_RESERVATION_URL: &str = "memory://evm-reservations";
 const DEFAULT_ETHEREUM_WALLET_POOL_SIZE: usize = 10;
 const MAX_ETHEREUM_WALLET_POOL_SIZE: usize = 10_000;
 
