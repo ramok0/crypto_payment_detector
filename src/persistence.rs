@@ -85,23 +85,30 @@ pub fn write_json_atomic<T: Serialize>(path: &str, value: &T) -> Result<(), Dete
         DetectorError::InvalidConfig(format!("Failed to rename state file to '{path}': {e}"))
     })?;
 
-    // Persisting the directory entry itself. Best-effort: some filesystems
-    // reject fsync on a directory handle, and a failure here only costs
-    // durability of the rename, not correctness of the data just written.
-    if let Some(parent) = Path::new(path).parent() {
-        let parent = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        if let Ok(dir) = std::fs::File::open(parent)
-            && let Err(e) = dir.sync_all()
-        {
-            log::debug!("Could not fsync directory '{}': {e}", parent.display());
-        }
-    }
+    fsync_parent_dir(path);
 
     Ok(())
+}
+
+/// Persist the directory entry pointing at `path`.
+///
+/// Best-effort: some filesystems reject fsync on a directory handle, and a
+/// failure here only costs durability of the directory update, not correctness
+/// of the data already written and synced.
+pub fn fsync_parent_dir(path: &str) {
+    let Some(parent) = Path::new(path).parent() else {
+        return;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if let Ok(dir) = std::fs::File::open(parent)
+        && let Err(e) = dir.sync_all()
+    {
+        log::debug!("Could not fsync directory '{}': {e}", parent.display());
+    }
 }
 
 #[cfg(test)]

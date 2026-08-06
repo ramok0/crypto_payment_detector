@@ -1,3 +1,6 @@
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +28,9 @@ const USER_INDEX_KEY_PREFIX: &str = "solana:user_assignment:";
 const USER_LOCK_KEY_PREFIX: &str = "solana:user_assignment_lock:";
 const USER_LOCK_TTL_SECS: u64 = 30;
 const DEFAULT_SOLANA_MAX_POOL_SIZE: usize = 10_000;
+/// Wallets generated when the pool file does not exist yet. Matches
+/// `DEFAULT_ETHEREUM_WALLET_POOL_SIZE` so both chains bootstrap alike.
+const DEFAULT_SOLANA_WALLET_POOL_SIZE: usize = 10;
 
 pub type SharedSolanaWallets = Arc<RwLock<Vec<ManagedSolanaWallet>>>;
 
@@ -97,12 +103,7 @@ struct WalletEntry {
 }
 
 pub fn load_wallet_pool(path: &str) -> Result<Vec<ManagedSolanaWallet>, DetectorError> {
-    let data = std::fs::read_to_string(path).map_err(|e| {
-        DetectorError::InvalidConfig(format!(
-            "Failed to read Solana wallet pool file '{}': {e}",
-            path
-        ))
-    })?;
+    let data = read_or_create_wallet_pool_file(path)?;
 
     let input: WalletPoolInput = serde_json::from_str(&data).map_err(|e| {
         DetectorError::InvalidConfig(format!(
@@ -163,6 +164,115 @@ pub fn load_wallet_pool(path: &str) -> Result<Vec<ManagedSolanaWallet>, Detector
     }
 
     Ok(wallets)
+}
+
+/// Read the pool file, generating it on first boot when it does not exist yet.
+///
+/// Mirrors `read_or_create_ethereum_wallet_pool_file`: before this, a missing
+/// `SOLANA_WALLET_POOL_FILE` was a hard boot failure while the EVM chains
+/// happily bootstrapped themselves, which made Solana the awkward chain to
+/// deploy for no good reason.
+fn read_or_create_wallet_pool_file(path: &str) -> Result<String, DetectorError> {
+    match std::fs::read_to_string(path) {
+        Ok(data) => Ok(data),
+        Err(e) if e.kind() == ErrorKind::NotFound => create_wallet_pool_file(path),
+        Err(e) => Err(DetectorError::InvalidConfig(format!(
+            "Failed to read Solana wallet pool file '{}': {e}",
+            path
+        ))),
+    }
+}
+
+fn create_wallet_pool_file(path: &str) -> Result<String, DetectorError> {
+    let wallet_count = solana_wallet_pool_size_from_env()?;
+    let data = generate_wallet_pool_json(wallet_count)?;
+    let path_ref = Path::new(path);
+
+    if let Some(parent) = path_ref
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DetectorError::InvalidConfig(format!(
+                "Failed to create Solana wallet pool directory '{}': {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let write_err = |e: std::io::Error| {
+        DetectorError::InvalidConfig(format!(
+            "Failed to write Solana wallet pool file '{}': {e}",
+            path
+        ))
+    };
+
+    // `create_new` claims the path atomically, so two processes racing to
+    // bootstrap can never each generate a pool and have one silently overwrite
+    // the other's keys. The loser re-reads the winner's file.
+    match OpenOptions::new().write(true).create_new(true).open(path_ref) {
+        Ok(mut file) => {
+            file.write_all(data.as_bytes()).map_err(write_err)?;
+            file.write_all(b"\n").map_err(write_err)?;
+            // This file is the only copy of these private keys; a rename that
+            // reaches the disk ahead of its data would strand every deposit
+            // made to them.
+            file.sync_all().map_err(write_err)?;
+            drop(file);
+            crate::persistence::fsync_parent_dir(path);
+
+            log::warn!(
+                "[SOL] Created missing wallet pool file '{}' with {} generated wallets. Back up this file securely.",
+                path,
+                wallet_count
+            );
+            Ok(data)
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            std::fs::read_to_string(path).map_err(|e| {
+                DetectorError::InvalidConfig(format!(
+                    "Failed to read Solana wallet pool file '{}': {e}",
+                    path
+                ))
+            })
+        }
+        Err(e) => Err(DetectorError::InvalidConfig(format!(
+            "Failed to create Solana wallet pool file '{}': {e}",
+            path
+        ))),
+    }
+}
+
+fn generate_wallet_pool_json(wallet_count: usize) -> Result<String, DetectorError> {
+    if wallet_count == 0 || wallet_count > DEFAULT_SOLANA_MAX_POOL_SIZE {
+        return Err(DetectorError::InvalidConfig(format!(
+            "SOLANA_WALLET_POOL_SIZE must be between 1 and {DEFAULT_SOLANA_MAX_POOL_SIZE}"
+        )));
+    }
+
+    let entries = (0..wallet_count)
+        .map(|_| {
+            let keypair = Keypair::new();
+            serde_json::json!({
+                "address": keypair.pubkey().to_string(),
+                "private_key": bs58::encode(keypair.to_bytes()).into_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::to_string_pretty(&serde_json::json!({ "wallets": entries })).map_err(Into::into)
+}
+
+fn solana_wallet_pool_size_from_env() -> Result<usize, DetectorError> {
+    match std::env::var("SOLANA_WALLET_POOL_SIZE") {
+        Ok(value) if value.trim().is_empty() => Ok(DEFAULT_SOLANA_WALLET_POOL_SIZE),
+        Ok(value) => value.trim().parse::<usize>().map_err(|_| {
+            DetectorError::InvalidConfig(format!(
+                "SOLANA_WALLET_POOL_SIZE must be between 1 and {DEFAULT_SOLANA_MAX_POOL_SIZE}"
+            ))
+        }),
+        Err(_) => Ok(DEFAULT_SOLANA_WALLET_POOL_SIZE),
+    }
 }
 
 pub fn find_wallet(wallets: &[ManagedSolanaWallet], address: &str) -> Option<ManagedSolanaWallet> {
@@ -1004,4 +1114,70 @@ fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        Path::new("target")
+            .join("solana_pool_tests")
+            .join(format!(
+                "{name}_{}_{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ))
+            .join("solana_wallets.json")
+    }
+
+    /// A missing pool file used to be a hard boot failure on Solana while the
+    /// EVM chains bootstrapped themselves. It must now generate the file,
+    /// including any parent directory the default path implies.
+    #[test]
+    fn creates_missing_solana_wallet_pool_file() {
+        let path = scratch_path("create");
+        let path_string = path.to_string_lossy().to_string();
+
+        let wallets = load_wallet_pool(&path_string).expect("wallet pool should load");
+
+        assert_eq!(wallets.len(), DEFAULT_SOLANA_WALLET_POOL_SIZE);
+        assert!(path.exists());
+
+        // Reloading must return the same keys, not generate a second pool —
+        // otherwise every restart would strand the previous deposits.
+        let reloaded = load_wallet_pool(&path_string).expect("created pool should reload");
+        assert_eq!(reloaded.len(), wallets.len());
+        assert_eq!(reloaded[0].address, wallets[0].address);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn generated_pool_entries_round_trip_through_the_parser() {
+        let json = generate_wallet_pool_json(3).expect("generation should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let entries = parsed["wallets"].as_array().expect("wallets array");
+        assert_eq!(entries.len(), 3);
+
+        // The address written to the file must match the key it was derived
+        // from; load_wallet_pool rejects a mismatch, so a wrong encoding here
+        // would only surface at boot.
+        for entry in entries {
+            let secret = entry["private_key"].as_str().expect("private key string");
+            let bytes = bs58::decode(secret).into_vec().expect("base58 secret");
+            assert_eq!(bytes.len(), 64);
+            let keypair = Keypair::try_from(bytes.as_slice()).expect("valid keypair");
+            assert_eq!(keypair.pubkey().to_string(), entry["address"]);
+        }
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_generated_pool_size() {
+        assert!(generate_wallet_pool_json(0).is_err());
+        assert!(generate_wallet_pool_json(DEFAULT_SOLANA_MAX_POOL_SIZE + 1).is_err());
+    }
 }

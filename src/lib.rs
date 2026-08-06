@@ -1,5 +1,6 @@
 pub mod bitcoin_sweep;
 pub mod blockstream;
+pub mod config;
 pub mod derivation;
 pub mod env_utils;
 pub mod error;
@@ -22,6 +23,11 @@ pub mod webhook;
 
 pub use bitcoin_sweep::{BitcoinSweepConfig, BitcoinSweepResult};
 pub use blockstream::ChainDetector;
+pub use config::{
+    ChainReadiness, MissingSetting, SETTINGS, Setting, SettingSchema, build_config,
+    build_evm_config, build_solana_config, chain_enable_key, chain_is_requested,
+    print_readiness_report, settings_schema,
+};
 pub use error::DetectorError;
 pub use ethereum::{
     Erc20TokenConfig, EthereumConfig, EthereumDetector, default_erc20_tokens, parse_erc20_tokens,

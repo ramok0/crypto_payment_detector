@@ -23,10 +23,13 @@ pub fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
-/// Env var prefix used for `chain_env_var` lookups. Note this is `SOLANA` for
-/// Solana (matching the existing `SOLANA_*` env vars in the codebase) — *not*
-/// `SOL` — so callers like [`chain_env_var`] resolve `SOLANA_RPC_URL` rather
-/// than `SOL_RPC_URL`.
+/// Env var prefix used for `chain_env_var` lookups.
+///
+/// Solana maps to `SOL`, *not* `SOLANA`: [`chain_env_var`] resolves
+/// `SOL_POLL_INTERVAL`, `SOL_STATE_FILE`, `SOL_MIN_CONFIRMATIONS`. The
+/// `SOLANA_*` variables (`SOLANA_RPC_URL`, `SOLANA_DEPOSIT_ADDRESS`,
+/// `SOLANA_WALLET_POOL_FILE`, …) do not follow this convention and are spelled
+/// out in full by their callers — see the catalog in [`crate::config`].
 pub fn chain_env_prefix(chain: Chain) -> &'static str {
     match chain {
         Chain::Bitcoin => "BTC",

@@ -2211,30 +2211,51 @@ impl PaymentDetector for EthereumDetector {
     }
 }
 
-pub fn default_erc20_tokens() -> Vec<Erc20TokenConfig> {
+/// Stablecoin contracts for `chain`, used when `{P}_ERC20_TOKENS` is unset or
+/// set to `default`.
+///
+/// Parametrized by chain because the contract addresses genuinely differ: Base
+/// has its own USDC/USDT deployments. Returning the mainnet ones for Base — as
+/// this function used to, unconditionally — meant `BASE_ERC20_TOKENS=default`
+/// silently watched addresses that hold nothing on Base, so token deposits were
+/// never detected and nothing in the logs said why.
+pub fn default_erc20_tokens(chain: Chain) -> Vec<Erc20TokenConfig> {
+    let (usdc, usdt) = match chain {
+        Chain::Base => (
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
+        ),
+        // Ethereum mainnet, and the historical fallback for any other chain.
+        _ => (
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        ),
+    };
+
     vec![
         Erc20TokenConfig {
             symbol: "USDC".into(),
-            contract: Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
-                .expect("valid USDC contract"),
+            contract: Address::from_str(usdc).expect("valid USDC contract"),
             decimals: 6,
         },
         Erc20TokenConfig {
             symbol: "USDT".into(),
-            contract: Address::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7")
-                .expect("valid USDT contract"),
+            contract: Address::from_str(usdt).expect("valid USDT contract"),
             decimals: 6,
         },
     ]
 }
 
-pub fn parse_erc20_tokens(value: Option<&str>) -> Result<Vec<Erc20TokenConfig>, DetectorError> {
+pub fn parse_erc20_tokens(
+    value: Option<&str>,
+    chain: Chain,
+) -> Result<Vec<Erc20TokenConfig>, DetectorError> {
     let Some(value) = value else {
-        return Ok(default_erc20_tokens());
+        return Ok(default_erc20_tokens(chain));
     };
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-        return Ok(default_erc20_tokens());
+        return Ok(default_erc20_tokens(chain));
     }
     if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("off") {
         return Ok(Vec::new());
@@ -2553,6 +2574,55 @@ fn is_rpc_rate_limit_error(err: &DetectorError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `default` used to resolve to the Ethereum mainnet contracts on every
+    /// chain, so `BASE_ERC20_TOKENS=default` silently watched addresses that
+    /// hold nothing on Base and no token deposit was ever detected.
+    #[test]
+    fn default_erc20_tokens_are_chain_specific() {
+        let mainnet = default_erc20_tokens(Chain::Ethereum);
+        let base = default_erc20_tokens(Chain::Base);
+
+        assert_eq!(mainnet.len(), 2);
+        assert_eq!(base.len(), 2);
+        assert_eq!(base[0].symbol, "USDC");
+        assert_eq!(base[1].symbol, "USDT");
+
+        assert_ne!(mainnet[0].contract, base[0].contract);
+        assert_ne!(mainnet[1].contract, base[1].contract);
+
+        assert_eq!(
+            format!("{:?}", base[0].contract).to_lowercase(),
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        );
+        assert_eq!(
+            format!("{:?}", base[1].contract).to_lowercase(),
+            "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
+        );
+    }
+
+    #[test]
+    fn default_keyword_follows_the_chain() {
+        let contracts = |tokens: &[Erc20TokenConfig]| {
+            tokens.iter().map(|token| token.contract).collect::<Vec<_>>()
+        };
+        let expected = contracts(&default_erc20_tokens(Chain::Base));
+
+        let explicit = parse_erc20_tokens(Some("default"), Chain::Base).expect("valid config");
+        assert_eq!(contracts(&explicit), expected);
+
+        let implicit = parse_erc20_tokens(None, Chain::Base).expect("valid config");
+        assert_eq!(contracts(&implicit), expected);
+
+        // Base must not inherit the mainnet defaults through this path either.
+        assert_ne!(
+            contracts(&explicit),
+            contracts(&default_erc20_tokens(Chain::Ethereum))
+        );
+
+        let disabled = parse_erc20_tokens(Some("none"), Chain::Base).expect("valid config");
+        assert!(disabled.is_empty());
+    }
 
     #[test]
     fn native_gas_tank_top_up_is_internal() {
