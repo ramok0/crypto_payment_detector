@@ -485,7 +485,11 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "{P}_EXPLORER_API_URLS",
-        aliases: &["{P}_EXPLORER_API_URL", "EXPLORER_API_URLS", "EXPLORER_API_URL"],
+        aliases: &[
+            "{P}_EXPLORER_API_URL",
+            "EXPLORER_API_URLS",
+            "EXPLORER_API_URL",
+        ],
         scope: Scope::Prefixed(UTXO_CHAINS),
         kind: Kind::Text,
         requirement: Requirement::Optional,
@@ -1063,7 +1067,9 @@ pub fn print_readiness_report(report: &[ChainReadiness]) {
     eprintln!();
     eprintln!("=== Detector configuration ===");
     if report.is_empty() {
-        eprintln!("  No chain requested. Set CHAIN (bitcoin, litecoin, solana, ethereum, base, all).");
+        eprintln!(
+            "  No chain requested. Set CHAIN (bitcoin, litecoin, solana, ethereum, base, all)."
+        );
     }
     for entry in report {
         if entry.is_enabled() {

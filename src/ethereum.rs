@@ -2604,7 +2604,10 @@ mod tests {
     #[test]
     fn default_keyword_follows_the_chain() {
         let contracts = |tokens: &[Erc20TokenConfig]| {
-            tokens.iter().map(|token| token.contract).collect::<Vec<_>>()
+            tokens
+                .iter()
+                .map(|token| token.contract)
+                .collect::<Vec<_>>()
         };
         let expected = contracts(&default_erc20_tokens(Chain::Base));
 

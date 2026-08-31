@@ -210,7 +210,11 @@ fn create_wallet_pool_file(path: &str) -> Result<String, DetectorError> {
     // `create_new` claims the path atomically, so two processes racing to
     // bootstrap can never each generate a pool and have one silently overwrite
     // the other's keys. The loser re-reads the winner's file.
-    match OpenOptions::new().write(true).create_new(true).open(path_ref) {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path_ref)
+    {
         Ok(mut file) => {
             file.write_all(data.as_bytes()).map_err(write_err)?;
             file.write_all(b"\n").map_err(write_err)?;

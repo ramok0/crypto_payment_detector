@@ -250,12 +250,14 @@ async fn main() {
                 let tokens = parse_erc20_tokens(std::env::var(&tokens_env).ok().as_deref(), chain)
                     .unwrap_or_else(|e| panic!("Invalid {tokens_env}: {e}"));
                 let wallets = shared_ethereum_wallets(
-                    load_ethereum_wallet_pool(chain, &config.wallet_pool_file)
-                        .unwrap_or_else(|e| panic!("Failed to load {} wallet pool: {e}", chain.name())),
+                    load_ethereum_wallet_pool(chain, &config.wallet_pool_file).unwrap_or_else(
+                        |e| panic!("Failed to load {} wallet pool: {e}", chain.name()),
+                    ),
                 );
                 let detector = Arc::new(
-                    EthereumDetector::new(config, tokens, wallets)
-                        .unwrap_or_else(|e| panic!("Failed to create {} detector: {e}", chain.ticker())),
+                    EthereumDetector::new(config, tokens, wallets).unwrap_or_else(|e| {
+                        panic!("Failed to create {} detector: {e}", chain.ticker())
+                    }),
                 );
 
                 readiness.push(ChainReadiness::enabled(
