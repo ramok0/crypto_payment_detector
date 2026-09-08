@@ -153,3 +153,34 @@ fn legacy_cursor_only_state_loads_without_resetting_height() {
     assert_eq!(state.last_scanned_height, Some(100));
     assert!(state.pending.is_empty());
 }
+
+#[tokio::test]
+async fn legacy_credited_txid_is_not_credited_again_after_upgrade() {
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let log = events.clone();
+    let server = mock_server(move |body| {
+        log.lock().unwrap().push(body);
+        async { (StatusCode::OK, Json(json!({}))) }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let first = detector(&dir, Chain::Bitcoin, &server.url);
+    let payments = batched_payments(&first);
+    let legacy = json!({
+        "last_scanned_height": 100,
+        "known_block_hashes": {},
+        "notified_confirmed": [payments[0].txid],
+        "pending": [{"payment": payments[0], "block_height":100}]
+    });
+    std::fs::write(
+        &first.config.state_file,
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    drop(first);
+    let restarted = detector(&dir, Chain::Bitcoin, &server.url);
+    restarted.enqueue_or_confirm(payments).unwrap();
+    restarted.process_confirmed(103).await.unwrap();
+    assert!(events.lock().unwrap().is_empty());
+    assert!(restarted.state.lock().unwrap().pending.is_empty());
+}

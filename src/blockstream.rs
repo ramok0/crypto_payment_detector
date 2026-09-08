@@ -286,7 +286,14 @@ impl ChainDetector {
             explorer_list
         );
 
-        let persisted = crate::persistence::load_state(&config.state_file)?;
+        let mut persisted = crate::persistence::load_state(&config.state_file)?;
+        // Older releases keyed pending/credited webhooks by txid. Retain that
+        // identity across upgrades so an existing backend credit stays final.
+        for pending in &mut persisted.pending {
+            if pending.payment.event_id.is_none() {
+                pending.payment.event_id = Some(pending.payment.txid.clone());
+            }
+        }
         Ok(Self {
             config,
             client,
@@ -802,10 +809,10 @@ impl ChainDetector {
                 let key = utxo_payment_key(&payment.txid, &payment.address, payment.chain);
                 payment.event_id = Some(key.clone());
                 if state.notified_confirmed.contains(&key)
-                    || state
-                        .pending
-                        .iter()
-                        .any(|p| p.payment.event_id.as_ref() == Some(&key))
+                    || state.notified_confirmed.contains(&payment.txid)
+                    || state.pending.iter().any(|p| {
+                        p.payment.txid == payment.txid && p.payment.address == payment.address
+                    })
                 {
                     continue;
                 }
@@ -847,11 +854,16 @@ impl ChainDetector {
         pending: &PendingPayment,
         tip_height: u64,
     ) -> Result<(), DetectorError> {
-        let key = utxo_payment_key(
-            &pending.payment.txid,
-            &pending.payment.address,
-            self.config.chain,
-        );
+        let key = pending
+            .payment
+            .event_id
+            .clone()
+            .unwrap_or_else(|| pending.payment.txid.clone());
+        let already_credited = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.notified_confirmed.contains(&key)
+                || state.notified_confirmed.contains(&pending.payment.txid)
+        };
         let mut payment = pending.payment.clone();
         payment.event_id = Some(key.clone());
         payment.confirmations = if tip_height >= pending.block_height {
@@ -859,7 +871,7 @@ impl ChainDetector {
         } else {
             0
         };
-        if !pending.detected_notified {
+        if !pending.detected_notified && !already_credited {
             send_webhook(
                 &self.webhook_client,
                 &self.config.webhook_url,
@@ -895,12 +907,6 @@ impl ChainDetector {
                 payment.sweep_txid = result.txid.clone();
             }
         }
-        let already_credited = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .notified_confirmed
-            .contains(&key);
         if !already_credited {
             if let Ok(price) = self.price_fetcher.get_price().await {
                 payment.coin_price = Some(price);
@@ -983,7 +989,7 @@ impl ChainDetector {
         // also catch duplicates if a webhook somehow re-fires.
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.notified_confirmed.contains(&key) {
+            if state.notified_confirmed.contains(&key) || state.notified_confirmed.contains(txid) {
                 log::info!(
                     "[{}] /recover-txid: txid={txid} already credited (user_id={user_id})",
                     chain.ticker()
@@ -1099,7 +1105,7 @@ impl ChainDetector {
 
         let credited = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.notified_confirmed.contains(&key)
+            state.notified_confirmed.contains(&key) || state.notified_confirmed.contains(txid)
         };
         let status = if credited {
             RecoverStatus::Credited

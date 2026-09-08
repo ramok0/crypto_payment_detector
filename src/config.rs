@@ -746,7 +746,7 @@ pub const SETTINGS: &[Setting] = &[
         requirement: Requirement::Optional,
         default: DefaultValue::Static("default"),
         secret: false,
-        description: "SYMBOL:mint:decimals list, or default (mainnet USDC) or none.",
+        description: "SYMBOL:mint:decimals list, or default (mainnet USDC + CASH) or none.",
     },
     Setting {
         key: "SOLANA_RESERVATION_TTL_SECS",
@@ -857,7 +857,7 @@ pub const SETTINGS: &[Setting] = &[
         requirement: Requirement::Optional,
         default: DefaultValue::Static("default"),
         secret: false,
-        description: "SYMBOL:0xcontract:decimals list, or default (USDC + USDT for that chain) or none.",
+        description: "SYMBOL:0xcontract:decimals list, or default (Ethereum USDC + USDT; Base USDC) or none.",
     },
     Setting {
         key: "{P}_RESERVATION_STORE",
