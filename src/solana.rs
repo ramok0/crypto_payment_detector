@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::Instruction;
@@ -74,6 +75,8 @@ struct SolanaPendingPayment {
     asset_decimals: Option<u8>,
     #[serde(default)]
     token_mint: Option<String>,
+    #[serde(default)]
+    detected_notified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -144,6 +147,9 @@ pub struct SolanaDetector {
     sol_usd_fetcher: PriceFetcher,
     sol_eur_fetcher: PriceFetcher,
     state: Arc<Mutex<SolanaState>>,
+    scan_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    credit_lock: tokio::sync::Mutex<()>,
+    scan_concurrency: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,6 +388,8 @@ impl SolanaDetector {
         }
 
         let mut rpc_builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(0)
             .connection_verbose(false);
         if let Some(ref proxy_url) = config.proxy_url {
@@ -405,7 +413,7 @@ impl SolanaDetector {
                 DetectorError::InvalidConfig(format!("Failed to build webhook client: {e}"))
             })?;
 
-        let state = load_solana_state(&config.state_file);
+        let state = load_solana_state(&config.state_file)?;
 
         Ok(Self {
             price_fetcher: PriceFetcher::new(
@@ -424,6 +432,13 @@ impl SolanaDetector {
             rpc_client,
             webhook_client,
             state: Arc::new(Mutex::new(state)),
+            scan_locks: Mutex::new(HashMap::new()),
+            credit_lock: tokio::sync::Mutex::new(()),
+            scan_concurrency: std::env::var("SOLANA_SCAN_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4)
+                .clamp(1, 32),
         })
     }
 
@@ -440,16 +455,6 @@ impl SolanaDetector {
             .iter()
             .map(|t| (t.symbol.clone(), t.mint.to_string(), t.decimals))
             .collect()
-    }
-
-    /// Poison-tolerant state lock.
-    ///
-    /// Without this, a panic anywhere under the lock poisons it for good and
-    /// every later `lock().unwrap()` panics too — turning one bad cycle into a
-    /// permanently dead detector. The guarded value is plain data with no
-    /// invariant a partial update can break, so recovering it is safe.
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, SolanaState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn gas_tank_address(&self) -> Option<String> {
@@ -524,7 +529,7 @@ impl SolanaDetector {
     /// queued for processing.
     pub async fn confirm_pending_payments(&self) -> Result<usize, DetectorError> {
         let pending_count = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.pending.len()
         };
         if pending_count == 0 {
@@ -655,19 +660,9 @@ impl SolanaDetector {
         // because the cycle never reaches the credit step. Each failure is
         // logged at WARN; the next cycle retries the same reservations.
         let scan_start = std::time::Instant::now();
-        let mut failed_scans: usize = 0;
-        for reservation in &reservations {
-            if let Err(error) = self
-                .process_reservation(reservation, current_slot, spot_price)
-                .await
-            {
-                failed_scans += 1;
-                log::warn!(
-                    "[SOL] process_cycle: scan failed for {} (will retry next cycle): {error}",
-                    reservation.address
-                );
-            }
-        }
+        let failed_scans = self
+            .scan_reservations(&reservations, current_slot, spot_price)
+            .await;
         let scan_elapsed = scan_start.elapsed();
         if failed_scans > 0 {
             log::warn!(
@@ -681,7 +676,8 @@ impl SolanaDetector {
         // the next cycle (or the Helius webhook path) retry. Returning Err
         // here would skip gas tank maintenance for no good reason.
         let credits_start = std::time::Instant::now();
-        if let Err(error) = self.process_credits(current_slot).await {
+        let credit_slot = self.get_current_slot().await.unwrap_or(current_slot);
+        if let Err(error) = self.process_credits(credit_slot).await {
             log::warn!(
                 "[SOL] process_cycle: process_credits errored (will retry next cycle): {error}"
             );
@@ -713,6 +709,33 @@ impl SolanaDetector {
         Ok(())
     }
 
+    async fn scan_reservations(
+        &self,
+        reservations: &[SolanaReservation],
+        current_slot: u64,
+        spot_price: Option<f64>,
+    ) -> usize {
+        let mut failed = 0;
+        let owned = reservations.to_vec();
+        let mut scans = stream::iter(owned.into_iter().map(|reservation| async move {
+            let result = self
+                .process_reservation(&reservation, current_slot, spot_price)
+                .await;
+            (reservation, result)
+        }))
+        .buffer_unordered(self.scan_concurrency);
+        while let Some((reservation, result)) = scans.next().await {
+            if let Err(error) = result {
+                failed += 1;
+                log::warn!(
+                    "[SOL] Scan failed for {} (will retry next cycle): {error}",
+                    reservation.address
+                );
+            }
+        }
+        failed
+    }
+
     async fn maybe_maintain_gas_tank(&self) -> Result<(), DetectorError> {
         let Some(gas_tank_pubkey) = self.gas_tank_pubkey else {
             return Ok(());
@@ -728,7 +751,7 @@ impl SolanaDetector {
         let interval =
             i64::try_from(self.config.gas_tank_check_interval_secs.max(1)).unwrap_or(i64::MAX);
         let throttle_elapsed = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state
                 .gas_tank_last_maintenance_unix
                 .map_or(true, |last| now.saturating_sub(last) >= interval)
@@ -751,7 +774,7 @@ impl SolanaDetector {
         }
 
         {
-            let mut state = self.lock_state();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.gas_tank_last_maintenance_unix = Some(now);
         }
         self.persist_state()
@@ -1100,8 +1123,18 @@ impl SolanaDetector {
         current_slot: u64,
         spot_price: Option<f64>,
     ) -> Result<(), DetectorError> {
-        self.process_native_for_reservation(reservation, current_slot, spot_price)
-            .await?;
+        let scan_lock = {
+            let mut locks = self.scan_locks.lock().unwrap();
+            locks
+                .entry(reservation.address.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = scan_lock.lock().await;
+        let mut first_error = self
+            .process_native_for_reservation(reservation, current_slot, spot_price)
+            .await
+            .err();
 
         let owner = match Pubkey::from_str(&reservation.address) {
             Ok(owner) => owner,
@@ -1116,17 +1149,24 @@ impl SolanaDetector {
 
         let tokens = self.tokens.clone();
         for token in &tokens {
-            self.process_token_for_reservation(reservation, &owner, token, current_slot)
-                .await?;
+            if let Err(error) = self
+                .process_token_for_reservation(reservation, &owner, token, current_slot)
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
         }
 
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn process_native_for_reservation(
         &self,
         reservation: &SolanaReservation,
-        current_slot: u64,
+        _current_slot: u64,
         spot_price: Option<f64>,
     ) -> Result<(), DetectorError> {
         let new_signatures = self.get_new_signatures(&reservation.address).await?;
@@ -1139,7 +1179,7 @@ impl SolanaDetector {
                 Ok(tx) => tx,
                 Err(e) => {
                     log::warn!("[SOL] Failed to load tx {}: {}", sig.signature, e);
-                    continue;
+                    return Err(e);
                 }
             };
 
@@ -1168,71 +1208,18 @@ impl SolanaDetector {
                 }
             }
 
-            let confirmations = current_slot.saturating_sub(tx.slot) + 1;
-            let dedup_key = payment_key(&sig.signature, &reservation.address, None);
-            let detected = DetectedPayment {
-                chain: Chain::Solana,
-                ticker: Chain::Solana.ticker().to_string(),
-                txid: sig.signature.clone(),
+            self.queue_payment(SolanaPendingPayment {
+                signature: sig.signature.clone(),
+                slot: tx.slot,
+                amount_base_units: amount_lamports,
                 address: reservation.address.clone(),
-                user_id: Some(reservation.user_id.clone()),
-                amount_sat: amount_lamports,
-                amount_coin: amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64,
-                confirmations,
-                block_height: Some(tx.slot),
-                derivation_index: reservation.wallet_index,
-                memo: None,
-                swept_to_address: None,
-                swept_amount_sat: None,
-                swept_amount_coin: None,
-                sweep_txid: None,
-                fiat_amount: None,
-                fiat_currency: None,
-                coin_price: None,
-                // Composite event_id makes the backend's idempotency lock
-                // per-(sig, addr, asset) instead of per-sig: two deposits
-                // in the same tx will produce two distinct credit rows.
-                event_id: Some(dedup_key.clone()),
-                log_index: None,
+                user_id: reservation.user_id.clone(),
+                wallet_index: reservation.wallet_index,
                 asset: None,
                 asset_decimals: None,
-                amount_base_units: None,
-                swept_amount_base_units: None,
-                token_contract: None,
-            };
-
-            let event = WebhookEvent::PaymentDetected(detected.clone());
-            send_webhook(
-                &self.webhook_client,
-                &self.config.webhook_url,
-                &self.config.webhook_hmac_secret,
-                &event,
-            )
-            .await?;
-
-            {
-                let mut state = self.lock_state();
-                let already_pending = state.pending.iter().any(|p| {
-                    p.signature == sig.signature
-                        && p.address == reservation.address
-                        && p.asset.is_none()
-                });
-                let already_credited = state.credited_payments.contains(&dedup_key);
-
-                if !already_pending && !already_credited {
-                    state.pending.push(SolanaPendingPayment {
-                        signature: sig.signature.clone(),
-                        slot: tx.slot,
-                        amount_base_units: amount_lamports,
-                        address: reservation.address.clone(),
-                        user_id: reservation.user_id.clone(),
-                        wallet_index: reservation.wallet_index,
-                        asset: None,
-                        asset_decimals: None,
-                        token_mint: None,
-                    });
-                }
-            }
+                token_mint: None,
+                detected_notified: false,
+            })?;
 
             self.update_last_processed_signature(&reservation.address, &sig.signature)?;
         }
@@ -1245,7 +1232,7 @@ impl SolanaDetector {
         reservation: &SolanaReservation,
         owner: &Pubkey,
         token: &SplTokenConfig,
-        current_slot: u64,
+        _current_slot: u64,
     ) -> Result<(), DetectorError> {
         let ata = self.ata_for_wallet(owner, &token.mint);
         let ata_string = ata.to_string();
@@ -1279,7 +1266,7 @@ impl SolanaDetector {
                 Ok(tx) => tx,
                 Err(e) => {
                     log::warn!("[SOL] Failed to load token tx {}: {}", sig.signature, e);
-                    continue;
+                    return Err(e);
                 }
             };
 
@@ -1321,71 +1308,18 @@ impl SolanaDetector {
                 }
             }
 
-            let confirmations = current_slot.saturating_sub(tx.slot) + 1;
-            let dedup_key = payment_key(
-                &sig.signature,
-                &reservation.address,
-                Some(token.symbol.as_str()),
-            );
-            let detected = DetectedPayment {
-                chain: Chain::Solana,
-                ticker: token.symbol.clone(),
-                txid: sig.signature.clone(),
+            self.queue_payment(SolanaPendingPayment {
+                signature: sig.signature.clone(),
+                slot: tx.slot,
+                amount_base_units,
                 address: reservation.address.clone(),
-                user_id: Some(reservation.user_id.clone()),
-                amount_sat: amount_base_units,
-                amount_coin,
-                confirmations,
-                block_height: Some(tx.slot),
-                derivation_index: reservation.wallet_index,
-                memo: None,
-                swept_to_address: None,
-                swept_amount_sat: None,
-                swept_amount_coin: None,
-                sweep_txid: None,
-                fiat_amount: None,
-                fiat_currency: None,
-                coin_price: None,
-                event_id: Some(dedup_key.clone()),
-                log_index: None,
+                user_id: reservation.user_id.clone(),
+                wallet_index: reservation.wallet_index,
                 asset: Some(token.symbol.clone()),
                 asset_decimals: Some(token.decimals),
-                amount_base_units: Some(amount_base_units.to_string()),
-                swept_amount_base_units: None,
-                token_contract: Some(mint_string.clone()),
-            };
-
-            send_webhook(
-                &self.webhook_client,
-                &self.config.webhook_url,
-                &self.config.webhook_hmac_secret,
-                &WebhookEvent::PaymentDetected(detected),
-            )
-            .await?;
-
-            {
-                let mut state = self.lock_state();
-                let already_pending = state.pending.iter().any(|p| {
-                    p.signature == sig.signature
-                        && p.address == reservation.address
-                        && p.asset.as_deref() == Some(token.symbol.as_str())
-                });
-                let already_credited = state.credited_payments.contains(&dedup_key);
-
-                if !already_pending && !already_credited {
-                    state.pending.push(SolanaPendingPayment {
-                        signature: sig.signature.clone(),
-                        slot: tx.slot,
-                        amount_base_units,
-                        address: reservation.address.clone(),
-                        user_id: reservation.user_id.clone(),
-                        wallet_index: reservation.wallet_index,
-                        asset: Some(token.symbol.clone()),
-                        asset_decimals: Some(token.decimals),
-                        token_mint: Some(mint_string.clone()),
-                    });
-                }
-            }
+                token_mint: Some(mint_string.clone()),
+                detected_notified: false,
+            })?;
 
             self.update_last_processed_signature(&ata_string, &sig.signature)?;
         }
@@ -1394,8 +1328,10 @@ impl SolanaDetector {
     }
 
     async fn process_credits(&self, current_slot: u64) -> Result<(), DetectorError> {
+        let _guard = self.credit_lock.lock().await;
+        self.persist_state()?;
         let pending = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.pending.clone()
         };
 
@@ -1424,15 +1360,37 @@ impl SolanaDetector {
         current_slot: u64,
     ) -> Result<(), DetectorError> {
         {
-            let confirmations = current_slot.saturating_sub(entry.slot) + 1;
-            if confirmations < self.config.min_confirmations {
+            let detection = self.pending_detection(&entry, current_slot);
+            let key = detection.event_id.clone().unwrap();
+            if !entry.detected_notified {
+                send_webhook(
+                    &self.webhook_client,
+                    &self.config.webhook_url,
+                    &self.config.webhook_hmac_secret,
+                    &WebhookEvent::PaymentDetected(detection.clone()),
+                )
+                .await?;
+                {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(p) = state
+                        .pending
+                        .iter_mut()
+                        .find(|p| payment_key(&p.signature, &p.address, p.asset.as_deref()) == key)
+                    {
+                        p.detected_notified = true;
+                    }
+                }
+                self.persist_state()?;
+            }
+            let confirmations = detection.confirmations;
+            if confirmations < self.config.min_confirmations.max(1) {
                 return Ok(());
             }
 
             let entry_dedup_key =
                 payment_key(&entry.signature, &entry.address, entry.asset.as_deref());
             let already_credited = {
-                let state = self.lock_state();
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.credited_payments.contains(&entry_dedup_key)
             };
 
@@ -1679,7 +1637,7 @@ impl SolanaDetector {
                 .await?;
 
                 {
-                    let mut state = self.lock_state();
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.credited_payments.insert(entry_dedup_key.clone());
                 }
                 self.persist_state()?;
@@ -1687,7 +1645,7 @@ impl SolanaDetector {
 
             if !was_deferred {
                 {
-                    let mut state = self.lock_state();
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     // Match by the same composite key we used to insert the
                     // pending entry — multiple entries can share a signature
                     // when one tx credits several of our addresses, and we
@@ -2359,7 +2317,7 @@ impl SolanaDetector {
 
     async fn get_new_signatures(&self, address: &str) -> Result<Vec<SignatureInfo>, DetectorError> {
         let last_processed = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state
                 .addresses
                 .get(address)
@@ -2416,18 +2374,25 @@ impl SolanaDetector {
         &self,
         signature: &str,
     ) -> Result<RpcTransactionResult, DetectorError> {
-        self.rpc_call(
-            "getTransaction",
-            serde_json::json!([
-                signature,
-                {
-                    "encoding": "jsonParsed",
-                    "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0
-                }
-            ]),
-        )
-        .await
+        let tx: RpcTransactionResult = self
+            .rpc_call(
+                "getTransaction",
+                serde_json::json!([
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0
+                    }
+                ]),
+            )
+            .await?;
+        if tx.meta.is_none() {
+            return Err(DetectorError::ApiError(format!(
+                "Transaction {signature} has no metadata; retrying"
+            )));
+        }
+        Ok(tx)
     }
 
     fn extract_positive_lamports_to_address(
@@ -2465,8 +2430,8 @@ impl SolanaDetector {
 
         let post = meta.post_token_balances.iter().find(|balance| {
             balance.mint == mint
-                && (matches_owner_balance(balance, owner)
-                    || account_at_index(result, balance.account_index) == Some(ata))
+                && account_at_index(result, balance.account_index) == Some(ata)
+                && (balance.owner.is_none() || matches_owner_balance(balance, owner))
         })?;
 
         let pre_amount = meta
@@ -2493,7 +2458,7 @@ impl SolanaDetector {
         signature: &str,
     ) -> Result<(), DetectorError> {
         {
-            let mut state = self.lock_state();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state
                 .addresses
                 .entry(address.to_string())
@@ -2505,11 +2470,8 @@ impl SolanaDetector {
     }
 
     fn persist_state(&self) -> Result<(), DetectorError> {
-        let state = {
-            let state = self.lock_state();
-            state.clone()
-        };
-        crate::persistence::write_json_atomic(&self.config.state_file, &state)
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        crate::persistence::save_json_state(&self.config.state_file, &*state)
     }
 
     /// On-demand TXID recovery. Called when a user submits a Solana
@@ -2699,68 +2661,18 @@ impl SolanaDetector {
         tx: &RpcTransactionResult,
         amount_lamports: u64,
     ) -> Result<(), DetectorError> {
-        let dedup_key = payment_key(signature, &reservation.address, None);
-        let detected = DetectedPayment {
-            chain: Chain::Solana,
-            ticker: Chain::Solana.ticker().to_string(),
-            txid: signature.to_string(),
+        self.queue_payment(SolanaPendingPayment {
+            signature: signature.to_string(),
+            slot: tx.slot,
+            amount_base_units: amount_lamports,
             address: reservation.address.clone(),
-            user_id: Some(reservation.user_id.clone()),
-            amount_sat: amount_lamports,
-            amount_coin: amount_lamports as f64 / Chain::Solana.sats_per_unit() as f64,
-            confirmations: 1,
-            block_height: Some(tx.slot),
-            derivation_index: reservation.wallet_index,
-            memo: None,
-            swept_to_address: None,
-            swept_amount_sat: None,
-            swept_amount_coin: None,
-            sweep_txid: None,
-            fiat_amount: None,
-            fiat_currency: None,
-            coin_price: None,
-            event_id: Some(dedup_key.clone()),
-            log_index: None,
+            user_id: reservation.user_id.clone(),
+            wallet_index: reservation.wallet_index,
             asset: None,
             asset_decimals: None,
-            amount_base_units: None,
-            swept_amount_base_units: None,
-            token_contract: None,
-        };
-
-        send_webhook(
-            &self.webhook_client,
-            &self.config.webhook_url,
-            &self.config.webhook_hmac_secret,
-            &WebhookEvent::PaymentDetected(detected),
-        )
-        .await?;
-
-        {
-            let mut state = self.lock_state();
-            let already_pending = state.pending.iter().any(|p| {
-                p.signature == signature && p.address == reservation.address && p.asset.is_none()
-            });
-            let already_credited = state.credited_payments.contains(&dedup_key);
-            if !already_pending && !already_credited {
-                state.pending.push(SolanaPendingPayment {
-                    signature: signature.to_string(),
-                    slot: tx.slot,
-                    amount_base_units: amount_lamports,
-                    address: reservation.address.clone(),
-                    user_id: reservation.user_id.clone(),
-                    wallet_index: reservation.wallet_index,
-                    asset: None,
-                    asset_decimals: None,
-                    token_mint: None,
-                });
-            }
-        }
-
-        // Best-effort cursor advance so the regular scan loop doesn't
-        // re-emit a `payment_detected` for the same signature.
-        let _ = self.update_last_processed_signature(&reservation.address, signature);
-        Ok(())
+            token_mint: None,
+            detected_notified: false,
+        })
     }
 
     async fn enqueue_recovered_token(
@@ -2771,20 +2683,57 @@ impl SolanaDetector {
         token: &SplTokenConfig,
         amount_base_units: u64,
     ) -> Result<(), DetectorError> {
-        let mint_string = token.mint.to_string();
-        let amount_coin = amount_base_units as f64 / 10f64.powi(i32::from(token.decimals));
-        let dedup_key = payment_key(signature, &reservation.address, Some(token.symbol.as_str()));
-        let detected = DetectedPayment {
-            chain: Chain::Solana,
-            ticker: token.symbol.clone(),
-            txid: signature.to_string(),
+        self.queue_payment(SolanaPendingPayment {
+            signature: signature.to_string(),
+            slot: tx.slot,
+            amount_base_units,
             address: reservation.address.clone(),
-            user_id: Some(reservation.user_id.clone()),
-            amount_sat: amount_base_units,
-            amount_coin,
-            confirmations: 1,
-            block_height: Some(tx.slot),
-            derivation_index: reservation.wallet_index,
+            user_id: reservation.user_id.clone(),
+            wallet_index: reservation.wallet_index,
+            asset: Some(token.symbol.clone()),
+            asset_decimals: Some(token.decimals),
+            token_mint: Some(token.mint.to_string()),
+            detected_notified: false,
+        })
+    }
+
+    fn queue_payment(&self, entry: SolanaPendingPayment) -> Result<(), DetectorError> {
+        let key = payment_key(&entry.signature, &entry.address, entry.asset.as_deref());
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.credited_payments.contains(&key)
+                && !state
+                    .pending
+                    .iter()
+                    .any(|p| payment_key(&p.signature, &p.address, p.asset.as_deref()) == key)
+            {
+                state.pending.push(entry);
+            }
+        }
+        self.persist_state()
+    }
+
+    fn pending_detection(
+        &self,
+        entry: &SolanaPendingPayment,
+        current_slot: u64,
+    ) -> DetectedPayment {
+        let decimals = entry.asset_decimals.unwrap_or(9);
+        DetectedPayment {
+            chain: Chain::Solana,
+            ticker: entry.asset.clone().unwrap_or_else(|| "SOL".into()),
+            txid: entry.signature.clone(),
+            address: entry.address.clone(),
+            user_id: Some(entry.user_id.clone()),
+            amount_sat: entry.amount_base_units,
+            amount_coin: entry.amount_base_units as f64 / 10f64.powi(i32::from(decimals)),
+            confirmations: if current_slot >= entry.slot {
+                current_slot - entry.slot + 1
+            } else {
+                0
+            },
+            block_height: Some(entry.slot),
+            derivation_index: entry.wallet_index,
             memo: None,
             swept_to_address: None,
             swept_amount_sat: None,
@@ -2793,55 +2742,18 @@ impl SolanaDetector {
             fiat_amount: None,
             fiat_currency: None,
             coin_price: None,
-            event_id: Some(dedup_key.clone()),
+            event_id: Some(payment_key(
+                &entry.signature,
+                &entry.address,
+                entry.asset.as_deref(),
+            )),
             log_index: None,
-            asset: Some(token.symbol.clone()),
-            asset_decimals: Some(token.decimals),
-            amount_base_units: Some(amount_base_units.to_string()),
+            asset: entry.asset.clone(),
+            asset_decimals: entry.asset_decimals,
+            amount_base_units: Some(entry.amount_base_units.to_string()),
             swept_amount_base_units: None,
-            token_contract: Some(mint_string.clone()),
-        };
-
-        send_webhook(
-            &self.webhook_client,
-            &self.config.webhook_url,
-            &self.config.webhook_hmac_secret,
-            &WebhookEvent::PaymentDetected(detected),
-        )
-        .await?;
-
-        {
-            let mut state = self.lock_state();
-            let already_pending = state.pending.iter().any(|p| {
-                p.signature == signature
-                    && p.address == reservation.address
-                    && p.asset.as_deref() == Some(token.symbol.as_str())
-            });
-            let already_credited = state.credited_payments.contains(&dedup_key);
-            if !already_pending && !already_credited {
-                state.pending.push(SolanaPendingPayment {
-                    signature: signature.to_string(),
-                    slot: tx.slot,
-                    amount_base_units,
-                    address: reservation.address.clone(),
-                    user_id: reservation.user_id.clone(),
-                    wallet_index: reservation.wallet_index,
-                    asset: Some(token.symbol.clone()),
-                    asset_decimals: Some(token.decimals),
-                    token_mint: Some(mint_string),
-                });
-            }
+            token_contract: entry.token_mint.clone(),
         }
-
-        let owner = Pubkey::from_str(&reservation.address).map_err(|e| {
-            DetectorError::InvalidConfig(format!(
-                "Invalid reserved Solana address '{}': {e}",
-                reservation.address
-            ))
-        })?;
-        let ata_string = self.ata_for_wallet(&owner, &token.mint).to_string();
-        let _ = self.update_last_processed_signature(&ata_string, signature);
-        Ok(())
     }
 
     async fn run_recovery_credit_cycle(&self) -> Result<(), DetectorError> {
@@ -2860,7 +2772,7 @@ impl SolanaDetector {
     ) -> RecoverResponse {
         let dedup_key = payment_key(signature, address, dedup_asset);
         let credited = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.credited_payments.contains(&dedup_key)
         };
         let status = if credited {
@@ -2937,7 +2849,7 @@ fn account_at_index(result: &RpcTransactionResult, index: u32) -> Option<&str> {
 fn is_usd_pegged_token(symbol: &str) -> bool {
     matches!(
         symbol.trim().to_ascii_uppercase().as_str(),
-        "USDC" | "USDT" | "DAI" | "BUSD" | "TUSD" | "USDP" | "GUSD" | "PYUSD"
+        "USDC" | "USDT" | "DAI" | "BUSD" | "TUSD" | "USDP" | "GUSD" | "PYUSD" | "CASH"
     )
 }
 
@@ -3084,46 +2996,19 @@ fn parse_solana_keypair(value: &str) -> Result<Keypair, String> {
     Keypair::try_from(bytes.as_slice()).map_err(|e| format!("failed to decode keypair: {e}"))
 }
 
-fn load_solana_state(path: &str) -> SolanaState {
-    let file = std::path::Path::new(path);
-    if !file.exists() {
-        log::info!(
-            "[SOL] No persisted state file found at '{}', starting fresh",
-            path
-        );
-        return SolanaState::default();
-    }
-
-    match std::fs::read_to_string(file) {
-        Ok(data) => match serde_json::from_str::<SolanaState>(&data) {
-            Ok(state) => {
-                log::info!(
-                    "[SOL] Loaded state from '{}' with {} pending payment(s) and {} tracked address cursor(s)",
-                    path,
-                    state.pending.len(),
-                    state.addresses.len()
-                );
-                state
-            }
-            Err(e) => {
-                log::warn!(
-                    "[SOL] Failed to parse state file '{}': {} - starting fresh",
-                    path,
-                    e
-                );
-                SolanaState::default()
-            }
-        },
-        Err(e) => {
-            log::warn!(
-                "[SOL] Failed to read state file '{}': {} - starting fresh",
-                path,
-                e
-            );
-            SolanaState::default()
-        }
-    }
+fn load_solana_state(path: &str) -> Result<SolanaState, DetectorError> {
+    let state: SolanaState = crate::persistence::load_json_state(path)?;
+    log::info!(
+        "[SOL] Loaded state with {} pending payment(s) and {} cursors",
+        state.pending.len(),
+        state.addresses.len()
+    );
+    Ok(state)
 }
+
+#[cfg(test)]
+#[path = "tests/solana_detection.rs"]
+mod detection_tests;
 
 #[cfg(test)]
 mod tests {

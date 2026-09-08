@@ -29,7 +29,7 @@ Two binaries:
 - [src/persistence.rs](src/persistence.rs) — atomic JSON state file (`tmp + rename`) for BTC/LTC.
 - [src/derivation.rs](src/derivation.rs) — BTC/LTC `xpub` → P2WPKH address. Handles `Ltub`→`xpub` prefix conversion via custom base58check (the bitcoin crate doesn't natively know about Litecoin extended keys).
 - [src/pricing.rs](src/pricing.rs) — Kraken price fetcher with 30s cache. One `PriceFetcher` per (chain, fiat) pair.
-- [src/webhook.rs](src/webhook.rs) — HMAC-SHA256 signed JSON webhook with infinite exponential-backoff retry. Also Discord webhook helper.
+- [src/webhook.rs](src/webhook.rs) — HMAC-SHA256 signed JSON webhook with bounded retry; durable per-chain pending queues retry failed deliveries on subsequent cycles. Also Discord webhook helper.
 - [src/env_utils.rs](src/env_utils.rs) — env helpers (`chain_env_var`, `proxy_env_var`, `redact_url_credentials`).
 
 ### Chain implementations
@@ -93,12 +93,16 @@ Non-USD-pegged tokens skip the ratio check (no price source) — falls back to "
 Each chain has its own JSON state file. **Every writer goes through `persistence::write_json_atomic`** — write to `.tmp`, `fsync`, `rename`, then `fsync` the parent directory. Plain `tmp + rename` only protects readers from a half-written file; without the fsync the rename can land on disk while the data behind it has not, leaving valid-but-truncated JSON after a power loss. This also covers the SOL/EVM **wallet pool files**, which hold the only copy of an auto-generated wallet's private key. Re-parses on startup; corrupt files log a warning and start fresh.
 
 - BTC/LTC: `last_scanned_height` + `known_block_hashes` (for reorg detection) + `pending` payments waiting for confirmations + `notified_confirmed` (credited txids). The last two were in-memory only until they were added to `PersistedState`; a restart between detection and `min_confirmations` silently dropped the deposit, because `last_scanned_height` had already moved past its block and the scan never revisits it. On startup the persisted entries are **merged** into memory rather than assigned — `run_detector` re-enters `run_block_scan_loop` after a scan error, and there the in-memory state is newer than the file.
+
+Each chain has its own JSON state file (atomic write via `.tmp + rename`). Re-parses on startup; corrupt files fail startup without resetting the credit ledger.
+
+- BTC/LTC: `last_scanned_height`, `known_block_hashes`, pending payments including detection delivery status, and credited event IDs. Batched outputs are aggregated by transaction and recipient.
 - SOL: per-address `last_processed_signature` cursor (works for both owner and ATA addresses), pending payments, credited signatures set.
-- ETH: `last_scanned_block`, pending payments, `credited_events` set, `ignored_events` set (gas-tank-originated transfers), `gas_tank_last_maintenance_unix`.
+- ETH: `last_scanned_block` (lowest completed source cursor), separate native/ERC-20/internal `scan_cursors`, pending payments with detection delivery status, `credited_events` set, `ignored_events` set (gas-tank-originated transfers), `gas_tank_last_maintenance_unix`.
 
 ## Adding a new SPL token
 
-1. Set env: `SOLANA_SPL_TOKENS=USDC:<mint>:6,USDT:<mint>:6,...` (or `default` for USDC mainnet, or `none`/`off` to disable).
+1. Set env: `SOLANA_SPL_TOKENS=USDC:<mint>:6,USDT:<mint>:6,...` (or `default` for USDC + Phantom CASH mainnet, or `none`/`off` to disable). CASH uses Token-2022; `token_program_for_mint` selects its program for ATA derivation and transfer instructions.
 2. The detector will automatically derive the ATA for each managed wallet and start monitoring.
 3. The destination ATA (= ATA of `SOLANA_DEPOSIT_ADDRESS` for that mint) **must already exist** before the first sweep. The detector does not create it.
 
@@ -129,7 +133,7 @@ BTC/LTC:
 
 Solana:
 - `SOLANA_RPC_URL`, `SOLANA_WALLET_POOL_FILE`, `SOLANA_DEPOSIT_ADDRESS` (cold/ledger destination).
-- `SOLANA_SPL_TOKENS` (default = USDC mainnet).
+- `SOLANA_SPL_TOKENS` (default = USDC + Phantom CASH mainnet).
 - `SOLANA_GAS_TANK_PRIVATE_KEY` — gas tank wallet that pays SPL fees and absorbs SOL native sweeps. Should be distinct from the deposit address. Legacy alias `SOLANA_FEE_PAYER_PRIVATE_KEY` still works but is deprecated.
 - `SOLANA_GAS_TANK_TARGET_USD` (default 10) — target balance kept on the gas tank; excess auto-forwarded to the ledger.
 - `SOLANA_GAS_TANK_INTERVAL_SECS` (default 900) — how often to run gas tank maintenance.
@@ -143,7 +147,7 @@ Ethereum:
 
 Base (mirrors the Ethereum env vars, just swap `ETH_` → `BASE_`):
 - `BASE_RPC_URL` (default `https://mainnet.base.org`), `BASE_CHAIN_ID` (default 8453), `BASE_WALLET_POOL_FILE`, `BASE_GAS_TANK_PRIVATE_KEY`, `BASE_LEDGER_ADDRESS`.
-- `BASE_ERC20_TOKENS` — Base USDC is `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` (6 decimals); Base USDT is `0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2` (6 decimals). Note: `default` in this env var still points to *Ethereum mainnet* contracts (USDC/USDT mainnet), so for Base you must set the env explicitly. Set `BASE_ERC20_TOKENS=USDC:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:6,USDT:0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2:6` (or `none` for ETH-only monitoring).
+- `BASE_ERC20_TOKENS` ? defaults to Base USDC only (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, 6 decimals), via `parse_erc20_tokens_for_chain`. Configure additional tokens explicitly, or use `none` for ETH-only monitoring.
 - `BASE_MIN_CONFIRMATIONS` (default 5 — Base finalizes faster than mainnet thanks to ~2s blocks).
 - `BASE_POLL_INTERVAL` (default 30s, override if you want faster polling — Base's tip moves quickly).
 - `BASE_RESERVATION_STORE=memory` to skip Redis on Base (independent of the Ethereum setting; both can be memory or both Redis).
@@ -199,3 +203,12 @@ Live tests in `blockstream.rs` are `#[ignore]`-gated — run with `cargo test --
 - Errors generally bubble up as `DetectorError::ApiError(format!(...))` or `DetectorError::InvalidConfig(...)`. Avoid panicking from request handlers; do panic from `main.rs` setup if config is unrecoverable.
 - Logging style: `[CHAIN_TICKER] Action — context (key=value, key=value)`. `log::info!` for milestones, `log::warn!` for recoverable issues, `log::error!` only for real failures, `log::debug!` for verbose RPC traces.
 - Sweep logging always includes the destination + txid so the operator can verify on-chain.
+
+### Detection recovery and RPC failover
+
+- `ETH_RPC_FALLBACK_URLS` / `BASE_RPC_FALLBACK_URLS`: comma-separated read RPCs. Chain IDs are checked before accepting detection data. Sweep transactions still use the primary RPC.
+- ERC-20 archive/range failures fall back to `eth_getBlockReceipts`, then individual receipts if the batch method is unavailable. Null historical responses are retried; incomplete data never advances a source cursor.
+- `SOLANA_SCAN_CONCURRENCY`: default 4, clamped to 1?32. Different wallet scans may overlap; scans of the same wallet and credit processing are serialized.
+- Detection is queued and persisted before sending webhooks. BTC/LTC and EVM webhooks now carry per-payment `event_id`; ERC-20 webhooks also carry `log_index`. The receiver must persist idempotency on `event_id` for crash-safe redelivery.
+- `/recover-txid` on Solana must never advance the wallet or ATA scan cursor.
+- Tests in `src/tests/` cover restart, batched payouts, failed/native receipts, archive fallback, missing RPC data and concurrent credits. See README for the optional read-only PublicNode regression.

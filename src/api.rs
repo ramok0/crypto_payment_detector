@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,6 +13,9 @@ use crypto_payment_detector::helius_webhooks::{
     HeliusWebhookClient, HeliusWebhookConfig, collect_candidate_addresses, verify_auth_header,
 };
 use crypto_payment_detector::persistence::load_state;
+use crypto_payment_detector::quicknode::{
+    CreditsResponse, QuickNodeClient, QuickNodeDetector, QuickNodeWebhook,
+};
 use crypto_payment_detector::recover::{RecoverRequest, RecoverResponse, RecoverStatus};
 use crypto_payment_detector::types::Chain;
 use crypto_payment_detector::{
@@ -22,13 +25,15 @@ use crypto_payment_detector::{
     assign_ethereum_wallet_for_user, assign_wallet_for_user, build_config, build_evm_config,
     build_solana_config, chain_enable_key, chain_is_requested, delete_all_assignments,
     delete_all_ethereum_assignments, load_active_ethereum_reservations, load_active_reservations,
-    load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens, parse_spl_tokens,
+    load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens_for_chain, parse_spl_tokens,
     print_readiness_report, rotate_assignment, settings_schema, shared_ethereum_wallets,
     shared_wallets,
 };
 
 #[derive(Clone)]
 struct AppState {
+    quicknode: Option<Arc<QuickNodeClient>>,
+    internal_service_token: Option<String>,
     chains: Vec<ChainInfo>,
     /// Shared client for the explorer/RPC probes in `/health`. Built once:
     /// a `reqwest::Client` owns a connection pool, so constructing one per
@@ -62,10 +67,12 @@ struct SolanaPoolApiState {
     /// `HELIUS_WEBHOOK_ENABLED` is unset or falsy — in that case the API
     /// behaves exactly as before (polling is the only detection path).
     helius: Option<Arc<HeliusWebhookClient>>,
+    quicknode: Option<Arc<QuickNodeWebhook>>,
 }
 
 #[derive(Clone)]
 struct EthereumPoolApiState {
+    quicknode: Option<Arc<QuickNodeWebhook>>,
     chain: Chain,
     wallets: SharedEthereumWallets,
     wallet_pool_path: String,
@@ -426,6 +433,10 @@ async fn handle_solana_address(
         }
     }
 
+    if let Some(quicknode) = &solana_pool.quicknode {
+        quicknode.sync_addresses().await;
+    }
+
     Ok(Json(SolanaAddressResponse {
         user_id: assignment.user_id,
         address: assignment.address,
@@ -486,6 +497,10 @@ async fn handle_solana_rotate(
                 fresh.address
             );
         }
+    }
+
+    if let Some(quicknode) = &solana_pool.quicknode {
+        quicknode.sync_addresses().await;
     }
 
     Ok(Json(SolanaRotateResponse {
@@ -567,6 +582,10 @@ async fn handle_evm_address(
     )
     .await
     .map_err(map_assignment_error)?;
+
+    if let Some(quicknode) = &pool.quicknode {
+        quicknode.sync_addresses().await;
+    }
 
     Ok(Json(EthereumAddressResponse {
         user_id: assignment.user_id,
@@ -1063,6 +1082,57 @@ async fn handle_solana_webhook(
     }))
 }
 
+async fn handle_quicknode_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(chain): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<SolanaWebhookResponse>, (StatusCode, String)> {
+    let webhook = match chain.as_str() {
+        "solana" => state
+            .solana_pool
+            .as_ref()
+            .and_then(|p| p.quicknode.as_ref()),
+        "ethereum" => state
+            .ethereum_pool
+            .as_ref()
+            .and_then(|p| p.quicknode.as_ref()),
+        "base" => state.base_pool.as_ref().and_then(|p| p.quicknode.as_ref()),
+        _ => return Err((StatusCode::NOT_FOUND, "Unsupported QuickNode chain".into())),
+    }
+    .ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "QuickNode webhook disabled for this chain".into(),
+    ))?;
+    let accepted = webhook.accept(&headers, &body)?;
+    Ok(Json(SolanaWebhookResponse { accepted }))
+}
+
+async fn handle_quicknode_credits(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<CreditsResponse>, (StatusCode, String)> {
+    let expected = state.internal_service_token.as_deref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "INTERNAL_SERVICE_TOKEN is required for credit usage access".into(),
+    ))?;
+    let received = headers
+        .get("x-internal-service-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_auth_header(expected, received) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid internal service token".into(),
+        ));
+    }
+    let client = state.quicknode.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "QUICKNODE_API_KEY is not configured".into(),
+    ))?;
+    client.credits().await.map(Json)
+}
+
 async fn handle_evm_recover(
     pool: Option<&EthereumPoolApiState>,
     payload: RecoverRequest,
@@ -1229,8 +1299,18 @@ fn build_solana_pool_api_state(
     wallets: SharedSolanaWallets,
     detector: Option<Arc<SolanaDetector>>,
     helius: Option<Arc<HeliusWebhookClient>>,
+    quicknode_client: Option<Arc<QuickNodeClient>>,
 ) -> Result<SolanaPoolApiState, DetectorError> {
+    let quicknode = match &detector {
+        Some(detector) => QuickNodeWebhook::start(
+            Chain::Solana,
+            QuickNodeDetector::Solana(detector.clone()),
+            quicknode_client,
+        )?,
+        None => None,
+    };
     Ok(SolanaPoolApiState {
+        quicknode,
         wallets,
         wallet_pool_path: config.wallet_pool_file.clone(),
         redis_url: config.redis_url.clone(),
@@ -1350,8 +1430,18 @@ fn build_ethereum_pool_api_state(
     wallets: SharedEthereumWallets,
     gas_tank_address: String,
     detector: Option<Arc<EthereumDetector>>,
+    quicknode_client: Option<Arc<QuickNodeClient>>,
 ) -> Result<EthereumPoolApiState, DetectorError> {
+    let quicknode = match &detector {
+        Some(detector) => QuickNodeWebhook::start(
+            config.chain,
+            QuickNodeDetector::Evm(detector.clone()),
+            quicknode_client,
+        )?,
+        None => None,
+    };
     Ok(EthereumPoolApiState {
+        quicknode,
         chain: config.chain,
         wallets,
         wallet_pool_path: config.wallet_pool_file.clone(),
@@ -1576,6 +1666,8 @@ async fn main() {
     let cfg_sig = crypto_payment_detector::remote_config::bootstrap().await;
     crypto_payment_detector::remote_config::spawn_watcher(cfg_sig);
 
+    let quicknode = QuickNodeClient::from_env().expect("Invalid QuickNode API configuration");
+
     let chain_str = std::env::var("CHAIN").unwrap_or_else(|_| "bitcoin".to_string());
     let max_index: u32 = std::env::var("MAX_DERIVATION_INDEX")
         .ok()
@@ -1751,6 +1843,7 @@ async fn main() {
                         wallets,
                         Some(detector.clone()),
                         helius_client,
+                        quicknode.clone(),
                     )
                     .expect("Failed to build Solana pool state");
 
@@ -1801,9 +1894,11 @@ async fn main() {
                     }
                 };
                 let tokens_env = format!("{}_ERC20_TOKENS", chain_env_prefix(evm_chain));
-                let tokens =
-                    parse_erc20_tokens(std::env::var(&tokens_env).ok().as_deref(), evm_chain)
-                        .unwrap_or_else(|e| panic!("Invalid {tokens_env}: {e}"));
+                let tokens = parse_erc20_tokens_for_chain(
+                    evm_chain,
+                    std::env::var(&tokens_env).ok().as_deref(),
+                )
+                .unwrap_or_else(|e| panic!("Invalid {tokens_env}: {e}"));
                 let wallets = shared_ethereum_wallets(
                     load_ethereum_wallet_pool(evm_chain, &config.wallet_pool_file).unwrap_or_else(
                         |e| panic!("Failed to load {} wallet pool: {e}", evm_chain.name()),
@@ -1819,6 +1914,7 @@ async fn main() {
                     wallets,
                     gas_tank_address.clone(),
                     Some(detector.clone()),
+                    quicknode.clone(),
                 )
                 .unwrap_or_else(|e| panic!("Failed to build {} pool state: {e}", evm_chain.name()));
 
@@ -1856,6 +1952,11 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
+        quicknode,
+        internal_service_token: std::env::var("INTERNAL_SERVICE_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
         chains: chain_infos,
         health_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -1867,33 +1968,7 @@ async fn main() {
         bitcoin_detectors,
     });
 
-    let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/derive", get(handle_derive))
-        .route("/solana/address", post(handle_solana_address))
-        .route("/solana/rotate", post(handle_solana_rotate))
-        .route("/solana/active", get(handle_solana_active))
-        .route("/solana/claim", post(handle_solana_claim))
-        .route("/solana/recover-txid", post(handle_solana_recover))
-        .route("/solana/webhook", post(handle_solana_webhook))
-        .route("/solana/webhook/status", get(handle_solana_webhook_status))
-        .route("/ethereum/address", post(handle_ethereum_address))
-        .route("/ethereum/active", get(handle_ethereum_active))
-        .route("/ethereum/claim", post(handle_ethereum_claim))
-        .route("/ethereum/recover-txid", post(handle_ethereum_recover))
-        .route("/base/address", post(handle_base_address))
-        .route("/base/active", get(handle_base_active))
-        .route("/base/claim", post(handle_base_claim))
-        .route("/base/recover-txid", post(handle_base_recover))
-        .route("/bitcoin/recover-txid", post(handle_bitcoin_recover))
-        .route("/litecoin/recover-txid", post(handle_litecoin_recover))
-        .route(
-            "/admin/reservations/cancel-all",
-            post(handle_admin_cancel_all_reservations),
-        )
-        .route("/internal/config-schema", get(handle_config_schema))
-        .with_state(state);
-
+    let app = api_router(state);
     // The API future below never completes, so nothing would ever observe a
     // dead detector task: the process would keep answering /reserve while
     // deposits stopped being credited. Watch the tasks and fail fast instead,
@@ -1923,11 +1998,126 @@ async fn main() {
     });
 
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to bind API_BIND={bind}: {e}"));
     log::info!("API server listening on {bind}");
-    axum::serve(listener, app)
-        .await
-        .unwrap_or_else(|e| panic!("API server stopped: {e}"));
+    let listener = tokio::net::TcpListener::bind(&bind).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+fn api_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/{chain}/webhook/quicknode", post(handle_quicknode_webhook))
+        .route("/quicknode/credits", get(handle_quicknode_credits))
+        .route("/health", get(handle_health))
+        .route("/derive", get(handle_derive))
+        .route("/solana/address", post(handle_solana_address))
+        .route("/solana/rotate", post(handle_solana_rotate))
+        .route("/solana/active", get(handle_solana_active))
+        .route("/solana/claim", post(handle_solana_claim))
+        .route("/solana/recover-txid", post(handle_solana_recover))
+        .route("/solana/webhook", post(handle_solana_webhook))
+        .route("/solana/webhook/status", get(handle_solana_webhook_status))
+        .route("/ethereum/address", post(handle_ethereum_address))
+        .route("/ethereum/active", get(handle_ethereum_active))
+        .route("/ethereum/claim", post(handle_ethereum_claim))
+        .route("/ethereum/recover-txid", post(handle_ethereum_recover))
+        .route("/base/address", post(handle_base_address))
+        .route("/base/active", get(handle_base_active))
+        .route("/base/claim", post(handle_base_claim))
+        .route("/base/recover-txid", post(handle_base_recover))
+        .route("/bitcoin/recover-txid", post(handle_bitcoin_recover))
+        .route("/litecoin/recover-txid", post(handle_litecoin_recover))
+        .route(
+            "/admin/reservations/cancel-all",
+            post(handle_admin_cancel_all_reservations),
+        )
+        .route("/internal/config-schema", get(handle_config_schema))
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod quicknode_api_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn credit_route_requires_internal_auth_and_returns_provider_balance() {
+        let (upstream, upstream_task) = serve(Router::new().route(
+            "/v0/usage/rpc",
+            get(|| async {
+                Json(
+                    json!({"data":{"credits_used":200, "credits_remaining":79999800,
+                "limit":80000000, "overages":null, "start_time":1, "end_time":2}}),
+                )
+            }),
+        ))
+        .await;
+        let state = Arc::new(AppState {
+            quicknode: Some(Arc::new(QuickNodeClient::new("key", &upstream).unwrap())),
+            internal_service_token: Some("internal-test".into()),
+            chains: vec![],
+            health_client: reqwest::Client::new(),
+            solana_pool: None,
+            ethereum_pool: None,
+            base_pool: None,
+            bitcoin_detectors: HashMap::new(),
+        });
+        let (url, task) = serve(api_router(state)).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert_eq!(
+            client
+                .get(format!("{url}/quicknode/credits"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let result: Value = client
+            .get(format!("{url}/quicknode/credits"))
+            .header("x-internal-service-token", "internal-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(result["credits_remaining"], 79999800);
+        assert_eq!(result["source"], "/v0/usage/rpc");
+        for chain in ["solana", "ethereum", "base"] {
+            assert_eq!(
+                client
+                    .post(format!("{url}/{chain}/webhook/quicknode"))
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        // The new dynamic route must not shadow the original Helius route.
+        assert_eq!(
+            client
+                .post(format!("{url}/solana/webhook"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        task.abort();
+        upstream_task.abort();
+    }
 }

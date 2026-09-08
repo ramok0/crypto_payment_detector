@@ -2,7 +2,7 @@ use crypto_payment_detector::{
     Chain, ChainDetector, ChainReadiness, EthereumDetector, PaymentDetector, SolanaDetector,
     build_config, build_evm_config, build_solana_config, chain_enable_key, chain_is_requested,
     env_utils::{chain_env_prefix, env_bool},
-    load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens, parse_spl_tokens,
+    load_ethereum_wallet_pool, load_wallet_pool, parse_erc20_tokens_for_chain, parse_spl_tokens,
     print_readiness_report, shared_ethereum_wallets, shared_wallets,
 };
 use std::sync::Arc;
@@ -247,8 +247,9 @@ async fn main() {
                     }
                 };
                 let tokens_env = format!("{}_ERC20_TOKENS", chain_env_prefix(chain));
-                let tokens = parse_erc20_tokens(std::env::var(&tokens_env).ok().as_deref(), chain)
-                    .unwrap_or_else(|e| panic!("Invalid {tokens_env}: {e}"));
+                let tokens =
+                    parse_erc20_tokens_for_chain(chain, std::env::var(&tokens_env).ok().as_deref())
+                        .unwrap_or_else(|e| panic!("Invalid {tokens_env}: {e}"));
                 let wallets = shared_ethereum_wallets(
                     load_ethereum_wallet_pool(chain, &config.wallet_pool_file).unwrap_or_else(
                         |e| panic!("Failed to load {} wallet pool: {e}", chain.name()),

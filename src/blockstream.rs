@@ -7,7 +7,7 @@ use crate::bitcoin_sweep::{self, BitcoinSweepConfig, BitcoinSweepResult, validat
 use crate::derivation::derive_address;
 use crate::env_utils::redact_url_credentials;
 use crate::error::DetectorError;
-use crate::persistence::PendingPayment;
+use crate::persistence::{PersistedPendingPayment as PendingPayment, PersistedState};
 use crate::pricing::PriceFetcher;
 use crate::recover::{RecoverResponse, RecoverStatus};
 use crate::trait_def::PaymentDetector;
@@ -129,11 +129,6 @@ fn blockchair_url(base_url: &str, path: &str) -> String {
     url
 }
 
-/// Upper bound on a single backoff sleep. `base_delay_ms << attempt` reaches
-/// hours within ~20 attempts, which stalls the scan loop far longer than any
-/// explorer outage warrants — and overflows outright past 64 attempts.
-const MAX_RETRY_DELAY_MS: u64 = 30_000;
-
 async fn retry<F, Fut, T>(
     name: &str,
     max_retries: u32,
@@ -144,38 +139,26 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, DetectorError>>,
 {
-    // `MAX_RETRIES=0` would otherwise skip the loop entirely and leave no error
-    // to return — the operation must run at least once.
-    let attempts = max_retries.max(1);
     let mut last_err = None;
-
-    for attempt in 0..attempts {
+    for attempt in 0..max_retries {
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                last_err = Some(e);
-                if attempt + 1 == attempts {
-                    break;
-                }
-                let delay = base_delay_ms
-                    .saturating_mul(2u64.saturating_pow(attempt.min(32)))
-                    .min(MAX_RETRY_DELAY_MS);
+                let delay = base_delay_ms * 2u64.pow(attempt);
                 log::warn!(
                     "Retry {}/{} for '{}' in {}ms - {}",
                     attempt + 1,
-                    attempts,
+                    max_retries,
                     name,
                     delay,
-                    last_err.as_ref().expect("error recorded above")
+                    e
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                last_err = Some(e);
             }
         }
     }
-
-    Err(last_err.unwrap_or_else(|| {
-        DetectorError::ApiError(format!("'{name}' failed without recording an error"))
-    }))
+    Err(last_err.unwrap())
 }
 
 #[derive(Debug)]
@@ -195,6 +178,7 @@ pub struct ChainDetector {
     explorer_apis: Vec<ExplorerApi>,
     active_explorer_index: Mutex<usize>,
     sweep_config: Option<BitcoinSweepConfig>,
+    credit_lock: tokio::sync::Mutex<()>,
 }
 
 impl ChainDetector {
@@ -229,6 +213,8 @@ impl ChainDetector {
         }
 
         let mut client_builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(0)
             .connection_verbose(false);
         if let Some(ref proxy_url) = config.proxy_url {
@@ -300,20 +286,22 @@ impl ChainDetector {
             explorer_list
         );
 
+        let persisted = crate::persistence::load_state(&config.state_file)?;
         Ok(Self {
             config,
             client,
             webhook_client,
             price_fetcher,
             state: Arc::new(Mutex::new(SharedState {
-                notified_confirmed: HashSet::new(),
-                last_scanned_height: None,
-                pending: Vec::new(),
-                known_block_hashes: HashMap::new(),
+                notified_confirmed: persisted.notified_confirmed,
+                last_scanned_height: persisted.last_scanned_height,
+                pending: persisted.pending,
+                known_block_hashes: persisted.known_block_hashes,
             })),
             explorer_apis,
             active_explorer_index: Mutex::new(0),
             sweep_config,
+            credit_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -322,10 +310,7 @@ impl ChainDetector {
     }
 
     fn esplora_base_url(&self) -> Option<String> {
-        let index = *self
-            .active_explorer_index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let index = *self.active_explorer_index.lock().unwrap();
         self.explorer_apis
             .get(index)
             .or_else(|| self.explorer_apis.first())
@@ -357,7 +342,12 @@ impl ChainDetector {
                     self.config.chain.ticker(),
                     address
                 );
-                return None;
+                return Some(BitcoinSweepResult {
+                    txid: None,
+                    amount_sat: 0,
+                    fee_sat: 0,
+                    deferred: true,
+                });
             }
         };
 
@@ -378,7 +368,12 @@ impl ChainDetector {
                     address,
                     derivation_index
                 );
-                None
+                Some(BitcoinSweepResult {
+                    txid: None,
+                    amount_sat: 0,
+                    fee_sat: 0,
+                    deferred: true,
+                })
             }
         }
     }
@@ -387,45 +382,13 @@ impl ChainDetector {
         self.config.chain
     }
 
-    /// Poison-tolerant state lock.
-    ///
-    /// A panic anywhere under the lock would otherwise poison it, and every
-    /// later `lock().unwrap()` would panic in turn — one transient bug would
-    /// take the detector down permanently instead of for a single cycle. The
-    /// guarded state is plain data with no invariant that a partial update can
-    /// break, so recovering the inner value is safe.
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, SharedState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Snapshot the mutable state and write it to the state file.
-    ///
-    /// Everything the scan loop cannot reconstruct after a restart lives here:
-    /// the scan height, the reorg hash window, payments still waiting for
-    /// confirmations, and the txids already credited.
-    fn persist_state(&self) -> Result<(), DetectorError> {
-        let snapshot = {
-            let state = self.lock_state();
-            crate::persistence::PersistedState {
-                last_scanned_height: state.last_scanned_height,
-                known_block_hashes: state.known_block_hashes.clone(),
-                pending: state.pending.clone(),
-                notified_confirmed: state.notified_confirmed.clone(),
-            }
-        };
-        crate::persistence::save_state(&self.config.state_file, &snapshot)
-    }
-
     async fn try_explorers<T, F, Fut>(&self, name: &str, mut call: F) -> Result<T, DetectorError>
     where
         F: FnMut(ExplorerApi) -> Fut,
         Fut: Future<Output = Result<T, DetectorError>>,
     {
         let len = self.explorer_apis.len();
-        let start = *self
-            .active_explorer_index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let start = *self.active_explorer_index.lock().unwrap();
         let mut last_err = None;
 
         for offset in 0..len {
@@ -443,10 +406,7 @@ impl ChainDetector {
                             name
                         );
                     }
-                    *self
-                        .active_explorer_index
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = index;
+                    *self.active_explorer_index.lock().unwrap() = index;
                     return Ok(value);
                 }
                 Err(error) => {
@@ -595,7 +555,6 @@ impl ChainDetector {
     ) -> Result<bitcoin::Block, DetectorError> {
         let bytes = self.fetch_raw_block_bytes_from(explorer, hash).await?;
 
-        // Litecoin blocks carry MWEB extensions the bitcoin crate cannot decode.
         let block = match self.config.chain {
             Chain::Litecoin => crate::litecoin_block::deserialize_litecoin_block(&bytes)?,
             _ => bitcoin::Block::consensus_decode(&mut bytes.as_slice())
@@ -701,79 +660,81 @@ impl ChainDetector {
         let network = chain.bitcoin_network();
         let confirmations = tip_height.saturating_sub(block_height) + 1;
 
-        block
-            .txdata
-            .par_iter()
-            .flat_map(|tx| {
-                let txid = tx.compute_txid().to_string();
-                tx.output
-                    .par_iter()
-                    .filter_map(move |output| {
-                        let script = &output.script_pubkey;
-                        let addr_str = bitcoin::Address::from_script(script, network)
-                            .ok()
-                            .map(|a| a.to_string());
+        aggregate_utxo_payments(
+            block
+                .txdata
+                .par_iter()
+                .flat_map(|tx| {
+                    let txid = tx.compute_txid().to_string();
+                    tx.output
+                        .par_iter()
+                        .filter_map(move |output| {
+                            let script = &output.script_pubkey;
+                            let addr_str = bitcoin::Address::from_script(script, network)
+                                .ok()
+                                .map(|a| a.to_string());
 
-                        let addr_str = match chain {
-                            Chain::Bitcoin => addr_str?,
-                            Chain::Litecoin => {
-                                let btc_addr = addr_str?;
-                                if btc_addr.starts_with("bc1") {
-                                    use bech32::Hrp;
-                                    let (_hrp, witness_version, witness_program) =
-                                        bech32::segwit::decode(&btc_addr).ok()?;
-                                    let ltc_hrp = Hrp::parse("ltc").unwrap();
-                                    bech32::segwit::encode(
-                                        ltc_hrp,
-                                        witness_version,
-                                        &witness_program,
-                                    )
-                                    .ok()?
-                                } else {
-                                    btc_addr
+                            let addr_str = match chain {
+                                Chain::Bitcoin => addr_str?,
+                                Chain::Litecoin => {
+                                    let btc_addr = addr_str?;
+                                    if btc_addr.starts_with("bc1") {
+                                        use bech32::Hrp;
+                                        let (_hrp, witness_version, witness_program) =
+                                            bech32::segwit::decode(&btc_addr).ok()?;
+                                        let ltc_hrp = Hrp::parse("ltc").unwrap();
+                                        bech32::segwit::encode(
+                                            ltc_hrp,
+                                            witness_version,
+                                            &witness_program,
+                                        )
+                                        .ok()?
+                                    } else {
+                                        btc_addr
+                                    }
                                 }
-                            }
-                            Chain::Solana | Chain::Ethereum | Chain::Base => return None,
-                        };
+                                Chain::Solana | Chain::Ethereum | Chain::Base => return None,
+                            };
 
-                        let &index = address_lookup.get(&addr_str)?;
-                        let amount_sat = output.value.to_sat();
-                        Some(DetectedPayment {
-                            chain,
-                            ticker: chain.ticker().to_string(),
-                            txid: txid.clone(),
-                            address: addr_str,
-                            user_id: None,
-                            amount_sat,
-                            amount_coin: amount_sat as f64 / chain.sats_per_unit() as f64,
-                            confirmations,
-                            block_height: Some(block_height),
-                            derivation_index: index,
-                            memo: None,
-                            swept_to_address: None,
-                            swept_amount_sat: None,
-                            swept_amount_coin: None,
-                            sweep_txid: None,
-                            fiat_amount: None,
-                            fiat_currency: None,
-                            coin_price: None,
-                            event_id: None,
-                            log_index: None,
-                            asset: None,
-                            asset_decimals: None,
-                            amount_base_units: None,
-                            swept_amount_base_units: None,
-                            token_contract: None,
+                            let &index = address_lookup.get(&addr_str)?;
+                            let amount_sat = output.value.to_sat();
+                            Some(DetectedPayment {
+                                chain,
+                                ticker: chain.ticker().to_string(),
+                                txid: txid.clone(),
+                                address: addr_str,
+                                user_id: None,
+                                amount_sat,
+                                amount_coin: amount_sat as f64 / chain.sats_per_unit() as f64,
+                                confirmations,
+                                block_height: Some(block_height),
+                                derivation_index: index,
+                                memo: None,
+                                swept_to_address: None,
+                                swept_amount_sat: None,
+                                swept_amount_coin: None,
+                                sweep_txid: None,
+                                fiat_amount: None,
+                                fiat_currency: None,
+                                coin_price: None,
+                                event_id: None,
+                                log_index: None,
+                                asset: None,
+                                asset_decimals: None,
+                                amount_base_units: None,
+                                swept_amount_base_units: None,
+                                token_contract: None,
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+        )
     }
 
     async fn detect_reorg(&self, current_height: u64) -> u64 {
         let known = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.known_block_hashes.clone()
         };
 
@@ -821,146 +782,153 @@ impl ChainDetector {
         depth
     }
 
-    fn enqueue_or_confirm(&self, payments: Vec<DetectedPayment>) {
-        let min_conf = self.config.min_confirmations;
-        let mut state = self.lock_state();
-        for payment in payments {
-            if state.notified_confirmed.contains(&payment.txid) {
-                continue;
+    fn persist_state(&self) -> Result<(), DetectorError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        crate::persistence::save_state(
+            &self.config.state_file,
+            &PersistedState {
+                last_scanned_height: state.last_scanned_height,
+                known_block_hashes: state.known_block_hashes.clone(),
+                pending: state.pending.clone(),
+                notified_confirmed: state.notified_confirmed.clone(),
+            },
+        )
+    }
+
+    fn enqueue_or_confirm(&self, payments: Vec<DetectedPayment>) -> Result<(), DetectorError> {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for mut payment in payments {
+                let key = utxo_payment_key(&payment.txid, &payment.address, payment.chain);
+                payment.event_id = Some(key.clone());
+                if state.notified_confirmed.contains(&key)
+                    || state
+                        .pending
+                        .iter()
+                        .any(|p| p.payment.event_id.as_ref() == Some(&key))
+                {
+                    continue;
+                }
+                state.pending.push(PendingPayment {
+                    block_height: payment.block_height.unwrap_or(0),
+                    payment,
+                    detected_notified: false,
+                });
             }
-            let already_pending = state.pending.iter().any(|p| p.payment.txid == payment.txid);
-            if already_pending {
-                continue;
-            }
-            if payment.confirmations < min_conf {
-                log::info!(
-                    "[{}] Payment pending ({}/{} confirmations): txid={} amount={} sats",
-                    self.config.chain.ticker(),
-                    payment.confirmations,
-                    min_conf,
-                    &payment.txid[..12],
-                    payment.amount_sat,
-                );
-            }
-            state.pending.push(PendingPayment {
-                payment: payment.clone(),
-                block_height: payment.block_height.unwrap_or(0),
-            });
         }
+        // The outbox is durable before a webhook or cursor advance can happen.
+        self.persist_state()
     }
 
     async fn process_confirmed(&self, tip_height: u64) -> Result<(), DetectorError> {
-        let min_conf = self.config.min_confirmations;
-        let ticker = self.config.chain.ticker();
+        let _guard = self.credit_lock.lock().await;
+        self.persist_state()?;
+        let pending = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .clone();
+        for entry in pending {
+            if let Err(error) = self.process_pending_payment(&entry, tip_height).await {
+                log::warn!(
+                    "[{}] Payment {} for {} will retry: {error}",
+                    self.config.chain.ticker(),
+                    entry.payment.txid,
+                    entry.payment.address
+                );
+            }
+        }
+        Ok(())
+    }
 
-        // Pull every confirmed entry — including ones already credited —
-        // so we can keep retrying a deferred sweep without re-firing the
-        // webhook.
-        let ready: Vec<PendingPayment> = {
-            let state = self.lock_state();
-            state
-                .pending
-                .iter()
-                .filter(|p| {
-                    let confs = tip_height.saturating_sub(p.block_height) + 1;
-                    confs >= min_conf
-                })
-                .cloned()
-                .collect()
+    async fn process_pending_payment(
+        &self,
+        pending: &PendingPayment,
+        tip_height: u64,
+    ) -> Result<(), DetectorError> {
+        let key = utxo_payment_key(
+            &pending.payment.txid,
+            &pending.payment.address,
+            self.config.chain,
+        );
+        let mut payment = pending.payment.clone();
+        payment.event_id = Some(key.clone());
+        payment.confirmations = if tip_height >= pending.block_height {
+            tip_height - pending.block_height + 1
+        } else {
+            0
         };
-
-        let mut to_remove: HashSet<String> = HashSet::new();
-        for pending in &ready {
-            let confs = tip_height.saturating_sub(pending.block_height) + 1;
-            let mut enriched = pending.payment.clone();
-            enriched.confirmations = confs;
-
-            let sweep_outcome = self
-                .maybe_sweep(pending.payment.derivation_index, &pending.payment.address)
-                .await;
-            let sweep_deferred = matches!(&sweep_outcome, Some(r) if r.deferred);
-
-            if let Some(result) = &sweep_outcome {
-                if !result.deferred {
-                    if let Some(destination) = self.sweep_destination() {
-                        enriched.swept_to_address = Some(destination.to_string());
-                    }
-                    enriched.swept_amount_sat = Some(result.amount_sat);
-                    enriched.swept_amount_coin =
-                        Some(result.amount_sat as f64 / self.config.chain.sats_per_unit() as f64);
-                    enriched.sweep_txid = result.txid.clone();
-                }
-            }
-
-            let already_notified = {
-                let state = self.lock_state();
-                state.notified_confirmed.contains(&pending.payment.txid)
-            };
-
-            if !already_notified {
-                match self.price_fetcher.get_price().await {
-                    Ok(price) => {
-                        enriched.coin_price = Some(price);
-                        enriched.fiat_currency = Some(self.price_fetcher.currency().to_string());
-                        let coin =
-                            enriched.amount_sat as f64 / self.config.chain.sats_per_unit() as f64;
-                        enriched.fiat_amount = Some(coin * price);
-                    }
-                    Err(e) => {
-                        log::warn!("[{}] Failed to fetch price: {e}", ticker);
-                    }
-                }
-
-                let event = WebhookEvent::PaymentCredited(enriched.clone());
-                send_webhook(
-                    &self.webhook_client,
-                    &self.config.webhook_url,
-                    &self.config.webhook_hmac_secret,
-                    &event,
-                )
-                .await?;
-
+        if !pending.detected_notified {
+            send_webhook(
+                &self.webhook_client,
+                &self.config.webhook_url,
+                &self.config.webhook_hmac_secret,
+                &WebhookEvent::PaymentDetected(payment.clone()),
+            )
+            .await?;
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = state
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.payment.event_id.as_ref() == Some(&key))
                 {
-                    let mut state = self.lock_state();
-                    state
-                        .notified_confirmed
-                        .insert(pending.payment.txid.clone());
+                    entry.detected_notified = true;
                 }
-                log::info!(
-                    "[{}] Payment confirmed ({} confs): txid={} address={} amount={} sats fiat={:?} {}{}",
-                    ticker,
-                    confs,
-                    pending.payment.txid,
-                    pending.payment.address,
-                    pending.payment.amount_sat,
-                    enriched.fiat_amount,
-                    self.price_fetcher.currency(),
-                    if sweep_deferred {
-                        " (sweep deferred)"
-                    } else {
-                        ""
-                    },
-                );
             }
-
-            if sweep_deferred {
-                log::info!(
-                    "[{}] Sweep deferred for txid {} - keeping in pending until next cycle",
-                    ticker,
-                    pending.payment.txid
-                );
-            } else {
-                to_remove.insert(pending.payment.txid.clone());
+            self.persist_state()?;
+        }
+        if payment.confirmations < self.config.min_confirmations.max(1) {
+            return Ok(());
+        }
+        let sweep = self
+            .maybe_sweep(payment.derivation_index, &payment.address)
+            .await;
+        let deferred = sweep.as_ref().is_some_and(|s| s.deferred);
+        if let Some(result) = &sweep {
+            if !result.deferred {
+                payment.swept_to_address = self.sweep_destination().map(str::to_string);
+                payment.swept_amount_sat = Some(result.amount_sat);
+                payment.swept_amount_coin =
+                    Some(result.amount_sat as f64 / self.config.chain.sats_per_unit() as f64);
+                payment.sweep_txid = result.txid.clone();
             }
         }
-
-        if !to_remove.is_empty() {
-            let mut state = self.lock_state();
-            state
+        let already_credited = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .notified_confirmed
+            .contains(&key);
+        if !already_credited {
+            if let Ok(price) = self.price_fetcher.get_price().await {
+                payment.coin_price = Some(price);
+                payment.fiat_currency = Some(self.price_fetcher.currency().to_string());
+                payment.fiat_amount = Some(payment.amount_coin * price);
+            }
+            send_webhook(
+                &self.webhook_client,
+                &self.config.webhook_url,
+                &self.config.webhook_hmac_secret,
+                &WebhookEvent::PaymentCredited(payment),
+            )
+            .await?;
+            self.state
+                .lock()
+                .unwrap()
+                .notified_confirmed
+                .insert(key.clone());
+            self.persist_state()?;
+        }
+        if !deferred {
+            self.state
+                .lock()
+                .unwrap()
                 .pending
-                .retain(|p| !to_remove.contains(&p.payment.txid));
+                .retain(|p| p.payment.event_id.as_ref() != Some(&key));
+            self.persist_state()?;
         }
-
         Ok(())
     }
 
@@ -980,7 +948,8 @@ impl ChainDetector {
         user_id: u32,
         max_derivation_index: u32,
     ) -> Result<RecoverResponse, DetectorError> {
-        let txid = txid.trim();
+        let txid_normalized = txid.trim().to_ascii_lowercase();
+        let txid = txid_normalized.as_str();
         let chain = self.config.chain;
         let txid_owned = txid.to_string();
         let user_id_str = user_id.to_string();
@@ -998,27 +967,6 @@ impl ChainDetector {
             return Ok(mk(RecoverStatus::WrongUser));
         }
 
-        // Detector-side dedup: already credited via the regular block
-        // scan or a previous recovery. Backend's unique DB index will
-        // also catch duplicates if a webhook somehow re-fires.
-        {
-            let state = self.lock_state();
-            if state.notified_confirmed.contains(txid) {
-                log::info!(
-                    "[{}] /recover-txid: txid={txid} already credited (user_id={user_id})",
-                    chain.ticker()
-                );
-                return Ok(mk(RecoverStatus::AlreadyCredited));
-            }
-            if state.pending.iter().any(|p| p.payment.txid == txid) {
-                log::info!(
-                    "[{}] /recover-txid: txid={txid} already pending sweep (user_id={user_id})",
-                    chain.ticker()
-                );
-                return Ok(mk(RecoverStatus::PendingSweep));
-            }
-        }
-
         // The address we expect to credit. If the supplied user_id
         // doesn't yield the same address as one of the tx outputs,
         // the recovery is rejected.
@@ -1027,6 +975,33 @@ impl ChainDetector {
                 "Failed to derive xpub address for user_id={user_id}: {e}"
             ))
         })?;
+
+        let key = utxo_payment_key(txid, &expected_address, chain);
+
+        // Detector-side dedup: already credited via the regular block
+        // scan or a previous recovery. Backend's unique DB index will
+        // also catch duplicates if a webhook somehow re-fires.
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.notified_confirmed.contains(&key) {
+                log::info!(
+                    "[{}] /recover-txid: txid={txid} already credited (user_id={user_id})",
+                    chain.ticker()
+                );
+                return Ok(mk(RecoverStatus::AlreadyCredited));
+            }
+            if state
+                .pending
+                .iter()
+                .any(|p| p.payment.event_id.as_ref() == Some(&key))
+            {
+                log::info!(
+                    "[{}] /recover-txid: txid={txid} already pending sweep (user_id={user_id})",
+                    chain.ticker()
+                );
+                return Ok(mk(RecoverStatus::PendingSweep));
+            }
+        }
 
         let tx = match self.fetch_esplora_tx(txid).await? {
             Some(tx) => tx,
@@ -1110,7 +1085,7 @@ impl ChainDetector {
             fiat_amount: None,
             fiat_currency: None,
             coin_price: None,
-            event_id: None,
+            event_id: Some(key.clone()),
             log_index: None,
             asset: None,
             asset_decimals: None,
@@ -1119,35 +1094,12 @@ impl ChainDetector {
             token_contract: None,
         };
 
-        // First send a `payment_detected` so the backend records the
-        // event. Idempotent on the backend side via the same key the
-        // regular scan loop would have produced.
-        send_webhook(
-            &self.webhook_client,
-            &self.config.webhook_url,
-            &self.config.webhook_hmac_secret,
-            &WebhookEvent::PaymentDetected(detected.clone()),
-        )
-        .await?;
-
-        // Enqueue and run the confirmation/sweep cycle synchronously so
-        // an already-confirmed tx fires `payment_credited` immediately
-        // rather than waiting for the next poll tick.
-        self.enqueue_or_confirm(vec![detected]);
+        self.enqueue_or_confirm(vec![detected])?;
         self.process_confirmed(tip_height).await?;
 
-        // A recovery runs outside the scan loop, so nothing else would write
-        // the credit (or the still-pending entry) to disk.
-        if let Err(e) = self.persist_state() {
-            log::error!(
-                "[{}] Failed to persist state after recovery: {e}",
-                chain.ticker()
-            );
-        }
-
         let credited = {
-            let state = self.lock_state();
-            state.notified_confirmed.contains(txid)
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.notified_confirmed.contains(&key)
         };
         let status = if credited {
             RecoverStatus::Credited
@@ -1284,15 +1236,16 @@ impl PaymentDetector for ChainDetector {
             max_derivation_index
         );
 
-        let persisted = crate::persistence::load_state(&self.config.state_file)?;
-        let mut known_block_hashes = persisted.known_block_hashes.clone();
+        let (persisted_height, mut known_block_hashes) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (state.last_scanned_height, state.known_block_hashes.clone())
+        };
 
         let mut current_height = if let Some(h) = start_height {
             h
         } else if self.config.skip_initial_block_sync {
             let tip_height = self.get_chain_tip().await?;
-            let persisted_height = persisted
-                .last_scanned_height
+            let persisted_height = persisted_height
                 .map(|height| height.to_string())
                 .unwrap_or_else(|| "none".to_string());
             log::info!(
@@ -1303,7 +1256,7 @@ impl PaymentDetector for ChainDetector {
             );
             known_block_hashes.clear();
             tip_height.saturating_add(1)
-        } else if let Some(last) = persisted.last_scanned_height {
+        } else if let Some(last) = persisted_height {
             log::info!("[{}] Resuming from persisted height {}", ticker, last + 1);
             last + 1
         } else {
@@ -1311,38 +1264,9 @@ impl PaymentDetector for ChainDetector {
         };
 
         {
-            let mut state = self.lock_state();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.last_scanned_height = Some(current_height.saturating_sub(1));
             state.known_block_hashes = known_block_hashes.clone();
-            // Payments detected before the last restart but not yet confirmed:
-            // their block is already behind `last_scanned_height`, so the scan
-            // will never surface them again. Restoring them here is what makes
-            // a restart mid-confirmation non-destructive.
-            //
-            // Merged, not assigned: `run_detector` re-enters this function after
-            // a scan error, and in that case the in-memory state is newer than
-            // the file. Overwriting it would resurrect entries already credited
-            // since the last save.
-            state
-                .notified_confirmed
-                .extend(persisted.notified_confirmed.iter().cloned());
-            let mut restored = 0usize;
-            for entry in &persisted.pending {
-                let txid = &entry.payment.txid;
-                let known = state.notified_confirmed.contains(txid)
-                    || state.pending.iter().any(|p| &p.payment.txid == txid);
-                if !known {
-                    state.pending.push(entry.clone());
-                    restored += 1;
-                }
-            }
-            if restored > 0 {
-                log::info!(
-                    "[{}] Restored {} pending payment(s) awaiting confirmation from state file",
-                    ticker,
-                    restored
-                );
-            }
         }
 
         if self.config.skip_initial_block_sync {
@@ -1363,11 +1287,6 @@ impl PaymentDetector for ChainDetector {
                 if let Err(e) = self.process_confirmed(tip_height).await {
                     log::error!("[{}] Failed to process confirmed payments: {e}", ticker);
                 }
-                // At the tip there is no block save to piggyback on, so credits
-                // and sweeps settled just now would only exist in memory.
-                if let Err(e) = self.persist_state() {
-                    log::error!("[{}] Failed to persist state: {e}", ticker);
-                }
                 tokio::time::sleep(poll_interval).await;
                 continue;
             }
@@ -1379,6 +1298,7 @@ impl PaymentDetector for ChainDetector {
             while current_height <= tip_height {
                 let reorg_depth = self.detect_reorg(current_height).await;
                 if reorg_depth > 0 {
+                    let _credit_guard = self.credit_lock.lock().await;
                     log::warn!(
                         "[{}] Reorg detected! Rolling back {} block(s) from height {}",
                         ticker,
@@ -1387,7 +1307,7 @@ impl PaymentDetector for ChainDetector {
                     );
                     let rollback_from = current_height - reorg_depth;
                     {
-                        let mut state = self.lock_state();
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         state.pending.retain(|p| p.block_height < rollback_from);
                         for h in rollback_from..current_height {
                             state.known_block_hashes.remove(&h);
@@ -1404,7 +1324,7 @@ impl PaymentDetector for ChainDetector {
                 }
 
                 let block_start_time = Instant::now();
-                let blocks_done = current_height - batch_start;
+                let blocks_done = current_height.saturating_sub(batch_start);
                 let progress = if total_blocks > 0 {
                     (blocks_done as f64 / total_blocks as f64) * 100.0
                 } else {
@@ -1473,7 +1393,7 @@ impl PaymentDetector for ChainDetector {
                         payments.len(),
                         current_height
                     );
-                    self.enqueue_or_confirm(payments);
+                    self.enqueue_or_confirm(payments)?;
                 }
 
                 if let Err(e) = self.process_confirmed(tip_height).await {
@@ -1481,7 +1401,7 @@ impl PaymentDetector for ChainDetector {
                 }
 
                 {
-                    let mut state = self.lock_state();
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.last_scanned_height = Some(current_height);
                     state
                         .known_block_hashes
@@ -1491,9 +1411,7 @@ impl PaymentDetector for ChainDetector {
                     state.known_block_hashes.retain(|&h, _| h >= min_keep);
                 }
 
-                if let Err(e) = self.persist_state() {
-                    log::error!("[{}] Failed to persist state: {e}", ticker);
-                }
+                self.persist_state()?;
 
                 current_height += 1;
             }
@@ -1513,6 +1431,35 @@ impl PaymentDetector for ChainDetector {
         }
     }
 }
+
+fn utxo_payment_key(txid: &str, address: &str, chain: Chain) -> String {
+    format!("{}:{}:{}", chain.ticker(), txid, address)
+}
+
+fn aggregate_utxo_payments(payments: Vec<DetectedPayment>) -> Vec<DetectedPayment> {
+    let mut totals: std::collections::BTreeMap<String, DetectedPayment> =
+        std::collections::BTreeMap::new();
+    for mut payment in payments {
+        if payment.amount_sat == 0 {
+            continue;
+        }
+        let key = utxo_payment_key(&payment.txid, &payment.address, payment.chain);
+        payment.event_id = Some(key.clone());
+        totals
+            .entry(key)
+            .and_modify(|existing| {
+                existing.amount_sat += payment.amount_sat;
+                existing.amount_coin =
+                    existing.amount_sat as f64 / existing.chain.sats_per_unit() as f64;
+            })
+            .or_insert(payment);
+    }
+    totals.into_values().collect()
+}
+
+#[cfg(test)]
+#[path = "tests/btc_detection.rs"]
+mod detection_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1557,126 +1504,8 @@ mod tests {
             )],
             active_explorer_index: Mutex::new(0),
             sweep_config: None,
+            credit_lock: tokio::sync::Mutex::new(()),
         }
-    }
-
-    fn sample_payment(txid: &str, block_height: u64) -> DetectedPayment {
-        DetectedPayment {
-            chain: Chain::Litecoin,
-            ticker: "LTC".to_string(),
-            txid: txid.to_string(),
-            address: "ltc1qexample".to_string(),
-            user_id: None,
-            amount_sat: 500_000,
-            amount_coin: 0.005,
-            confirmations: 1,
-            block_height: Some(block_height),
-            derivation_index: 3,
-            memo: None,
-            swept_to_address: None,
-            swept_amount_sat: None,
-            swept_amount_coin: None,
-            sweep_txid: None,
-            fiat_amount: None,
-            fiat_currency: None,
-            coin_price: None,
-            event_id: None,
-            log_index: None,
-            asset: None,
-            asset_decimals: None,
-            amount_base_units: None,
-            swept_amount_base_units: None,
-            token_contract: None,
-        }
-    }
-
-    /// A payment detected but not yet confirmed used to live only in memory,
-    /// while `last_scanned_height` was persisted — so a restart in that window
-    /// dropped the deposit for good (the scan never revisits the block).
-    #[test]
-    fn persists_pending_payments_across_restart() {
-        let mut state_file = std::env::temp_dir();
-        state_file.push("cpd_blockstream_pending_restart.json");
-        let state_file = state_file.to_string_lossy().into_owned();
-        let _ = std::fs::remove_file(&state_file);
-
-        let mut detector = blockchair_litecoin_detector();
-        detector.config.state_file = state_file.clone();
-        detector.config.min_confirmations = 6;
-
-        detector.enqueue_or_confirm(vec![sample_payment("deadbeef", 3_000_000)]);
-        {
-            let mut state = detector.lock_state();
-            state.last_scanned_height = Some(3_000_000);
-            state.notified_confirmed.insert("cafe".to_string());
-        }
-        detector.persist_state().expect("state should persist");
-
-        let reloaded = crate::persistence::load_state(&state_file).expect("state should reload");
-        assert_eq!(reloaded.last_scanned_height, Some(3_000_000));
-        assert_eq!(reloaded.pending.len(), 1);
-        assert_eq!(reloaded.pending[0].payment.txid, "deadbeef");
-        assert_eq!(reloaded.pending[0].block_height, 3_000_000);
-        assert!(reloaded.notified_confirmed.contains("cafe"));
-
-        let _ = std::fs::remove_file(&state_file);
-    }
-
-    /// A panic under the state lock used to poison it, so every later
-    /// `lock().unwrap()` panicked too and the detector stayed dead until the
-    /// process was restarted.
-    #[test]
-    fn survives_a_poisoned_state_lock() {
-        let detector = Arc::new(blockchair_litecoin_detector());
-
-        let poisoner = Arc::clone(&detector.state);
-        let _ = std::thread::spawn(move || {
-            let _guard = poisoner.lock().unwrap();
-            panic!("poison the lock");
-        })
-        .join();
-
-        assert!(detector.state.is_poisoned());
-
-        let mut state = detector.lock_state();
-        state.last_scanned_height = Some(42);
-        drop(state);
-        assert_eq!(detector.lock_state().last_scanned_height, Some(42));
-    }
-
-    #[tokio::test]
-    async fn retry_runs_once_and_reports_the_error_when_max_retries_is_zero() {
-        // `MAX_RETRIES=0` used to skip the loop entirely and then unwrap a
-        // `None` error, panicking the detector task.
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let result: Result<(), DetectorError> = retry("test_op", 0, 1, || async {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(DetectorError::ApiError("boom".into()))
-        })
-        .await;
-
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(
-            result.unwrap_err().to_string().contains("boom"),
-            "the real error must survive"
-        );
-    }
-
-    #[tokio::test]
-    async fn retry_returns_the_first_success_without_sleeping_again() {
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let result: Result<u32, DetectorError> = retry("test_op", 5, 1, || async {
-            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n == 0 {
-                Err(DetectorError::ApiError("transient".into()))
-            } else {
-                Ok(7)
-            }
-        })
-        .await;
-
-        assert_eq!(result.expect("should succeed on the second attempt"), 7);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1745,35 +1574,6 @@ mod tests {
             block.header.time > 1_600_000_000,
             "downloaded Litecoin block {block_hash} has an implausible timestamp: {}",
             block.header.time
-        );
-    }
-
-    /// Companion to the pre-MWEB test above: every block mined since the MWEB
-    /// activation ends with a HogEx transaction whose flag byte is `0x08`, which
-    /// used to abort the scan loop with "unsupported segwit version: 8".
-    #[tokio::test]
-    #[ignore = "hits the live Blockchair Litecoin API"]
-    async fn blockchair_live_decodes_recent_mweb_litecoin_block() {
-        let detector = blockchair_litecoin_detector();
-        let tip_height = detector
-            .get_chain_tip()
-            .await
-            .expect("Blockchair should return a Litecoin tip height");
-        let block_height = tip_height.saturating_sub(6);
-        let block_hash = detector
-            .get_block_hash(block_height)
-            .await
-            .expect("Blockchair should return a Litecoin block hash by height");
-
-        let block = detector
-            .fetch_raw_block(&block_hash)
-            .await
-            .expect("Blockchair should return a decodable raw Litecoin block");
-
-        assert_eq!(block.block_hash().to_string(), block_hash);
-        assert!(
-            block.check_merkle_root(),
-            "merkle root mismatch on Litecoin block {block_hash} at height {block_height}"
         );
     }
 }

@@ -29,6 +29,14 @@ pub struct PriceFetcher {
 }
 
 impl PriceFetcher {
+    #[cfg(test)]
+    pub(crate) fn seed_test_price(&self, price: f64) {
+        *self.cache.lock().unwrap() = Some(PriceCache {
+            price,
+            fetched_at: Instant::now(),
+        });
+    }
+
     pub fn new(client: reqwest::Client, currency: &str, chain: Chain) -> Self {
         let pair = kraken_pair(chain, currency);
         Self {
@@ -80,6 +88,7 @@ impl PriceFetcher {
         let resp: KrakenResponse = self
             .client
             .get(&url)
+            .timeout(Duration::from_secs(10))
             .send()
             .await
             .map_err(|e| DetectorError::ApiError(format!("Kraken API request failed: {e}")))?
@@ -116,6 +125,11 @@ impl PriceFetcher {
             .parse()
             .map_err(|e| DetectorError::ApiError(format!("Kraken: failed to parse price: {e}")))?;
 
+        if !price.is_finite() || price <= 0.0 {
+            return Err(DetectorError::ApiError(
+                "Kraken returned an invalid price".into(),
+            ));
+        }
         log::debug!(
             "Kraken {}/{} price: {:.2}",
             self.chain.ticker(),

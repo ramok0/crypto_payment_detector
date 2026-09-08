@@ -7,8 +7,8 @@ use ethers::middleware::SignerMiddleware;
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{
-    Address, BlockNumber, Bytes, Filter, H256, TransactionRequest, U256, ValueOrArray,
-    transaction::eip2718::TypedTransaction,
+    Address, Block, BlockNumber, Bytes, Filter, H256, Log, Transaction, TransactionReceipt,
+    TransactionRequest, U64, U256, ValueOrArray, transaction::eip2718::TypedTransaction,
 };
 use ethers::utils::keccak256;
 use serde::{Deserialize, Serialize};
@@ -91,11 +91,52 @@ struct EthereumPendingPayment {
     address: String,
     user_id: String,
     wallet_index: u32,
+    #[serde(default)]
+    detected_notified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct EthereumScanCursors {
+    native: Option<u64>,
+    erc20: Option<u64>,
+    internal: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScanKind {
+    Native,
+    Erc20,
+    Internal,
+}
+
+impl EthereumScanCursors {
+    fn get(&self, kind: ScanKind) -> Option<u64> {
+        match kind {
+            ScanKind::Native => self.native,
+            ScanKind::Erc20 => self.erc20,
+            ScanKind::Internal => self.internal,
+        }
+    }
+
+    fn set(&mut self, kind: ScanKind, height: u64) {
+        let cursor = match kind {
+            ScanKind::Native => &mut self.native,
+            ScanKind::Erc20 => &mut self.erc20,
+            ScanKind::Internal => &mut self.internal,
+        };
+        *cursor = Some(cursor.map_or(height, |previous| previous.max(height)));
+    }
+
+    fn common_height(&self) -> Option<u64> {
+        Some(self.native?.min(self.erc20?).min(self.internal?))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EthereumState {
     last_scanned_block: Option<u64>,
+    #[serde(default)]
+    scan_cursors: Option<EthereumScanCursors>,
     #[serde(default)]
     pending: Vec<EthereumPendingPayment>,
     #[serde(default)]
@@ -146,6 +187,10 @@ pub struct EthereumDetector {
     /// intentional, otherwise concurrent calls would bypass the gap.
     rpc_throttle: Arc<tokio::sync::Mutex<Option<Instant>>>,
     rpc_min_interval: Duration,
+    read_providers: Vec<Provider<Http>>,
+    verified_read_providers: Mutex<HashSet<usize>>,
+    scan_lock: tokio::sync::Mutex<()>,
+    credit_lock: tokio::sync::Mutex<()>,
 }
 
 impl EthereumDetector {
@@ -198,6 +243,18 @@ impl EthereumDetector {
         }
 
         let provider = build_ethereum_provider(&config)?;
+        let mut read_providers = vec![provider.clone()];
+        if let Ok(urls) = std::env::var(format!("{prefix}_RPC_FALLBACK_URLS")) {
+            for url in urls
+                .split([',', ';'])
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                let mut fallback_config = config.clone();
+                fallback_config.rpc_url = url.to_string();
+                read_providers.push(build_ethereum_provider(&fallback_config)?);
+            }
+        }
 
         let gas_tank_wallet = config
             .gas_tank_private_key
@@ -252,7 +309,7 @@ impl EthereumDetector {
             }
         };
 
-        let state = load_ethereum_state(config.chain, &config.state_file);
+        let state = load_ethereum_state(config.chain, &config.state_file)?;
         let rpc_min_interval = Duration::from_millis(config.rpc_min_request_interval_ms);
         if !rpc_min_interval.is_zero() {
             log::info!(
@@ -278,6 +335,10 @@ impl EthereumDetector {
             state: Arc::new(Mutex::new(state)),
             rpc_throttle: Arc::new(tokio::sync::Mutex::new(None)),
             rpc_min_interval,
+            read_providers,
+            verified_read_providers: Mutex::new(HashSet::new()),
+            scan_lock: tokio::sync::Mutex::new(()),
+            credit_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -312,15 +373,15 @@ impl EthereumDetector {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, DetectorError>>,
     {
-        const MAX_ATTEMPTS: u32 = 5;
+        const MAX_ATTEMPTS: u32 = 3;
         let mut delay = Duration::from_millis(500);
         for attempt in 0..MAX_ATTEMPTS {
             self.acquire_rpc_slot().await;
             match f().await {
                 Ok(value) => return Ok(value),
-                Err(err) if attempt + 1 < MAX_ATTEMPTS && is_rpc_rate_limit_error(&err) => {
+                Err(err) if attempt + 1 < MAX_ATTEMPTS && is_retryable_rpc_error(&err) => {
                     log::warn!(
-                        "[{}] {} rate-limited (attempt {}/{}); backing off {}ms — error: {}",
+                        "[{}] {} transient failure (attempt {}/{}); backing off {}ms — error: {}",
                         self.config.chain.ticker(),
                         op,
                         attempt + 1,
@@ -337,18 +398,189 @@ impl EthereumDetector {
         unreachable!("with_rpc_retry loop should return inside the for body")
     }
 
-    pub fn wallet_count(&self) -> usize {
-        self.wallets.read().unwrap_or_else(|p| p.into_inner()).len()
+    /// Read-only failover. Transactions are always signed/sent via the primary
+    /// provider; retrying a send on another endpoint could duplicate a sweep.
+    async fn read_rpc<T>(&self, method: &str, params: serde_json::Value) -> Result<T, DetectorError>
+    where
+        T: serde::de::DeserializeOwned + Serialize + std::fmt::Debug + Send,
+    {
+        let mut last_error = None;
+        for (index, provider) in self.read_providers.iter().enumerate() {
+            let verified = self
+                .verified_read_providers
+                .lock()
+                .unwrap()
+                .contains(&index);
+            if !verified {
+                let chain = self
+                    .with_rpc_retry("eth_chainId", || async {
+                        provider
+                            .get_chainid()
+                            .await
+                            .map_err(|e| eth_rpc_error("eth_chainId", e))
+                    })
+                    .await;
+                match chain {
+                    Ok(chain) if chain == U256::from(self.config.chain_id) => {
+                        self.verified_read_providers.lock().unwrap().insert(index);
+                    }
+                    Ok(chain) => {
+                        last_error = Some(DetectorError::ApiError(format!(
+                            "RPC endpoint {} serves chain {}, expected {}",
+                            index + 1,
+                            chain,
+                            self.config.chain_id
+                        )));
+                        continue;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                }
+            }
+            match self
+                .with_rpc_retry(method, || async {
+                    let value = provider
+                        .request::<_, serde_json::Value>(method, params.clone())
+                        .await
+                        .map_err(|e| eth_rpc_error(method, e))?;
+                    if value.is_null()
+                        && matches!(
+                            method,
+                            "eth_getBlockByNumber"
+                                | "eth_getBlockReceipts"
+                                | "eth_getTransactionReceipt"
+                        )
+                    {
+                        return Err(DetectorError::ApiError(format!(
+                            "{method} returned null; historical data unavailable"
+                        )));
+                    }
+                    Ok(value)
+                })
+                .await
+            {
+                Ok(value) => match serde_json::from_value(value) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => {
+                        last_error = Some(DetectorError::ApiError(format!(
+                            "Invalid {method} response: {error}"
+                        )))
+                    }
+                },
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| DetectorError::ApiError("No read RPC configured".into())))
     }
 
-    /// Poison-tolerant state lock.
-    ///
-    /// Without this, a panic anywhere under the lock poisons it for good and
-    /// every later `lock().unwrap()` panics too — turning one bad cycle into a
-    /// permanently dead detector. The guarded value is plain data with no
-    /// invariant a partial update can break, so recovering it is safe.
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, EthereumState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    async fn full_block(&self, number: u64) -> Result<Block<Transaction>, DetectorError> {
+        let block: Option<Block<Transaction>> = self
+            .read_rpc(
+                "eth_getBlockByNumber",
+                serde_json::json!([format!("{number:#x}"), true]),
+            )
+            .await?;
+        let block = block.ok_or_else(|| {
+            DetectorError::ApiError(format!("Block {number} is unavailable; cursor retained"))
+        })?;
+        if block.number.map(|n| n.as_u64()) != Some(number) || block.hash.is_none() {
+            return Err(DetectorError::ApiError(format!(
+                "Invalid RPC block response for {number}"
+            )));
+        }
+        Ok(block)
+    }
+
+    async fn transaction_receipt(&self, hash: H256) -> Result<TransactionReceipt, DetectorError> {
+        let receipt: Option<TransactionReceipt> = self
+            .read_rpc("eth_getTransactionReceipt", serde_json::json!([hash]))
+            .await?;
+        let receipt = receipt.ok_or_else(|| {
+            DetectorError::ApiError(format!(
+                "Receipt {hash:#x} unavailable; payment retained for retry"
+            ))
+        })?;
+        if receipt.transaction_hash != hash
+            || receipt.block_hash.is_none()
+            || receipt.block_number.is_none()
+        {
+            return Err(DetectorError::ApiError(format!(
+                "Incomplete or mismatched receipt for {hash:#x}"
+            )));
+        }
+        Ok(receipt)
+    }
+
+    async fn block_receipts(&self, number: u64) -> Result<Vec<TransactionReceipt>, DetectorError> {
+        let block: Option<Block<H256>> = self
+            .read_rpc(
+                "eth_getBlockByNumber",
+                serde_json::json!([format!("{number:#x}"), false]),
+            )
+            .await?;
+        let block = block.ok_or_else(|| {
+            DetectorError::ApiError(format!("Block {number} unavailable during receipt scan"))
+        })?;
+        let hash = block
+            .hash
+            .ok_or_else(|| DetectorError::ApiError("Block missing hash".into()))?;
+        if block.number.map(|n| n.as_u64()) != Some(number) {
+            return Err(DetectorError::ApiError(
+                "Receipt scan received wrong block".into(),
+            ));
+        }
+        if block.transactions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch: Result<Option<Vec<TransactionReceipt>>, DetectorError> = self
+            .read_rpc(
+                "eth_getBlockReceipts",
+                serde_json::json!([format!("{number:#x}")]),
+            )
+            .await;
+        let receipts = match batch {
+            Ok(Some(receipts)) => receipts,
+            Ok(None) => {
+                return Err(DetectorError::ApiError(format!(
+                    "Receipts for block {number} unavailable"
+                )));
+            }
+            Err(error) if should_fallback_to_receipts(&error) => {
+                let mut receipts = Vec::with_capacity(block.transactions.len());
+                for txid in &block.transactions {
+                    receipts.push(self.transaction_receipt(*txid).await?);
+                }
+                receipts
+            }
+            Err(error) => return Err(error),
+        };
+        // A partial/empty RPC result must not move the cursor past lost logs.
+        if receipts.len() != block.transactions.len() {
+            return Err(DetectorError::ApiError(format!(
+                "Incomplete receipt set for block {number}"
+            )));
+        }
+        let expected: HashSet<H256> = block.transactions.into_iter().collect();
+        let mut seen = HashSet::new();
+        for receipt in &receipts {
+            if !expected.contains(&receipt.transaction_hash)
+                || !seen.insert(receipt.transaction_hash)
+            {
+                return Err(DetectorError::ApiError(format!(
+                    "Unexpected/duplicate receipt in block {number}"
+                )));
+            }
+            validate_receipt(receipt, receipt.transaction_hash, number, hash)?;
+        }
+        Ok(receipts)
+    }
+
+    pub fn wallet_count(&self) -> usize {
+        self.wallets.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn gas_tank_address(&self) -> String {
@@ -361,6 +593,26 @@ impl EthereumDetector {
 
     pub fn token_count(&self) -> usize {
         self.tokens.len()
+    }
+
+    pub fn webhook_address_set(&self) -> Vec<String> {
+        snapshot_ethereum_wallets(&self.wallets)
+            .iter()
+            .map(|wallet| format_address(wallet.eth_address))
+            .collect()
+    }
+
+    pub fn webhook_token_contracts(&self) -> Vec<String> {
+        self.tokens
+            .iter()
+            .map(|token| format_address(token.contract))
+            .collect()
+    }
+
+    /// A push wakes the normal scan for ALL assignments: EVM cursors are
+    /// chain-wide, so scanning only the notified wallet would skip others.
+    pub async fn process_webhook_now(&self) -> Result<(), DetectorError> {
+        self.process_cycle().await
     }
 
     /// Manually trigger a scan + sweep + credit pass for the user with the
@@ -527,18 +779,23 @@ impl EthereumDetector {
     }
 
     async fn process_cycle(&self) -> Result<(), DetectorError> {
+        let current_block = self.current_block_number().await?;
+        // Retry existing credits even if Redis or one of the scan sources is down.
+        self.process_credits(current_block).await?;
         let reservations =
             load_active_ethereum_reservations(self.config.chain, &self.config.redis_url).await?;
-        let current_block = self.current_block_number().await?;
-        let safe_block =
-            current_block.saturating_sub(self.config.min_confirmations.saturating_sub(1));
-
-        self.scan_new_blocks(&reservations, current_block, safe_block)
-            .await?;
+        let safe_block = current_block.saturating_sub(self.config.min_confirmations.max(1) - 1);
+        let scan_result = self
+            .scan_new_blocks(&reservations, current_block, safe_block)
+            .await;
         self.process_credits(current_block).await?;
-        self.maybe_maintain_gas_tank().await?;
-
-        Ok(())
+        if let Err(error) = self.maybe_maintain_gas_tank().await {
+            log::warn!(
+                "[{}] Gas tank maintenance will retry: {error}",
+                self.config.chain.ticker()
+            );
+        }
+        scan_result
     }
 
     async fn scan_new_blocks(
@@ -547,80 +804,129 @@ impl EthereumDetector {
         current_block: u64,
         safe_block: u64,
     ) -> Result<(), DetectorError> {
-        if reservations.is_empty() {
-            self.initialize_or_advance_cursor(safe_block)?;
-            return Ok(());
-        }
-
-        let maybe_last = { self.lock_state().last_scanned_block };
-        let from_block = match maybe_last {
-            Some(last) => last.saturating_add(1),
-            None => {
-                if let Some(start_block) = self.config.start_block {
-                    start_block
-                } else {
-                    self.set_last_scanned_block(safe_block)?;
-                    log::info!(
-                        "[{}] No state found; starting fresh after block {}. Set {}_START_BLOCK to backfill.",
-                        self.config.chain.ticker(),
-                        safe_block,
-                        chain_env_prefix(self.config.chain)
-                    );
-                    return Ok(());
-                }
+        let _guard = self.scan_lock.lock().await;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.scan_cursors.is_none() {
+                // Old state has one shared cursor. Inherit it without dropping
+                // the backlog (including the blocks rejected by an archive RPC).
+                let initial = state.last_scanned_block.or_else(|| {
+                    if self.config.start_block.is_none() {
+                        Some(safe_block)
+                    } else {
+                        None
+                    }
+                });
+                state.scan_cursors = Some(EthereumScanCursors {
+                    native: initial,
+                    erc20: initial,
+                    internal: initial,
+                });
+                state.last_scanned_block = initial;
             }
-        };
+        }
+        self.persist_state()?;
+        let lookup = self.reservation_lookup(reservations);
+        let mut first_error = None;
+        for kind in [ScanKind::Native, ScanKind::Erc20, ScanKind::Internal] {
+            if lookup.is_empty()
+                || (matches!(kind, ScanKind::Erc20) && self.tokens.is_empty())
+                || (matches!(kind, ScanKind::Internal) && self.etherscan.is_none())
+            {
+                self.set_scan_cursor(kind, safe_block)?;
+                continue;
+            }
+            if let Err(error) = self
+                .scan_source(kind, &lookup, current_block, safe_block)
+                .await
+            {
+                log::warn!(
+                    "[{}] {:?} scan paused; other sources continue: {error}",
+                    self.config.chain.ticker(),
+                    kind
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 
-        if from_block > safe_block {
+    async fn scan_source(
+        &self,
+        kind: ScanKind,
+        reservations: &HashMap<Address, EthereumReservation>,
+        current_block: u64,
+        safe_block: u64,
+    ) -> Result<(), DetectorError> {
+        let cursor = self
+            .state
+            .lock()
+            .unwrap()
+            .scan_cursors
+            .as_ref()
+            .unwrap()
+            .get(kind);
+        let mut from = cursor
+            .map(|last| last.saturating_add(1))
+            .unwrap_or(self.config.start_block.unwrap_or(safe_block));
+        let end = safe_block.min(from.saturating_add(self.config.max_blocks_per_cycle.max(1) - 1));
+        if from > end {
             return Ok(());
         }
-
-        let max_blocks = self.config.max_blocks_per_cycle.max(1);
-        let to_block = safe_block.min(from_block.saturating_add(max_blocks).saturating_sub(1));
-        let reservation_lookup = self.reservation_lookup(reservations);
-
         log::info!(
-            "[{}] Scanning blocks {}..={} for {} reserved address(es)",
+            "[{}] {:?} scanning blocks {}..={} for {} address(es)",
             self.config.chain.ticker(),
-            from_block,
-            to_block,
-            reservation_lookup.len()
+            kind,
+            from,
+            end,
+            reservations.len()
         );
-
-        let mut detected = Vec::new();
-        detected.extend(
-            self.scan_native_eth(from_block, to_block, current_block, &reservation_lookup)
-                .await?,
-        );
-        detected.extend(
-            self.scan_erc20_logs(from_block, to_block, current_block, &reservation_lookup)
-                .await?,
-        );
-        detected.extend(
-            self.scan_internal_calls(from_block, to_block, current_block, &reservation_lookup)
-                .await?,
-        );
-
-        for payment in detected {
-            self.emit_detected_and_enqueue(payment, current_block)
-                .await?;
+        while from <= end {
+            // Persist native progress every block; bound ERC-20 replay to 25
+            // blocks if a provider fails halfway through a receipt fallback.
+            let chunk = match kind {
+                ScanKind::Native => 1,
+                ScanKind::Erc20 => 25,
+                ScanKind::Internal => self.config.max_blocks_per_cycle.max(1),
+            };
+            let to = end.min(from.saturating_add(chunk - 1));
+            let detected = match kind {
+                ScanKind::Native => {
+                    self.scan_native_eth(from, to, current_block, reservations)
+                        .await?
+                }
+                ScanKind::Erc20 => {
+                    self.scan_erc20_logs(from, to, current_block, reservations)
+                        .await?
+                }
+                ScanKind::Internal => {
+                    self.scan_internal_calls(from, to, current_block, reservations)
+                        .await?
+                }
+            };
+            for payment in detected {
+                self.emit_detected_and_enqueue(payment, current_block)
+                    .await?;
+            }
+            self.set_scan_cursor(kind, to)?;
+            from = to.saturating_add(1);
         }
-
-        self.set_last_scanned_block(to_block)?;
         Ok(())
     }
 
-    fn initialize_or_advance_cursor(&self, safe_block: u64) -> Result<(), DetectorError> {
-        let should_update = {
-            let state = self.lock_state();
-            state
-                .last_scanned_block
-                .map_or(true, |last| last < safe_block)
-        };
-        if should_update {
-            self.set_last_scanned_block(safe_block)?;
+    fn set_scan_cursor(&self, kind: ScanKind, block: u64) -> Result<(), DetectorError> {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let cursors = state
+                .scan_cursors
+                .get_or_insert_with(EthereumScanCursors::default);
+            cursors.set(kind, block);
+            state.last_scanned_block = cursors.common_height();
         }
-        Ok(())
+        self.persist_state()
     }
 
     fn reservation_lookup(
@@ -647,17 +953,10 @@ impl EthereumDetector {
         let mut detected = Vec::new();
 
         for block_number in from_block..=to_block {
-            let block = self
-                .with_rpc_retry("eth_getBlockByNumber", || async {
-                    self.provider
-                        .get_block_with_txs(block_number)
-                        .await
-                        .map_err(|e| eth_rpc_error("eth_getBlockByNumber", e))
-                })
-                .await?;
-            let Some(block) = block else {
-                continue;
-            };
+            let block: Block<Transaction> = self.full_block(block_number).await?;
+            let block_hash = block
+                .hash
+                .ok_or_else(|| DetectorError::ApiError("Mined block has no hash".into()))?;
 
             for tx in block.transactions {
                 if tx.value.is_zero() {
@@ -681,6 +980,12 @@ impl EthereumDetector {
 
                 let event_id = format!("native:{:#x}:{}", tx.hash, format_address(to));
                 if self.is_known_event(&event_id) {
+                    continue;
+                }
+
+                let receipt = self.transaction_receipt(tx.hash).await?;
+                validate_receipt(&receipt, tx.hash, block_number, block_hash)?;
+                if !receipt_succeeded(&receipt)? {
                     continue;
                 }
 
@@ -715,75 +1020,109 @@ impl EthereumDetector {
         _current_block: u64,
         reservations: &HashMap<Address, EthereumReservation>,
     ) -> Result<Vec<DetectedEthereumPayment>, DetectorError> {
-        let to_topics = reservations
-            .keys()
-            .copied()
-            .map(address_to_topic)
-            .collect::<Vec<_>>();
-        if to_topics.is_empty() || self.tokens.is_empty() {
+        if reservations.is_empty() || self.tokens.is_empty() {
             return Ok(Vec::new());
         }
-
-        let transfer_topic = H256::from_slice(&keccak256("Transfer(address,address,uint256)"));
-        let mut detected = Vec::new();
-
-        for token in &self.tokens {
-            let filter = Filter::new()
-                .address(token.contract)
-                .from_block(BlockNumber::Number(from_block.into()))
-                .to_block(BlockNumber::Number(to_block.into()))
-                .topic0(transfer_topic)
-                .topic2(ValueOrArray::Array(to_topics.clone()));
-
-            let logs = self
-                .with_rpc_retry("eth_getLogs", || async {
-                    self.provider
-                        .get_logs(&filter)
-                        .await
-                        .map_err(|e| eth_rpc_error("eth_getLogs", e))
-                })
-                .await?;
-
-            for log in logs {
-                if log.topics.len() < 3 || log.data.0.len() != 32 {
-                    continue;
-                }
-                let to = address_from_topic(log.topics[2]);
-                let Some(reservation) = reservations.get(&to) else {
-                    continue;
-                };
-                let amount = U256::from_big_endian(&log.data.0);
-                if amount.is_zero() {
-                    continue;
-                }
-
-                let tx_hash = log.transaction_hash.unwrap_or_default();
-                let log_index = log.log_index.unwrap_or_default().as_u64();
-                let block_number = log.block_number.unwrap_or_default().as_u64();
-                let event_id = format!(
-                    "erc20:{}:{:#x}:{}",
-                    format_address(token.contract),
-                    tx_hash,
-                    log_index
+        let filter = Filter::new()
+            .address(ValueOrArray::Array(
+                self.tokens.iter().map(|t| t.contract).collect(),
+            ))
+            .from_block(BlockNumber::Number(from_block.into()))
+            .to_block(BlockNumber::Number(to_block.into()))
+            .topic0(H256::from_slice(&keccak256(
+                "Transfer(address,address,uint256)",
+            )))
+            .topic2(ValueOrArray::Array(
+                reservations.keys().copied().map(address_to_topic).collect(),
+            ));
+        let logs: Vec<Log> = match self
+            .read_rpc("eth_getLogs", serde_json::json!([filter]))
+            .await
+        {
+            Ok(logs) => logs,
+            Err(error) if should_fallback_to_receipts(&error) => {
+                log::warn!(
+                    "[{}] eth_getLogs unavailable for {}..={}; scanning block receipts instead: {error}",
+                    self.config.chain.ticker(),
+                    from_block,
+                    to_block
                 );
-                if self.is_known_event(&event_id) {
-                    continue;
+                let mut logs = Vec::new();
+                for block in from_block..=to_block {
+                    for receipt in self.block_receipts(block).await? {
+                        if receipt_succeeded(&receipt)? {
+                            logs.extend(receipt.logs);
+                        }
+                    }
                 }
-
-                detected.push(DetectedEthereumPayment {
-                    event_id,
-                    txid: format!("{:#x}", tx_hash),
-                    block_number,
-                    amount,
-                    asset: token.symbol.clone(),
-                    asset_decimals: token.decimals,
-                    token_contract: Some(token.contract),
-                    reservation: reservation.clone(),
-                });
+                logs
+            }
+            Err(error) => return Err(error),
+        };
+        let mut detected = Vec::new();
+        for log in logs {
+            if let Some(payment) =
+                self.payment_from_log(&log, from_block, to_block, reservations)?
+            {
+                if !self.is_known_event(&payment.event_id) {
+                    detected.push(payment);
+                }
             }
         }
-
         Ok(detected)
+    }
+
+    fn payment_from_log(
+        &self,
+        log: &Log,
+        from: u64,
+        to_block: u64,
+        reservations: &HashMap<Address, EthereumReservation>,
+    ) -> Result<Option<DetectedEthereumPayment>, DetectorError> {
+        if log.removed == Some(true)
+            || log.topics.len() != 3
+            || log.data.len() != 32
+            || log.topics[0] != H256::from_slice(&keccak256("Transfer(address,address,uint256)"))
+        {
+            return Ok(None);
+        }
+        let Some(token) = self.tokens.iter().find(|t| t.contract == log.address) else {
+            return Ok(None);
+        };
+        let Some(reservation) = reservations.get(&address_from_topic(log.topics[2])) else {
+            return Ok(None);
+        };
+        let (Some(hash), Some(index), Some(block)) =
+            (log.transaction_hash, log.log_index, log.block_number)
+        else {
+            return Err(DetectorError::ApiError(
+                "Transfer log missing transaction, index or block".into(),
+            ));
+        };
+        if !(from..=to_block).contains(&block.as_u64()) {
+            return Err(DetectorError::ApiError(
+                "Transfer log outside requested block range".into(),
+            ));
+        }
+        let amount = U256::from_big_endian(&log.data);
+        if amount.is_zero() {
+            return Ok(None);
+        }
+        Ok(Some(DetectedEthereumPayment {
+            event_id: format!(
+                "erc20:{}:{:#x}:{}",
+                format_address(token.contract),
+                hash,
+                index.as_u64()
+            ),
+            txid: format!("{hash:#x}"),
+            block_number: block.as_u64(),
+            amount,
+            asset: token.symbol.clone(),
+            asset_decimals: token.decimals,
+            token_contract: Some(token.contract),
+            reservation: reservation.clone(),
+        }))
     }
 
     /// Detect native ETH transfers that happened via internal CALLs (e.g.
@@ -807,6 +1146,7 @@ impl EthereumDetector {
 
         let mut detected = Vec::new();
         let mut total_internal_seen: usize = 0;
+        let mut first_error = None;
 
         for (address, reservation) in reservations {
             let internals = match etherscan
@@ -815,11 +1155,7 @@ impl EthereumDetector {
             {
                 Ok(list) => list,
                 Err(error) => {
-                    // Don't fail the whole scan on a transient Etherscan error
-                    // (rate-limit, timeout, transient HTTP). The cursor only
-                    // advances after the whole loop succeeds via the caller's
-                    // `set_last_scanned_block`, so we return the error to keep
-                    // the cursor put and retry next cycle.
+                    // Continue other addresses, but do not advance this source's cursor.
                     log::warn!(
                         "[{}] Etherscan scan failed for {} ({}..={}): {error}",
                         self.config.chain.ticker(),
@@ -827,7 +1163,8 @@ impl EthereumDetector {
                         from_block,
                         to_block
                     );
-                    return Err(error);
+                    first_error.get_or_insert(error);
+                    continue;
                 }
             };
 
@@ -893,29 +1230,27 @@ impl EthereumDetector {
             detected.len()
         );
 
+        if let Some(error) = first_error {
+            for payment in detected {
+                self.emit_detected_and_enqueue(payment, _current_block)
+                    .await?;
+            }
+            return Err(error);
+        }
         Ok(detected)
     }
 
     async fn emit_detected_and_enqueue(
         &self,
         payment: DetectedEthereumPayment,
-        current_block: u64,
+        _current_block: u64,
     ) -> Result<(), DetectorError> {
         if self.is_known_event(&payment.event_id) {
             return Ok(());
         }
 
-        let detected = self.payment_to_webhook(&payment, current_block, None);
-        send_webhook(
-            &self.webhook_client,
-            &self.config.webhook_url,
-            &self.config.webhook_hmac_secret,
-            &WebhookEvent::PaymentDetected(detected),
-        )
-        .await?;
-
         {
-            let mut state = self.lock_state();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let already_pending = state.pending.iter().any(|p| p.event_id == payment.event_id);
             let already_credited = state.credited_events.contains(&payment.event_id);
             if !already_pending && !already_credited {
@@ -930,6 +1265,7 @@ impl EthereumDetector {
                     address: payment.reservation.address,
                     user_id: payment.reservation.user_id,
                     wallet_index: payment.reservation.wallet_index,
+                    detected_notified: false,
                 });
             }
         }
@@ -938,92 +1274,161 @@ impl EthereumDetector {
     }
 
     async fn process_credits(&self, current_block: u64) -> Result<(), DetectorError> {
-        let pending = { self.lock_state().pending.clone() };
-
+        let _guard = self.credit_lock.lock().await;
+        self.persist_state()?;
+        let pending = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .clone();
         for entry in pending {
-            let confirmations = current_block.saturating_sub(entry.block_number) + 1;
-            if confirmations < self.config.min_confirmations {
-                continue;
-            }
-            if entry.token_contract.is_none() && self.is_pending_gas_tank_top_up(&entry).await? {
-                log::info!(
-                    "[{}] Ignoring previously queued gas tank top-up {} for {}",
+            let event_id = entry.event_id.clone();
+            if let Err(error) = self.process_credit_entry(entry, current_block).await {
+                log::warn!(
+                    "[{}] Credit {} will retry; continuing other payments: {error}",
                     self.config.chain.ticker(),
-                    entry.txid,
-                    entry.address
+                    event_id
                 );
-                self.mark_event_ignored(&entry.event_id)?;
-                continue;
-            }
-
-            let amount = U256::from_dec_str(&entry.amount_base_units).map_err(|e| {
-                DetectorError::InvalidConfig(format!(
-                    "Invalid persisted Ethereum amount for {}: {e}",
-                    entry.event_id
-                ))
-            })?;
-
-            let sweep = if let Some(ref contract) = entry.token_contract {
-                let contract = Address::from_str(contract).map_err(|e| {
-                    DetectorError::InvalidConfig(format!(
-                        "Invalid persisted token contract '{}': {e}",
-                        contract
-                    ))
-                })?;
-                self.sweep_erc20_from_address(&entry.address, contract, amount)
-                    .await?
-            } else {
-                self.sweep_native_from_address(&entry.address).await?
-            };
-
-            let already_credited = self.is_credited_event(&entry.event_id);
-
-            if !already_credited {
-                let sweep_for_webhook = if sweep.deferred { None } else { Some(&sweep) };
-                let mut credited_payment =
-                    self.pending_to_webhook(&entry, current_block, sweep_for_webhook, amount);
-                self.enrich_fiat(&mut credited_payment).await;
-
-                send_webhook(
-                    &self.webhook_client,
-                    &self.config.webhook_url,
-                    &self.config.webhook_hmac_secret,
-                    &WebhookEvent::PaymentCredited(credited_payment),
-                )
-                .await?;
-
-                {
-                    let mut state = self.lock_state();
-                    state.credited_events.insert(entry.event_id.clone());
-                }
-                self.persist_state()?;
-
-                if sweep.deferred {
-                    log::info!(
-                        "[{}] Credited {} immediately (funds on managed wallet); sweep deferred and will retry next cycle",
-                        self.config.chain.ticker(),
-                        entry.event_id
-                    );
-                }
-            } else if sweep.deferred {
-                log::info!(
-                    "[{}] Sweep retry deferred for already-credited {} (will retry next cycle)",
-                    self.config.chain.ticker(),
-                    entry.event_id
-                );
-            }
-
-            if !sweep.deferred {
-                {
-                    let mut state = self.lock_state();
-                    state
-                        .pending
-                        .retain(|pending| pending.event_id != entry.event_id);
-                }
-                self.persist_state()?;
             }
         }
+        Ok(())
+    }
 
+    async fn process_credit_entry(
+        &self,
+        mut entry: EthereumPendingPayment,
+        current_block: u64,
+    ) -> Result<(), DetectorError> {
+        let tx_hash = H256::from_str(&entry.txid)
+            .map_err(|e| DetectorError::InvalidConfig(format!("Invalid pending txid: {e}")))?;
+        let receipt = self.transaction_receipt(tx_hash).await?;
+        if !receipt_succeeded(&receipt)? {
+            self.mark_event_ignored(&entry.event_id)?;
+            return Ok(());
+        }
+        let mined_at = receipt.block_number.unwrap().as_u64();
+        if mined_at != entry.block_number {
+            entry.block_number = mined_at;
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(p) = state
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.event_id == entry.event_id)
+                {
+                    p.block_number = mined_at;
+                }
+            }
+            self.persist_state()?;
+        }
+        let confirmations = if current_block >= mined_at {
+            current_block - mined_at + 1
+        } else {
+            0
+        };
+        if entry.token_contract.is_none() && self.is_pending_gas_tank_top_up(&entry).await? {
+            log::info!(
+                "[{}] Ignoring previously queued gas tank top-up {} for {}",
+                self.config.chain.ticker(),
+                entry.txid,
+                entry.address
+            );
+            self.mark_event_ignored(&entry.event_id)?;
+            return Ok(());
+        }
+
+        let amount = U256::from_dec_str(&entry.amount_base_units).map_err(|e| {
+            DetectorError::InvalidConfig(format!(
+                "Invalid persisted Ethereum amount for {}: {e}",
+                entry.event_id
+            ))
+        })?;
+
+        if !entry.detected_notified {
+            let detected = self.pending_to_webhook(&entry, current_block, None, amount);
+            send_webhook(
+                &self.webhook_client,
+                &self.config.webhook_url,
+                &self.config.webhook_hmac_secret,
+                &WebhookEvent::PaymentDetected(detected),
+            )
+            .await?;
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(p) = state
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.event_id == entry.event_id)
+                {
+                    p.detected_notified = true;
+                }
+            }
+            self.persist_state()?;
+        }
+        if confirmations < self.config.min_confirmations.max(1) {
+            return Ok(());
+        }
+
+        let sweep = if let Some(ref contract) = entry.token_contract {
+            let contract = Address::from_str(contract).map_err(|e| {
+                DetectorError::InvalidConfig(format!(
+                    "Invalid persisted token contract '{}': {e}",
+                    contract
+                ))
+            })?;
+            self.sweep_erc20_from_address(&entry.address, contract, amount)
+                .await?
+        } else {
+            self.sweep_native_from_address(&entry.address).await?
+        };
+
+        let already_credited = self.is_credited_event(&entry.event_id);
+
+        if !already_credited {
+            let sweep_for_webhook = if sweep.deferred { None } else { Some(&sweep) };
+            let mut credited_payment =
+                self.pending_to_webhook(&entry, current_block, sweep_for_webhook, amount);
+            self.enrich_fiat(&mut credited_payment).await;
+
+            send_webhook(
+                &self.webhook_client,
+                &self.config.webhook_url,
+                &self.config.webhook_hmac_secret,
+                &WebhookEvent::PaymentCredited(credited_payment),
+            )
+            .await?;
+
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.credited_events.insert(entry.event_id.clone());
+            }
+            self.persist_state()?;
+
+            if sweep.deferred {
+                log::info!(
+                    "[{}] Credited {} immediately (funds on managed wallet); sweep deferred and will retry next cycle",
+                    self.config.chain.ticker(),
+                    entry.event_id
+                );
+            }
+        } else if sweep.deferred {
+            log::info!(
+                "[{}] Sweep retry deferred for already-credited {} (will retry next cycle)",
+                self.config.chain.ticker(),
+                entry.event_id
+            );
+        }
+
+        if !sweep.deferred {
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .pending
+                    .retain(|pending| pending.event_id != entry.event_id);
+            }
+            self.persist_state()?;
+        }
         Ok(())
     }
 
@@ -1041,12 +1446,10 @@ impl EthereumDetector {
             ))
         })?;
         let Some(tx) = self
-            .with_rpc_retry("eth_getTransactionByHash", || async {
-                self.provider
-                    .get_transaction(tx_hash)
-                    .await
-                    .map_err(|e| eth_rpc_error("eth_getTransactionByHash", e))
-            })
+            .read_rpc::<Option<Transaction>>(
+                "eth_getTransactionByHash",
+                serde_json::json!([tx_hash]),
+            )
             .await?
         else {
             return Ok(false);
@@ -1330,7 +1733,7 @@ impl EthereumDetector {
             .unwrap_or(i64::MAX)
             .max(1);
         let should_run = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state
                 .gas_tank_last_maintenance_unix
                 .map_or(true, |last| now.saturating_sub(last) >= interval)
@@ -1341,7 +1744,7 @@ impl EthereumDetector {
 
         self.maintain_gas_tank().await?;
         {
-            let mut state = self.lock_state();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.gas_tank_last_maintenance_unix = Some(now);
         }
         self.persist_state()
@@ -1594,14 +1997,10 @@ impl EthereumDetector {
     }
 
     async fn current_block_number(&self) -> Result<u64, DetectorError> {
-        self.with_rpc_retry("eth_blockNumber", || async {
-            self.provider
-                .get_block_number()
-                .await
-                .map(|block| block.as_u64())
-                .map_err(|e| eth_rpc_error("eth_blockNumber", e))
-        })
-        .await
+        let number: U64 = self
+            .read_rpc("eth_blockNumber", serde_json::json!([]))
+            .await?;
+        Ok(number.as_u64())
     }
 
     async fn eth_balance(&self, address: Address) -> Result<U256, DetectorError> {
@@ -1652,51 +2051,6 @@ impl EthereumDetector {
         .await
     }
 
-    fn payment_to_webhook(
-        &self,
-        payment: &DetectedEthereumPayment,
-        current_block: u64,
-        sweep: Option<&SweepResult>,
-    ) -> DetectedPayment {
-        let amount_coin = u256_to_units_f64(payment.amount, payment.asset_decimals);
-        let swept_amount = sweep.map(|result| result.amount);
-        let is_token = payment.token_contract.is_some();
-        DetectedPayment {
-            chain: self.config.chain,
-            ticker: payment.asset.clone(),
-            txid: payment.txid.clone(),
-            address: payment.reservation.address.clone(),
-            user_id: Some(payment.reservation.user_id.clone()),
-            amount_sat: u256_to_u64_saturating(payment.amount),
-            amount_coin,
-            confirmations: current_block.saturating_sub(payment.block_number) + 1,
-            block_height: Some(payment.block_number),
-            derivation_index: payment.reservation.wallet_index,
-            memo: None,
-            swept_to_address: sweep.map(|_| {
-                if is_token {
-                    self.ledger_address()
-                } else {
-                    self.gas_tank_address()
-                }
-            }),
-            swept_amount_sat: swept_amount.map(u256_to_u64_saturating),
-            swept_amount_coin: swept_amount
-                .map(|amount| u256_to_units_f64(amount, payment.asset_decimals)),
-            sweep_txid: sweep.and_then(|result| result.txid.clone()),
-            fiat_amount: None,
-            fiat_currency: None,
-            coin_price: None,
-            event_id: None,
-            log_index: None,
-            asset: Some(payment.asset.clone()),
-            asset_decimals: Some(payment.asset_decimals),
-            amount_base_units: Some(payment.amount.to_string()),
-            swept_amount_base_units: swept_amount.map(|amount| amount.to_string()),
-            token_contract: payment.token_contract.map(format_address),
-        }
-    }
-
     fn pending_to_webhook(
         &self,
         entry: &EthereumPendingPayment,
@@ -1732,8 +2086,8 @@ impl EthereumDetector {
             fiat_amount: None,
             fiat_currency: None,
             coin_price: None,
-            event_id: None,
-            log_index: None,
+            event_id: Some(entry.event_id.clone()),
+            log_index: event_log_index(&entry.event_id),
             asset: Some(entry.asset.clone()),
             asset_decimals: Some(entry.asset_decimals),
             amount_base_units: Some(entry.amount_base_units.clone()),
@@ -1798,7 +2152,7 @@ impl EthereumDetector {
     }
 
     fn is_known_event(&self, event_id: &str) -> bool {
-        let state = self.lock_state();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.credited_events.contains(event_id)
             || state.ignored_events.contains(event_id)
             || state
@@ -1808,30 +2162,22 @@ impl EthereumDetector {
     }
 
     fn is_credited_event(&self, event_id: &str) -> bool {
-        let state = self.lock_state();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.credited_events.contains(event_id)
     }
 
     fn mark_event_ignored(&self, event_id: &str) -> Result<(), DetectorError> {
         {
-            let mut state = self.lock_state();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.ignored_events.insert(event_id.to_string());
             state.pending.retain(|pending| pending.event_id != event_id);
         }
         self.persist_state()
     }
 
-    fn set_last_scanned_block(&self, block_number: u64) -> Result<(), DetectorError> {
-        {
-            let mut state = self.lock_state();
-            state.last_scanned_block = Some(block_number);
-        }
-        self.persist_state()
-    }
-
     fn persist_state(&self) -> Result<(), DetectorError> {
-        let state = { self.lock_state().clone() };
-        crate::persistence::write_json_atomic(&self.config.state_file, &state)
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        crate::persistence::save_json_state(&self.config.state_file, &*state)
     }
 
     /// On-demand TXID recovery for Ethereum mainnet / Base. The user
@@ -1930,12 +2276,10 @@ impl EthereumDetector {
         );
 
         let Some(tx) = self
-            .with_rpc_retry("eth_getTransactionByHash", || async {
-                self.provider
-                    .get_transaction(tx_hash)
-                    .await
-                    .map_err(|e| eth_rpc_error("eth_getTransactionByHash", e))
-            })
+            .read_rpc::<Option<Transaction>>(
+                "eth_getTransactionByHash",
+                serde_json::json!([tx_hash]),
+            )
             .await?
         else {
             return Ok(mk(RecoverStatus::TxNotFound));
@@ -1953,6 +2297,16 @@ impl EthereumDetector {
             }
         };
 
+        let receipt = self.transaction_receipt(tx_hash).await?;
+        if !receipt_succeeded(&receipt)? {
+            return Ok(mk(RecoverStatus::NoCreditAmount));
+        }
+        if receipt.block_number.map(|n| n.as_u64()) != Some(block_number) {
+            return Err(DetectorError::ApiError(
+                "Transaction moved blocks during recovery; retry".into(),
+            ));
+        }
+
         // Native ETH path: the tx itself credits the reserved address.
         if let Some(to) = tx.to {
             if to == reservation_address && !tx.value.is_zero() {
@@ -1967,7 +2321,7 @@ impl EthereumDetector {
                 let event_id = format!("native:{:#x}:{}", tx_hash, format_address(to));
 
                 {
-                    let state = self.lock_state();
+                    let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     if state.credited_events.contains(&event_id) {
                         return Ok(mk(RecoverStatus::AlreadyCredited));
                     }
@@ -2001,17 +2355,6 @@ impl EthereumDetector {
         // ERC-20 path: scan receipt logs for Transfer events targeted
         // at the reserved address. We trust the configured token list
         // (anything outside it is `NoCreditAmount` for our purposes).
-        let receipt = self
-            .with_rpc_retry("eth_getTransactionReceipt", || async {
-                self.provider
-                    .get_transaction_receipt(tx_hash)
-                    .await
-                    .map_err(|e| eth_rpc_error("eth_getTransactionReceipt", e))
-            })
-            .await?;
-        let Some(receipt) = receipt else {
-            return Ok(mk(RecoverStatus::TxNotFound));
-        };
         if receipt.status.map(|status| status.as_u64()) == Some(0) {
             log::info!(
                 "[{}] /recover-txid: txid={} reverted on-chain",
@@ -2054,7 +2397,7 @@ impl EthereumDetector {
             );
 
             {
-                let state = self.lock_state();
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.credited_events.contains(&event_id) {
                     return Ok(mk(RecoverStatus::AlreadyCredited));
                 }
@@ -2103,7 +2446,7 @@ impl EthereumDetector {
         user_id: &str,
     ) -> RecoverResponse {
         let credited = {
-            let state = self.lock_state();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.credited_events.contains(event_id)
         };
         let status = if credited {
@@ -2131,6 +2474,8 @@ fn build_ethereum_provider(config: &EthereumConfig) -> Result<Provider<Http>, De
     })?;
 
     let mut client_builder = reqwest_ethers::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(0)
         .connection_verbose(false);
 
@@ -2211,51 +2556,48 @@ impl PaymentDetector for EthereumDetector {
     }
 }
 
-/// Stablecoin contracts for `chain`, used when `{P}_ERC20_TOKENS` is unset or
-/// set to `default`.
-///
-/// Parametrized by chain because the contract addresses genuinely differ: Base
-/// has its own USDC/USDT deployments. Returning the mainnet ones for Base — as
-/// this function used to, unconditionally — meant `BASE_ERC20_TOKENS=default`
-/// silently watched addresses that hold nothing on Base, so token deposits were
-/// never detected and nothing in the logs said why.
-pub fn default_erc20_tokens(chain: Chain) -> Vec<Erc20TokenConfig> {
-    let (usdc, usdt) = match chain {
-        Chain::Base => (
-            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-            "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
-        ),
-        // Ethereum mainnet, and the historical fallback for any other chain.
-        _ => (
-            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-        ),
-    };
-
+pub fn default_erc20_tokens() -> Vec<Erc20TokenConfig> {
     vec![
         Erc20TokenConfig {
             symbol: "USDC".into(),
-            contract: Address::from_str(usdc).expect("valid USDC contract"),
+            contract: Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+                .expect("valid USDC contract"),
             decimals: 6,
         },
         Erc20TokenConfig {
             symbol: "USDT".into(),
-            contract: Address::from_str(usdt).expect("valid USDT contract"),
+            contract: Address::from_str("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+                .expect("valid USDT contract"),
             decimals: 6,
         },
     ]
 }
 
-pub fn parse_erc20_tokens(
-    value: Option<&str>,
+pub fn parse_erc20_tokens_for_chain(
     chain: Chain,
+    value: Option<&str>,
 ) -> Result<Vec<Erc20TokenConfig>, DetectorError> {
+    let use_defaults = value
+        .map(str::trim)
+        .is_none_or(|v| v.is_empty() || v.eq_ignore_ascii_case("default"));
+    if chain == Chain::Base && use_defaults {
+        return Ok(vec![Erc20TokenConfig {
+            symbol: "USDC".into(),
+            contract: Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+                .expect("Base USDC address"),
+            decimals: 6,
+        }]);
+    }
+    parse_erc20_tokens(value)
+}
+
+pub fn parse_erc20_tokens(value: Option<&str>) -> Result<Vec<Erc20TokenConfig>, DetectorError> {
     let Some(value) = value else {
-        return Ok(default_erc20_tokens(chain));
+        return Ok(default_erc20_tokens());
     };
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-        return Ok(default_erc20_tokens(chain));
+        return Ok(default_erc20_tokens());
     }
     if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("off") {
         return Ok(Vec::new());
@@ -2294,49 +2636,15 @@ pub fn parse_erc20_tokens(
         .collect()
 }
 
-fn load_ethereum_state(chain: Chain, path: &str) -> EthereumState {
-    let file = std::path::Path::new(path);
-    if !file.exists() {
-        log::info!(
-            "[{}] No persisted state file found at '{}', starting fresh",
-            chain.ticker(),
-            path
-        );
-        return EthereumState::default();
-    }
-
-    match std::fs::read_to_string(file) {
-        Ok(data) => match serde_json::from_str::<EthereumState>(&data) {
-            Ok(state) => {
-                log::info!(
-                    "[{}] Loaded state from '{}' with {} pending payment(s), last_scanned_block={:?}",
-                    chain.ticker(),
-                    path,
-                    state.pending.len(),
-                    state.last_scanned_block
-                );
-                state
-            }
-            Err(error) => {
-                log::warn!(
-                    "[{}] Failed to parse state file '{}': {} - starting fresh",
-                    chain.ticker(),
-                    path,
-                    error
-                );
-                EthereumState::default()
-            }
-        },
-        Err(error) => {
-            log::warn!(
-                "[{}] Failed to read state file '{}': {} - starting fresh",
-                chain.ticker(),
-                path,
-                error
-            );
-            EthereumState::default()
-        }
-    }
+fn load_ethereum_state(chain: Chain, path: &str) -> Result<EthereumState, DetectorError> {
+    let state: EthereumState = crate::persistence::load_json_state(path)?;
+    log::info!(
+        "[{}] Loaded state with {} pending payment(s), cursor {:?}",
+        chain.ticker(),
+        state.pending.len(),
+        state.last_scanned_block
+    );
+    Ok(state)
 }
 
 fn erc20_transfer_data(to: Address, amount: U256) -> Bytes {
@@ -2554,6 +2862,70 @@ fn is_rpc_insufficient_funds_error(err: &DetectorError) -> bool {
 /// - HTTP 429 / "too many requests"
 /// - "service unavailable" / "503" / "502" / "timeout" — bursty failure modes
 ///   that recover on retry; safer than blocking forward progress.
+fn event_log_index(event_id: &str) -> Option<u64> {
+    if !event_id.starts_with("erc20:") {
+        return None;
+    }
+    event_id.rsplit(':').next()?.parse().ok()
+}
+
+fn receipt_succeeded(receipt: &TransactionReceipt) -> Result<bool, DetectorError> {
+    match receipt.status.map(|s| s.as_u64()) {
+        Some(1) => Ok(true),
+        Some(0) => Ok(false),
+        _ => Err(DetectorError::ApiError(
+            "Transaction receipt missing a valid execution status".into(),
+        )),
+    }
+}
+
+fn validate_receipt(
+    receipt: &TransactionReceipt,
+    txid: H256,
+    block: u64,
+    hash: H256,
+) -> Result<(), DetectorError> {
+    if receipt.transaction_hash != txid
+        || receipt.block_number.map(|n| n.as_u64()) != Some(block)
+        || receipt.block_hash != Some(hash)
+    {
+        return Err(DetectorError::ApiError(format!(
+            "Receipt disagrees with block {block}; possible reorg, retrying"
+        )));
+    }
+    Ok(())
+}
+
+fn is_retryable_rpc_error(error: &DetectorError) -> bool {
+    let msg = error.to_string().to_ascii_lowercase();
+    is_rpc_rate_limit_error(error)
+        || msg.contains("returned null")
+        || msg.contains("unexpected end of file")
+        || msg.contains("error reading a body")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("connection closed")
+        || msg.contains("broken pipe")
+        || msg.contains("504")
+}
+
+fn should_fallback_to_receipts(error: &DetectorError) -> bool {
+    let msg = error.to_string().to_ascii_lowercase();
+    msg.contains("archive")
+        || msg.contains("returned null")
+        || msg.contains("not enabled")
+        || msg.contains("does not exist")
+        || msg.contains("not available")
+        || msg.contains("method not found")
+        || msg.contains("-32601")
+        || msg.contains("not supported")
+        || msg.contains("unsupported")
+        || msg.contains("block range")
+        || msg.contains("too many results")
+        || msg.contains("response size")
+        || msg.contains("-32005")
+}
+
 fn is_rpc_rate_limit_error(err: &DetectorError) -> bool {
     let msg = err.to_string().to_ascii_lowercase();
     msg.contains("over rate limit")
@@ -2572,60 +2944,12 @@ fn is_rpc_rate_limit_error(err: &DetectorError) -> bool {
 }
 
 #[cfg(test)]
+#[path = "tests/ethereum_detection.rs"]
+mod detection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `default` used to resolve to the Ethereum mainnet contracts on every
-    /// chain, so `BASE_ERC20_TOKENS=default` silently watched addresses that
-    /// hold nothing on Base and no token deposit was ever detected.
-    #[test]
-    fn default_erc20_tokens_are_chain_specific() {
-        let mainnet = default_erc20_tokens(Chain::Ethereum);
-        let base = default_erc20_tokens(Chain::Base);
-
-        assert_eq!(mainnet.len(), 2);
-        assert_eq!(base.len(), 2);
-        assert_eq!(base[0].symbol, "USDC");
-        assert_eq!(base[1].symbol, "USDT");
-
-        assert_ne!(mainnet[0].contract, base[0].contract);
-        assert_ne!(mainnet[1].contract, base[1].contract);
-
-        assert_eq!(
-            format!("{:?}", base[0].contract).to_lowercase(),
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-        );
-        assert_eq!(
-            format!("{:?}", base[1].contract).to_lowercase(),
-            "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
-        );
-    }
-
-    #[test]
-    fn default_keyword_follows_the_chain() {
-        let contracts = |tokens: &[Erc20TokenConfig]| {
-            tokens
-                .iter()
-                .map(|token| token.contract)
-                .collect::<Vec<_>>()
-        };
-        let expected = contracts(&default_erc20_tokens(Chain::Base));
-
-        let explicit = parse_erc20_tokens(Some("default"), Chain::Base).expect("valid config");
-        assert_eq!(contracts(&explicit), expected);
-
-        let implicit = parse_erc20_tokens(None, Chain::Base).expect("valid config");
-        assert_eq!(contracts(&implicit), expected);
-
-        // Base must not inherit the mainnet defaults through this path either.
-        assert_ne!(
-            contracts(&explicit),
-            contracts(&default_erc20_tokens(Chain::Ethereum))
-        );
-
-        let disabled = parse_erc20_tokens(Some("none"), Chain::Base).expect("valid config");
-        assert!(disabled.is_empty());
-    }
 
     #[test]
     fn native_gas_tank_top_up_is_internal() {

@@ -11,6 +11,7 @@ pub mod helius_webhooks;
 pub mod litecoin_block;
 pub mod persistence;
 pub mod pricing;
+pub mod quicknode;
 pub mod recover;
 pub mod remote_config;
 pub mod solana;
@@ -20,6 +21,9 @@ pub mod solana_tokens;
 pub mod trait_def;
 pub mod types;
 pub mod webhook;
+
+#[cfg(test)]
+mod test_support;
 
 pub use bitcoin_sweep::{BitcoinSweepConfig, BitcoinSweepResult};
 pub use blockstream::ChainDetector;
@@ -31,6 +35,7 @@ pub use config::{
 pub use error::DetectorError;
 pub use ethereum::{
     Erc20TokenConfig, EthereumConfig, EthereumDetector, default_erc20_tokens, parse_erc20_tokens,
+    parse_erc20_tokens_for_chain,
 };
 pub use ethereum_pool::{
     EthereumAssignment, EthereumReservation, ManagedEthereumWallet, SharedEthereumWallets,

@@ -21,48 +21,39 @@ pub async fn send_webhook(
     mac.update(payload.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
 
-    let mut attempt: u32 = 0;
-    loop {
+    // The durable detector outbox retries on later cycles. A permanently
+    // rejected payload must never monopolize the scan/credit task forever.
+    const ATTEMPTS: u32 = 3;
+    for attempt in 0..ATTEMPTS {
         let result = client
             .post(url)
+            .timeout(std::time::Duration::from_secs(10))
             .header("Content-Type", "application/json")
             .header("X-Signature-256", &signature)
             .body(payload.clone())
             .send()
             .await;
-
-        match result {
-            Ok(response) if response.status().is_success() => {
-                if attempt > 0 {
-                    log::info!("Webhook delivered after {} retries", attempt);
-                }
-                return Ok(());
-            }
+        let error = match result {
+            Ok(response) if response.status().is_success() => return Ok(()),
             Ok(response) => {
                 let status = response.status();
-                attempt += 1;
-                let delay = std::cmp::min(1000 * 2u64.pow(attempt.min(6)), 60_000);
-                log::warn!(
-                    "Webhook returned status {} - retry #{} in {}ms",
-                    status,
-                    attempt,
-                    delay
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                let error =
+                    DetectorError::WebhookError(format!("Webhook returned status {status}"));
+                if status.is_client_error() && status.as_u16() != 408 && status.as_u16() != 429 {
+                    return Err(error);
+                }
+                error
             }
-            Err(e) => {
-                attempt += 1;
-                let delay = std::cmp::min(1000 * 2u64.pow(attempt.min(6)), 60_000);
-                log::warn!(
-                    "Webhook request failed: {} - retry #{} in {}ms",
-                    e,
-                    attempt,
-                    delay
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            }
+            Err(error) => DetectorError::WebhookError(format!("Webhook request failed: {error}")),
+        };
+        if attempt + 1 == ATTEMPTS {
+            return Err(error);
         }
+        let delay = 1000 * (1u64 << attempt);
+        log::warn!("{error}; retrying in {delay}ms");
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
     }
+    unreachable!()
 }
 
 fn log_payment_webhook(event: &WebhookEvent) {

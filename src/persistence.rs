@@ -6,16 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::DetectorError;
 use crate::types::DetectedPayment;
 
-/// A payment seen in a block but not yet at `min_confirmations`.
-///
-/// Persisted with the rest of the state: a restart between detection and
-/// confirmation would otherwise drop the entry for good, because
-/// `last_scanned_height` has already moved past the block it was found in and
-/// the scan never revisits it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingPayment {
+pub struct PersistedPendingPayment {
     pub payment: DetectedPayment,
     pub block_height: u64,
+    #[serde(default)]
+    pub detected_notified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,9 +20,20 @@ pub struct PersistedState {
     #[serde(default)]
     pub known_block_hashes: std::collections::HashMap<u64, String>,
     #[serde(default)]
-    pub pending: Vec<PendingPayment>,
+    pub pending: Vec<PersistedPendingPayment>,
     #[serde(default)]
     pub notified_confirmed: std::collections::HashSet<String>,
+}
+
+pub(crate) fn load_json_state<T: serde::de::DeserializeOwned + Default>(
+    path: &str,
+) -> Result<T, DetectorError> {
+    match std::fs::read_to_string(path) {
+        Ok(data) => serde_json::from_str(&data).map_err(|e| DetectorError::InvalidConfig(
+            format!("Cannot parse state '{path}'; preserve this file and repair it before restarting: {e}"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(DetectorError::InvalidConfig(format!("Cannot read state '{path}': {error}"))),
+    }
 }
 
 pub fn load_state(path: &str) -> Result<PersistedState, DetectorError> {
@@ -55,39 +62,28 @@ pub fn load_state(path: &str) -> Result<PersistedState, DetectorError> {
 }
 
 pub fn save_state(path: &str, state: &PersistedState) -> Result<(), DetectorError> {
-    write_json_atomic(path, state)
+    save_json_state(path, state)
 }
 
-/// Write `value` as pretty JSON to `path`, atomically and durably.
-///
-/// `tmp + rename` alone only guarantees that a reader never observes a
-/// half-written file. It says nothing about a power loss: the rename can reach
-/// the disk while the data behind it has not, leaving a state file that is
-/// valid JSON but truncated. Fsyncing the temp file before the rename — and the
-/// directory after it — is what makes the swap survive a crash, which matters
-/// here because the state file is the only record of payments awaiting
-/// confirmation.
-pub fn write_json_atomic<T: Serialize>(path: &str, value: &T) -> Result<(), DetectorError> {
+/// Call while holding the detector's state lock: serialization and replacement
+/// must describe the same snapshot, and concurrent writers must not share .tmp.
+pub(crate) fn save_json_state<T: Serialize>(path: &str, state: &T) -> Result<(), DetectorError> {
     let tmp_path = format!("{}.tmp", path);
-    let data = serde_json::to_string_pretty(value)?;
-
-    let write_err = |e: std::io::Error| {
-        DetectorError::InvalidConfig(format!("Failed to write state file '{tmp_path}': {e}"))
-    };
-
-    {
-        let mut file = std::fs::File::create(&tmp_path).map_err(write_err)?;
-        file.write_all(data.as_bytes()).map_err(write_err)?;
-        file.sync_all().map_err(write_err)?;
-    }
-
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        DetectorError::InvalidConfig(format!("Failed to rename state file to '{path}': {e}"))
-    })?;
-
+    let data = serde_json::to_string_pretty(state)?;
+    let mut file = std::fs::File::create(&tmp_path)
+        .map_err(|e| DetectorError::InvalidConfig(format!("Failed to create state file: {e}")))?;
+    file.write_all(data.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| DetectorError::InvalidConfig(format!("Failed to flush state file: {e}")))?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| DetectorError::InvalidConfig(format!("Failed to rename state file: {e}")))?;
     fsync_parent_dir(path);
-
     Ok(())
+}
+
+pub fn write_json_atomic<T: Serialize>(path: &str, value: &T) -> Result<(), DetectorError> {
+    save_json_state(path, value)
 }
 
 /// Persist the directory entry pointing at `path`.
@@ -161,9 +157,10 @@ mod tests {
             last_scanned_height: Some(900_000),
             ..Default::default()
         };
-        state.pending.push(PendingPayment {
+        state.pending.push(PersistedPendingPayment {
             payment: sample_payment("aa"),
             block_height: 900_000,
+            detected_notified: false,
         });
         state.notified_confirmed.insert("bb".to_string());
 

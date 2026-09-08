@@ -6,11 +6,14 @@ use solana_sdk::pubkey::Pubkey;
 use crate::error::DetectorError;
 
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 pub const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
 pub const USDC_MAINNET_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub const USDC_DEFAULT_DECIMALS: u8 = 6;
+pub const CASH_MAINNET_MINT: &str = "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH";
+pub const CASH_DEFAULT_DECIMALS: u8 = 6;
 
 #[derive(Debug, Clone)]
 pub struct SplTokenConfig {
@@ -23,6 +26,16 @@ pub fn token_program_id() -> Pubkey {
     Pubkey::from_str(TOKEN_PROGRAM_ID).expect("hardcoded SPL token program id")
 }
 
+/// CASH is issued by Token-2022. Resolve by mint, never by the configurable
+/// display symbol, and use the same program for ATA derivation and transfers.
+pub fn token_program_for_mint(mint: &Pubkey) -> Pubkey {
+    if *mint == Pubkey::from_str(CASH_MAINNET_MINT).expect("valid CASH mint") {
+        Pubkey::from_str(TOKEN_2022_PROGRAM_ID).expect("valid Token-2022 program")
+    } else {
+        token_program_id()
+    }
+}
+
 pub fn associated_token_program_id() -> Pubkey {
     Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID)
         .expect("hardcoded SPL associated token program id")
@@ -33,7 +46,7 @@ pub fn system_program_id() -> Pubkey {
 }
 
 pub fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let token_program = token_program_id();
+    let token_program = token_program_for_mint(mint);
     let ata_program = associated_token_program_id();
     let (ata, _bump) = Pubkey::find_program_address(
         &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
@@ -56,7 +69,7 @@ pub fn create_associated_token_account_idempotent_instruction(
             AccountMeta::new_readonly(*wallet, false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(system_program_id(), false),
-            AccountMeta::new_readonly(token_program_id(), false),
+            AccountMeta::new_readonly(token_program_for_mint(mint), false),
         ],
         data: vec![1u8], // CreateIdempotent discriminator
     }
@@ -76,7 +89,7 @@ pub fn spl_transfer_checked_instruction(
     data.push(decimals);
 
     Instruction {
-        program_id: token_program_id(),
+        program_id: token_program_for_mint(mint),
         accounts: vec![
             AccountMeta::new(*source, false),
             AccountMeta::new_readonly(*mint, false),
@@ -133,11 +146,18 @@ pub fn parse_spl_tokens(value: Option<&str>) -> Result<Vec<SplTokenConfig>, Dete
 }
 
 pub fn default_spl_tokens() -> Vec<SplTokenConfig> {
-    vec![SplTokenConfig {
-        symbol: "USDC".into(),
-        mint: Pubkey::from_str(USDC_MAINNET_MINT).expect("valid USDC mainnet mint"),
-        decimals: USDC_DEFAULT_DECIMALS,
-    }]
+    vec![
+        SplTokenConfig {
+            symbol: "USDC".into(),
+            mint: Pubkey::from_str(USDC_MAINNET_MINT).expect("valid USDC mainnet mint"),
+            decimals: USDC_DEFAULT_DECIMALS,
+        },
+        SplTokenConfig {
+            symbol: "CASH".into(),
+            mint: Pubkey::from_str(CASH_MAINNET_MINT).expect("valid CASH mainnet mint"),
+            decimals: CASH_DEFAULT_DECIMALS,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -153,17 +173,58 @@ mod tests {
     }
 
     #[test]
-    fn parse_default_token_returns_usdc() {
+    fn parse_default_tokens_include_usdc_and_cash() {
         let parsed = parse_spl_tokens(None).unwrap();
-        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].symbol, "USDC");
         assert_eq!(parsed[0].decimals, 6);
+        assert_eq!(parsed[1].symbol, "CASH");
+        assert_eq!(parsed[1].mint.to_string(), CASH_MAINNET_MINT);
+        assert_eq!(parsed[1].decimals, 6);
     }
 
     #[test]
     fn parse_none_disables_tokens() {
         assert!(parse_spl_tokens(Some("none")).unwrap().is_empty());
         assert!(parse_spl_tokens(Some("off")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cash_uses_token_2022_for_both_ata_and_transfer() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::from_str(CASH_MAINNET_MINT).unwrap();
+        let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap();
+        let (expected, _) = Pubkey::find_program_address(
+            &[owner.as_ref(), token_2022.as_ref(), mint.as_ref()],
+            &associated_token_program_id(),
+        );
+        let (legacy, _) = Pubkey::find_program_address(
+            &[owner.as_ref(), token_program_id().as_ref(), mint.as_ref()],
+            &associated_token_program_id(),
+        );
+        assert_eq!(derive_associated_token_address(&owner, &mint), expected);
+        assert_ne!(expected, legacy);
+        let create = create_associated_token_account_idempotent_instruction(
+            &owner, &expected, &owner, &mint,
+        );
+        assert_eq!(create.accounts[5].pubkey, token_2022);
+        let transfer = spl_transfer_checked_instruction(
+            &expected,
+            &mint,
+            &Pubkey::new_unique(),
+            &owner,
+            42_000_000,
+            6,
+        );
+        assert_eq!(transfer.program_id, token_2022);
+        assert_eq!(
+            u64::from_le_bytes(transfer.data[1..9].try_into().unwrap()),
+            42_000_000
+        );
+        assert_eq!(
+            token_program_for_mint(&Pubkey::from_str(USDC_MAINNET_MINT).unwrap()),
+            token_program_id()
+        );
     }
 
     #[test]
