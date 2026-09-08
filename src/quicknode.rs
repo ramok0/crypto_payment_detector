@@ -121,6 +121,10 @@ impl QuickNodeClient {
         }
         let http = reqwest::Client::builder()
             .no_proxy()
+            .user_agent(concat!(
+                "crypto-payment-detector/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
@@ -337,6 +341,10 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async move {
                     assert_eq!(headers["x-api-key"], "api-key");
+                    assert_eq!(
+                        headers["user-agent"],
+                        concat!("crypto-payment-detector/", env!("CARGO_PKG_VERSION"))
+                    );
                     Json(json!({"data": usage()}))
                 }
             }),
