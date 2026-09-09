@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::extract::ConnectInfo;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 
 use crypto_payment_detector::derivation::derive_address;
 use crypto_payment_detector::env_utils::{chain_env_prefix, chain_env_var, env_bool};
@@ -258,6 +261,281 @@ struct SolanaAddressHealthCursor {
 struct EthereumHealthState {
     last_scanned_block: Option<u64>,
 }
+
+#[derive(Serialize)]
+struct PanelSnapshot {
+    generated_at_unix: u64,
+    overall: &'static str,
+    chains: Vec<PanelChainStatus>,
+}
+
+#[derive(Serialize)]
+struct PanelChainStatus {
+    chain: String,
+    ticker: String,
+    detector: &'static str,
+    rpc_reachable: bool,
+    cursor: Option<String>,
+    pending_payments: usize,
+    credited_payments: usize,
+    gas_address: Option<String>,
+    gas_balance: Option<f64>,
+    gas_symbol: Option<&'static str>,
+    gas_minimum: Option<f64>,
+    gas_low: bool,
+    error: Option<String>,
+}
+
+fn state_counters(path: &str) -> (Option<String>, usize, usize, Option<String>) {
+    let value: serde_json::Value = match std::fs::read(path)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+    {
+        Ok(value) => value,
+        Err(error) => return (None, 0, 0, Some(format!("state: {error}"))),
+    };
+    let count = |keys: &[&str]| {
+        keys.iter().find_map(|key| value.get(key)).map_or(0, |v| {
+            v.as_array()
+                .map_or_else(|| v.as_object().map_or(0, serde_json::Map::len), Vec::len)
+        })
+    };
+    let cursor = value
+        .get("last_scanned_height")
+        .or_else(|| value.get("last_scanned_block"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .or_else(|| {
+            value
+                .get("addresses")
+                .and_then(|v| v.as_object())
+                .and_then(|addresses| {
+                    let active = addresses
+                        .values()
+                        .filter(|entry| {
+                            entry
+                                .get("last_processed_signature")
+                                .is_some_and(|v| !v.is_null())
+                        })
+                        .count();
+                    (active > 0).then(|| format!("{active} adresse(s) suivie(s)"))
+                })
+        });
+    (
+        cursor,
+        count(&["pending"]),
+        count(&["credited_events", "credited_payments", "notified_confirmed"]),
+        None,
+    )
+}
+
+async fn rpc_value(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    client
+        .post(url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "réponse RPC sans result".to_string())
+}
+
+async fn panel_chain_status(state: &AppState, info: &ChainInfo) -> PanelChainStatus {
+    let (cursor, pending, credited, mut error) = state_counters(&info.state_file);
+    let mut gas_address = None;
+    let mut gas_balance = None;
+    let mut gas_symbol = None;
+    let mut gas_minimum = None;
+    let reachable;
+
+    match &info.endpoint {
+        HealthEndpoint::ExplorerApis(urls) => {
+            reachable = if let Some(url) = urls.first() {
+                let health_url = if is_blockchair_api_url(url) {
+                    blockchair_health_url(url)
+                } else {
+                    esplora_health_url(url)
+                };
+                state
+                    .health_client
+                    .get(health_url)
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+            } else {
+                false
+            };
+        }
+        HealthEndpoint::SolanaRpc(url) => {
+            gas_address = state
+                .solana_pool
+                .as_ref()
+                .and_then(|pool| pool.detector.as_ref())
+                .and_then(|detector| detector.gas_tank_address());
+            gas_symbol = Some("SOL");
+            gas_minimum = Some(
+                std::env::var("PANEL_SOL_GAS_MINIMUM")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.01),
+            );
+            let slot = rpc_value(&state.health_client, url, "getSlot", serde_json::json!([])).await;
+            reachable = slot.is_ok();
+            if let Some(address) = &gas_address {
+                match rpc_value(
+                    &state.health_client,
+                    url,
+                    "getBalance",
+                    serde_json::json!([address]),
+                )
+                .await
+                {
+                    Ok(v) => {
+                        gas_balance = v
+                            .get("value")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as f64 / 1e9)
+                    }
+                    Err(e) => error = Some(format!("solde gaz: {e}")),
+                }
+            }
+        }
+        HealthEndpoint::EthereumRpc(url) => {
+            gas_address = match info.chain {
+                Chain::Ethereum => state.ethereum_pool.as_ref(),
+                Chain::Base => state.base_pool.as_ref(),
+                _ => None,
+            }
+            .map(|pool| pool.gas_tank_address.clone());
+            gas_symbol = Some("ETH");
+            let prefix = chain_env_prefix(info.chain);
+            gas_minimum = Some(
+                std::env::var(format!("PANEL_{prefix}_GAS_MINIMUM"))
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.002),
+            );
+            let block = rpc_value(
+                &state.health_client,
+                url,
+                "eth_blockNumber",
+                serde_json::json!([]),
+            )
+            .await;
+            reachable = block.is_ok();
+            if let Some(address) = &gas_address {
+                match rpc_value(
+                    &state.health_client,
+                    url,
+                    "eth_getBalance",
+                    serde_json::json!([address, "latest"]),
+                )
+                .await
+                {
+                    Ok(v) => {
+                        gas_balance = v
+                            .as_str()
+                            .and_then(|v| u128::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                            .map(|v| v as f64 / 1e18)
+                    }
+                    Err(e) => error = Some(format!("solde gaz: {e}")),
+                }
+            }
+        }
+    }
+    let gas_low = gas_minimum
+        .zip(gas_balance)
+        .is_some_and(|(minimum, balance)| balance < minimum);
+    PanelChainStatus {
+        chain: info.chain.name().to_string(),
+        ticker: info.chain.ticker().to_string(),
+        detector: if reachable && cursor.is_some() {
+            "actif"
+        } else {
+            "dégradé"
+        },
+        rpc_reachable: reachable,
+        cursor,
+        pending_payments: pending,
+        credited_payments: credited,
+        gas_address,
+        gas_balance,
+        gas_symbol,
+        gas_minimum,
+        gas_low,
+        error,
+    }
+}
+
+async fn handle_panel_status(State(state): State<Arc<AppState>>) -> Json<PanelSnapshot> {
+    let mut chains = Vec::with_capacity(state.chains.len());
+    for info in &state.chains {
+        chains.push(panel_chain_status(&state, info).await);
+    }
+    let healthy = chains
+        .iter()
+        .all(|c| c.rpc_reachable && c.detector == "actif" && !c.gas_low);
+    Json(PanelSnapshot {
+        generated_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        overall: if healthy {
+            "opérationnel"
+        } else {
+            "attention requise"
+        },
+        chains,
+    })
+}
+
+async fn tailscale_only(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !is_tailnet_or_loopback(peer.ip()) {
+        return (StatusCode::FORBIDDEN, "Panel réservé au tailnet").into_response();
+    }
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
+
+fn is_tailnet_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback() || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || (ip.segments()[0] == 0xfd7a
+                    && ip.segments()[1] == 0x115c
+                    && ip.segments()[2] == 0xa1e0)
+        }
+    }
+}
+
+async fn handle_panel() -> Html<&'static str> {
+    Html(PANEL_HTML)
+}
+
+const PANEL_HTML: &str = include_str!("panel.html");
 
 async fn handle_derive(
     State(state): State<Arc<AppState>>,
@@ -1968,7 +2246,7 @@ async fn main() {
         bitcoin_detectors,
     });
 
-    let app = api_router(state);
+    let app = api_router(state.clone());
     // The API future below never completes, so nothing would ever observe a
     // dead detector task: the process would keep answering /reserve while
     // deposits stopped being credited. Watch the tasks and fail fast instead,
@@ -1995,6 +2273,28 @@ async fn main() {
             None => return,
         }
         std::process::exit(1);
+    });
+
+    let panel_bind =
+        std::env::var("TAILSCALE_PANEL_BIND").unwrap_or_else(|_| "127.0.0.1:3031".to_string());
+    let panel_listener = tokio::net::TcpListener::bind(&panel_bind)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("Impossible d'écouter le panel Tailscale sur {panel_bind}: {e}")
+        });
+    log::info!("Panel opérations Tailscale disponible sur http://{panel_bind}");
+    let panel_app = Router::new()
+        .route("/", get(handle_panel))
+        .route("/status", get(handle_panel_status))
+        .layer(axum::middleware::from_fn(tailscale_only))
+        .with_state(state);
+    tokio::spawn(async move {
+        axum::serve(
+            panel_listener,
+            panel_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Serveur du panel Tailscale arrêté: {e}"));
     });
 
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3030".to_string());
@@ -2038,6 +2338,53 @@ fn api_router(state: Arc<AppState>) -> Router {
 mod quicknode_api_tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn panel_network_filter_only_accepts_tailnet_and_loopback() {
+        for address in [
+            "127.0.0.1",
+            "::1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "fd7a:115c:a1e0::1",
+        ] {
+            assert!(
+                is_tailnet_or_loopback(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        for address in [
+            "10.0.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "8.8.8.8",
+            "fd00::1",
+        ] {
+            assert!(
+                !is_tailnet_or_loopback(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_reads_detection_counters_without_private_keys() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            json!({
+                "last_scanned_block": 42,
+                "pending": [{"event_id": "pending"}],
+                "credited_events": ["one", "two"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (cursor, pending, credited, error) = state_counters(file.path().to_str().unwrap());
+        assert_eq!(cursor.as_deref(), Some("42"));
+        assert_eq!((pending, credited), (1, 2));
+        assert!(error.is_none());
+    }
 
     async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

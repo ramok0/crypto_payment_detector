@@ -142,7 +142,24 @@ BTC_MIN_CONFIRMATIONS=3
 LTC_MIN_CONFIRMATIONS=2
 MAX_DERIVATION_INDEX=1500
 API_BIND=0.0.0.0:3030
+TAILSCALE_PANEL_BIND=127.0.0.1:3031 # ou l'IP Tailscale 100.x de la machine
+PANEL_SOL_GAS_MINIMUM=0.01          # alerte du panel sous ce solde
+PANEL_ETH_GAS_MINIMUM=0.002
+PANEL_BASE_GAS_MINIMUM=0.002
 ```
+
+## Panel d'opérations Tailscale
+
+Le binaire `crypto_payment_api` expose un second serveur, indépendant de l'API
+publique, avec l'état des détecteurs, les curseurs et files de paiements, les
+adresses de gaz et une alerte de solde insuffisant. Il se rafraîchit toutes les
+5 secondes. Par défaut il écoute uniquement `127.0.0.1:3031`, ce qui convient à
+`tailscale serve http://127.0.0.1:3031`. Il peut aussi écouter directement sur
+l'adresse Tailscale de la machine avec `TAILSCALE_PANEL_BIND=100.x.y.z:3031`.
+
+Le serveur refuse au niveau applicatif toute adresse source hors loopback,
+plage Tailscale IPv4 (`100.64.0.0/10`) ou préfixe Tailscale IPv6. Ne publiez pas
+ce port via un reverse proxy public.
 
 BTC/LTC explorer URLs use Esplora-compatible APIs by default. Litecoin also
 falls back to Blockchair when `litecoinspace.org` is unreachable. For production
