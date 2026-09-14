@@ -14,6 +14,7 @@ pub mod pricing;
 pub mod quicknode;
 pub mod recover;
 pub mod remote_config;
+pub mod reset;
 pub mod solana;
 pub mod solana_pool;
 pub mod solana_scheduled;

@@ -238,7 +238,9 @@ fn create_ethereum_wallet_pool_file(chain: Chain, path: &str) -> Result<String, 
     }
 }
 
-fn generate_ethereum_wallet_pool_json(wallet_count: usize) -> Result<String, DetectorError> {
+pub(crate) fn generate_ethereum_wallet_pool_json(
+    wallet_count: usize,
+) -> Result<String, DetectorError> {
     let wallets = generate_ethereum_wallet_entries(wallet_count)?;
     serde_json::to_string_pretty(&WalletPoolInput::Wrapped { wallets }).map_err(Into::into)
 }

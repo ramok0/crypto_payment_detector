@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/crypto_payment_detector /usr/local/bin/crypto_payment_detector
 COPY --from=builder /app/target/release/crypto_payment_api /usr/local/bin/crypto_payment_api
+COPY --from=builder /app/target/release/crypto_payment_reset /usr/local/bin/crypto_payment_reset
+RUN crypto_payment_reset --version
 
 # State files and wallet pool paths default to relative locations. Without a
 # WORKDIR they would resolve against `/`, scattering them across the image root.

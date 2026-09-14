@@ -1942,6 +1942,8 @@ async fn main() {
     // over the local env BEFORE any config builder runs, then watch for
     // changes (a change triggers a clean restart so it always applies).
     let cfg_sig = crypto_payment_detector::remote_config::bootstrap().await;
+    let _storage_guard = crypto_payment_detector::reset::detector_guard()
+        .expect("Reset incomplete or storage locked; inspect reset archive before restarting");
     crypto_payment_detector::remote_config::spawn_watcher(cfg_sig);
 
     let quicknode = QuickNodeClient::from_env().expect("Invalid QuickNode API configuration");
@@ -2014,7 +2016,7 @@ async fn main() {
 
         match chain {
             Chain::Bitcoin | Chain::Litecoin => {
-                if let Some((info, xpub)) = build_chain_info(chain) {
+                if let Some((mut info, xpub)) = build_chain_info(chain) {
                     let config = match build_config(chain, xpub) {
                         Ok(config) => config,
                         Err(missing) => {
@@ -2022,6 +2024,7 @@ async fn main() {
                             continue;
                         }
                     };
+                    info.address_source = AddressSource::Xpub(config.xpub.clone());
                     let detector = match ChainDetector::new(config) {
                         Ok(detector) => Arc::new(detector),
                         Err(error) => {

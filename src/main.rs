@@ -85,6 +85,8 @@ async fn main() {
     // over the local env BEFORE any config builder runs, then watch for
     // changes (a change triggers a clean restart so it always applies).
     let cfg_sig = crypto_payment_detector::remote_config::bootstrap().await;
+    let _storage_guard = crypto_payment_detector::reset::detector_guard()
+        .expect("Reset incomplete or storage locked; inspect reset archive before restarting");
     crypto_payment_detector::remote_config::spawn_watcher(cfg_sig);
 
     let chain_str = std::env::var("CHAIN").unwrap_or_else(|_| "bitcoin".to_string());

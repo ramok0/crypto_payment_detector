@@ -1339,7 +1339,7 @@ pub fn chain_enable_key(chain: Chain) -> String {
 pub fn build_config(chain: Chain, xpub: String) -> Result<DetectorConfig, Vec<MissingSetting>> {
     let mut resolver = Resolver::new(Some(chain));
 
-    let config = DetectorConfig {
+    let mut config = DetectorConfig {
         chain,
         xpub,
         webhook_url: resolver.text("WEBHOOK_URL"),
@@ -1369,6 +1369,10 @@ pub fn build_config(chain: Chain, xpub: String) -> Result<DetectorConfig, Vec<Mi
     };
 
     resolver.finish()?;
+    crate::reset::apply_wallet_generation(&mut config).map_err(|_| vec![MissingSetting {
+        key: format!("{}_WALLET_GENERATION", chain_env_prefix(chain)),
+        description: "Invalid persisted wallet generation; restore its metadata before restarting.",
+    }])?;
     Ok(config)
 }
 

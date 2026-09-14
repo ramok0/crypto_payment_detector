@@ -10,7 +10,10 @@ use crate::types::Chain;
 const LTC_XPUB_VERSION: [u8; 4] = [0x01, 0x9D, 0xA4, 0x62]; // Ltub
 const BTC_XPUB_VERSION: [u8; 4] = [0x04, 0x88, 0xB2, 0x1E]; // xpub
 
-fn normalize_xpub_to_bitcoin(xpub_str: &str, chain: Chain) -> Result<String, DetectorError> {
+pub(crate) fn normalize_xpub_to_bitcoin(
+    xpub_str: &str,
+    chain: Chain,
+) -> Result<String, DetectorError> {
     match chain {
         Chain::Bitcoin => Ok(xpub_str.to_string()),
         Chain::Litecoin => {
