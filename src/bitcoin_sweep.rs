@@ -102,7 +102,10 @@ pub fn derive_private_key(
     Ok(child.private_key)
 }
 
-fn normalize_xpriv_to_bitcoin(xpriv_str: &str, chain: Chain) -> Result<String, DetectorError> {
+pub(crate) fn normalize_xpriv_to_bitcoin(
+    xpriv_str: &str,
+    chain: Chain,
+) -> Result<String, DetectorError> {
     match chain {
         Chain::Bitcoin => Ok(xpriv_str.to_string()),
         Chain::Litecoin => {

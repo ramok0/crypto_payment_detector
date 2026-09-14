@@ -247,7 +247,7 @@ fn create_wallet_pool_file(path: &str) -> Result<String, DetectorError> {
     }
 }
 
-fn generate_wallet_pool_json(wallet_count: usize) -> Result<String, DetectorError> {
+pub(crate) fn generate_wallet_pool_json(wallet_count: usize) -> Result<String, DetectorError> {
     if wallet_count == 0 || wallet_count > DEFAULT_SOLANA_MAX_POOL_SIZE {
         return Err(DetectorError::InvalidConfig(format!(
             "SOLANA_WALLET_POOL_SIZE must be between 1 and {DEFAULT_SOLANA_MAX_POOL_SIZE}"

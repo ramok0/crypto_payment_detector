@@ -183,6 +183,14 @@ pub struct ChainDetector {
 
 impl ChainDetector {
     pub fn new(config: DetectorConfig) -> Result<Self, DetectorError> {
+        Self::new_with_state(config, true)
+    }
+
+    pub(crate) fn new_for_reset(config: DetectorConfig) -> Result<Self, DetectorError> {
+        Self::new_with_state(config, false)
+    }
+
+    fn new_with_state(config: DetectorConfig, load_state: bool) -> Result<Self, DetectorError> {
         if config.xpub.is_empty() {
             return Err(DetectorError::InvalidConfig("xpub is required".into()));
         }
@@ -286,7 +294,11 @@ impl ChainDetector {
             explorer_list
         );
 
-        let mut persisted = crate::persistence::load_state(&config.state_file)?;
+        let mut persisted = if load_state {
+            crate::persistence::load_state(&config.state_file)?
+        } else {
+            crate::persistence::PersistedState::default()
+        };
         // Older releases keyed pending/credited webhooks by txid. Retain that
         // identity across upgrades so an existing backend credit stays final.
         for pending in &mut persisted.pending {
@@ -434,7 +446,7 @@ impl ChainDetector {
         }))
     }
 
-    async fn get_chain_tip(&self) -> Result<u64, DetectorError> {
+    pub(crate) async fn get_chain_tip(&self) -> Result<u64, DetectorError> {
         self.try_explorers("get_chain_tip", |explorer| async move {
             self.get_chain_tip_from(&explorer).await
         })

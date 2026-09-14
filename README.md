@@ -4,6 +4,9 @@ Rust payment detector for **Bitcoin**, **Litecoin**, **Solana**, **Ethereum**, a
 
 BTC/LTC addresses are derived from an xpub / Ltub. Sweeping is optional and requires the corresponding private key and destination. Solana and EVM chains use managed wallet pools with permanent per-user address assignments. Webhooks include the user or derivation index and a stable per-payment `event_id`.
 
+For an offline reset with new deposit wallets, archived recovery keys and an
+interruption-safe restart, see [Reset et remplacement des wallets](docs/reset.md).
+
 ## Detection and delivery
 
 QuickNode Webhooks are supported for Solana (SOL/SPL), Ethereum and Base
